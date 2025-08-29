@@ -426,6 +426,104 @@ def scatter_roi_power_vs_rating(
     _save_fig(fig, plots_dir / f"scatter_{_sanitize(roi_key)}_{band}_power_vs_rating_temp")
 
 
+# Trial-wise trajectory: ROI power and rating
+# -----------------------------------------------------------------------------
+
+def plot_trialwise_power_and_rating(
+    subject: str,
+    task: str = TASK,
+    roi: str = "central",
+    band: str = "alpha",
+) -> None:
+    """Plot trial-wise trajectories of ROI-averaged power and rating.
+
+    A simple rolling-average smoothing is applied; adjust ``roll_window`` to
+    modify the smoothing window or set it to ``None``/``1`` to disable.
+    """
+
+    plots_dir = _plots_dir(subject)
+    _ensure_dir(plots_dir)
+
+    # Load power features and channel info
+    pow_df, _conn_df, _y, info = _load_features_and_targets(subject, task)
+
+    # Identify ROI channels
+    roi_map = _build_rois(info)
+    roi_key = None
+    for key in roi_map:
+        if key.lower() == roi.lower():
+            roi_key = key
+            break
+    if roi_key is None:
+        print(f"ROI '{roi}' not found for sub-{subject}. Available: {list(roi_map)}")
+        return
+    chs = roi_map[roi_key]
+    cols = [f"pow_{band}_{ch}" for ch in chs if f"pow_{band}_{ch}" in pow_df.columns]
+    if not cols:
+        print(f"No power columns for band '{band}' and ROI '{roi_key}' in sub-{subject}")
+        return
+    roi_power = pow_df[cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+
+    # Load epochs and align events for ratings
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None:
+        print(f"Could not find epochs for sub-{subject}")
+        return
+    epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+    events = _load_events_df(subject, task)
+    aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
+    if aligned_events is None or len(aligned_events) == 0:
+        print(f"No aligned events for sub-{subject}")
+        return
+    rating_col = _pick_first_column(aligned_events, RATING_COLUMNS)
+    if rating_col is None:
+        print(f"No rating column found for sub-{subject}")
+        return
+    rating = pd.to_numeric(aligned_events[rating_col], errors="coerce")
+
+    # Build DataFrame aligning trials
+    n = min(len(roi_power), len(rating))
+    df = pd.DataFrame(
+        {
+            "trial_index": np.arange(n),
+            "power": roi_power.iloc[:n].to_numpy(),
+            "rating": rating.iloc[:n].to_numpy(),
+        }
+    ).dropna(subset=["power", "rating"])
+    if df.empty:
+        print(f"Not enough valid data for trajectory plot: sub-{subject}")
+        return
+
+    # Optional rolling-average smoothing
+    roll_window: Optional[int] = 3  # set to None or 1 to disable
+    if roll_window and roll_window > 1:
+        df["power_plot"] = df["power"].rolling(roll_window, center=True, min_periods=1).mean()
+        df["rating_plot"] = df["rating"].rolling(roll_window, center=True, min_periods=1).mean()
+    else:
+        df["power_plot"] = df["power"]
+        df["rating_plot"] = df["rating"]
+
+    # Plot dual-axis line plot
+    fig, ax1 = plt.subplots(figsize=(6, 3.5))
+    ax2 = ax1.twinx()
+    ax1.plot(df["trial_index"], df["power_plot"], color="tab:blue", label="Power")
+    ax2.plot(df["trial_index"], df["rating_plot"], color="tab:orange", label="Rating")
+    ax1.set_xlabel("Trial index")
+    band_rng = FEATURES_FREQ_BANDS.get(band)
+    band_label = f"{band} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band
+    ax1.set_ylabel(f"{roi_key} {band_label} power", color="tab:blue")
+    ax2.set_ylabel(f"Rating ({rating_col})", color="tab:orange")
+    ax1.set_title(f"{roi_key} {band} power and rating over trials")
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+
+    _save_fig(
+        fig,
+        plots_dir / f"trajectory_{_sanitize(roi_key)}_{band}_power_and_rating",
+    )
+
+
 # Power high vs low rating topographic difference
 # -----------------------------------------------------------------------------
 
