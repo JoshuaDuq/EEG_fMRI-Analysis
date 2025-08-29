@@ -134,50 +134,30 @@ def _save_fig(fig: plt.Figure, out_dir: Path, name: str) -> None:
     print(f"Saved: {out_path}")
 
 
-def _save_counts_tsv(values: pd.Series, out_dir: Path, filename: str) -> None:
-    """Save value counts to TSV in out_dir/filename."""
-    _ensure_dir(out_dir)
-    counts = values.value_counts().sort_index()
-    df = counts.rename_axis("level").reset_index(name="count")
-    df.to_csv(out_dir / filename, sep="\t", index=False)
-    print(f"Saved: {out_dir / filename}")
+def _maybe_crop_epochs(
+    epochs: mne.Epochs, crop_tmin: Optional[float], crop_tmax: Optional[float]
+) -> mne.Epochs:
+    """Optionally crop epochs in time.
 
-
-def qc_plots(epochs: mne.Epochs, out_dir: Path) -> None:
-    """Generate a few quick QC plots."""
-    # PSD
-    try:
-        fig = epochs.compute_psd().plot(show=False)
-        _save_fig(fig, out_dir, "qc_psd.png")
-    except Exception as e:
-        print(f"QC: PSD plot failed: {e}")
-
-    # Sensor layout
-    try:
-        fig = epochs.plot_sensors(show=False)
-        _save_fig(fig, out_dir, "qc_sensors.png")
-    except Exception as e:
-        print(f"QC: sensors plot failed: {e}")
-
-    # Drop log summary (if any drops)
-    try:
-        if getattr(epochs, "drop_log", None) is not None:
-            fig = mne.viz.plot_drop_log(epochs.drop_log, threshold=1, show=False)
-            _save_fig(fig, out_dir, "qc_drop_log.png")
-    except Exception as e:
-        print(f"QC: drop log plot failed: {e}")
-
-    # Trial image (built-in visualization of single-trial data)
-    try:
-        fig = epochs.plot_image(picks=ERP_PICKS, colorbar=False, show=False)
-        # epochs.plot_image may return a list of figures depending on MNE version
-        if isinstance(fig, list):
-            for i, f in enumerate(fig):
-                _save_fig(f, out_dir, f"qc_image_{i+1}.png")
-        else:
-            _save_fig(fig, out_dir, "qc_image.png")
-    except Exception as e:
-        print(f"QC: image plot failed: {e}")
+    Notes
+    -----
+    - Uses include_tmax=False to drop the terminal sample, which helps avoid
+      boundary artifacts at the exact epoch end (e.g., stimulus offset).
+    - If a bound is None, the existing epochs.tmin/tmax is kept.
+    """
+    if crop_tmin is None and crop_tmax is None:
+        return epochs
+    tmin = epochs.tmin if crop_tmin is None else float(crop_tmin)
+    tmax = epochs.tmax if crop_tmax is None else float(crop_tmax)
+    # Ensure valid order
+    if tmax <= tmin:
+        raise ValueError(f"Invalid crop window: tmin={tmin}, tmax={tmax}")
+    print(f"Cropping epochs to [{tmin:.3f}, {tmax:.3f}] s (include_tmax=False)")
+    ep = epochs.copy()
+    # Cropping modifies epoch data; ensure it is loaded into memory
+    if not getattr(ep, "preload", False):
+        ep.load_data()
+    return ep.crop(tmin=tmin, tmax=tmax, include_tmax=False)
 
 
 def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path) -> None:
@@ -270,11 +250,6 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path) -> None:
         uniq_sorted = sorted(levels_series.astype(str).unique())
         use_numeric = False
 
-    # Save counts TSV using metadata (preferred)
-    try:
-        _save_counts_tsv(levels_series, out_dir, "counts_temperature.tsv")
-    except Exception as e:
-        print(f"Saving counts_temperature.tsv failed: {e}")
 
     evokeds: Dict[str, mne.Evoked] = {}
     for lvl in uniq_sorted:
@@ -325,8 +300,12 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path) -> None:
         print(f"ERP by temperature (GFP) failed: {e}")
 
 
-
-def main(subject: str = "001", task: str = DEFAULT_TASK) -> None:
+def main(
+    subject: str = "001",
+    task: str = DEFAULT_TASK,
+    crop_tmin: Optional[float] = None,
+    crop_tmax: Optional[float] = None,
+) -> None:
     # Resolve paths
     plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots"
     _ensure_dir(plots_dir)
@@ -393,8 +372,9 @@ def main(subject: str = "001", task: str = DEFAULT_TASK) -> None:
                     print(f"Saving counts_pain.tsv failed: {e}")
                 break
 
-    # Basic QC
-    qc_plots(epochs, plots_dir)
+    # Optional epoch time cropping prior to averaging/plotting
+    if crop_tmin is not None or crop_tmax is not None:
+        epochs = _maybe_crop_epochs(epochs, crop_tmin, crop_tmax)
 
     # ERP: pain vs non-pain and by temperature (requires metadata)
     if events_df is not None and epochs.metadata is not None:
@@ -410,6 +390,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Foundational EEG QC and ERP analysis for one subject")
     parser.add_argument("--subject", "-s", type=str, default="001", help="BIDS subject label without 'sub-' prefix (e.g., 001)")
     parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label (default from config)")
+    parser.add_argument("--crop-tmin", type=float, default=None, help="Optional epoch crop start time in seconds")
+    parser.add_argument("--crop-tmax", type=float, default=None, help="Optional epoch crop end time in seconds (excluded)")
     args = parser.parse_args()
 
-    main(subject=args.subject, task=args.task)
+    main(subject=args.subject, task=args.task, crop_tmin=args.crop_tmin, crop_tmax=args.crop_tmax)
