@@ -426,6 +426,73 @@ def scatter_roi_power_vs_rating(
     _save_fig(fig, plots_dir / f"scatter_{_sanitize(roi_key)}_{band}_power_vs_rating_temp")
 
 
+# ERP peak vs rating
+# -----------------------------------------------------------------------------
+
+def scatter_erp_peak_vs_rating(
+    subject: str,
+    task: str = TASK,
+    channel: str = "Cz",
+    tmin: float = 0.2,
+    tmax: float = 0.4,
+) -> None:
+    """Scatter plot of ERP peak amplitude versus rating for a channel."""
+
+    plots_dir = _plots_dir(subject)
+    _ensure_dir(plots_dir)
+
+    # Load epochs
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None:
+        print(f"Could not find epochs for sub-{subject}")
+        return
+    epochs = mne.read_epochs(epo_path, preload=True, verbose=False)
+
+    if channel not in epochs.ch_names:
+        print(f"Channel {channel} not found for sub-{subject}")
+        return
+
+    # Load and align ratings
+    events = _load_events_df(subject, task)
+    events = _align_events_to_epochs(events, epochs) if events is not None else None
+    rating_col = _pick_first_column(events, RATING_COLUMNS) if events is not None else None
+    if rating_col is None:
+        print(f"No rating column found for sub-{subject}")
+        return
+    ratings = pd.to_numeric(events[rating_col], errors="coerce")
+
+    # Extract peak amplitude within window
+    try:
+        idx_min, idx_max = epochs.time_as_index([tmin, tmax])
+    except Exception:
+        print(f"Invalid time window {tmin}\u2013{tmax} for sub-{subject}")
+        return
+    data = epochs.copy().pick(channel).get_data()[:, 0, idx_min:idx_max]
+    if data.size == 0:
+        print(f"No data in time window for sub-{subject}")
+        return
+    peak = np.max(np.abs(data), axis=1)
+
+    # Align lengths and drop missing
+    n = min(len(peak), len(ratings))
+    df = pd.DataFrame({"amp": peak[:n], "rating": ratings.iloc[:n]}).dropna()
+    if df.empty:
+        print(f"Not enough valid data for ERP peak vs rating: sub-{subject}")
+        return
+
+    # Plot scatter with regression line
+    fig, ax = plt.subplots(figsize=(4.5, 3.5))
+    sns.scatterplot(data=df, x="amp", y="rating", ax=ax)
+    sns.regplot(data=df, x="amp", y="rating", scatter=False, ax=ax, color="k")
+    time_label = f"{tmin:g}\u2013{tmax:g} s"
+    ax.set_xlabel(f"{channel} peak amplitude ({time_label})")
+    ax.set_ylabel(f"Rating ({rating_col})")
+    ax.set_title(f"{channel} ERP peak vs rating")
+    fname = f"erp_peak_{_sanitize(channel)}_{tmin}-{tmax}_vs_rating"
+    _save_fig(fig, plots_dir / fname)
+
+
+
 
 
 # -----------------------------------------------------------------------------
