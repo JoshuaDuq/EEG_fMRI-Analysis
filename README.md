@@ -100,6 +100,13 @@ Notes:
 - Only `Stim_on` rows are updated with behavioral columns, preserving non-stim rows.
 - Length mismatches are trimmed to the shorter length with a warning.
 
+**Combined per-subject events (new):**
+- After per-run merges, the script writes a combined file per subject at `sub-<ID>/eeg/sub-<ID>_task-<task>_events.tsv`.
+- It concatenates all `*_task-<task>_run-*_events.tsv` for the subject, sorted by run (ascending) and by `onset` within each run (stable sort).
+- If more than one run is present, the combined file includes a `run` column; if only a single run exists, `run` is omitted.
+- Columns are aligned using the union across runs, preserving the order from the first run file; missing values are filled with NA.
+- In `--dry_run` mode, combined files are not written (dry-run is for preview only).
+
 
 ### 3) Foundational QC and ERP Analysis: `eeg_pipeline/01_foundational_analysis.py`
 
