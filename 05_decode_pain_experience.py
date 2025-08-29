@@ -18,7 +18,7 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import mne
 from sklearn.model_selection import LeaveOneGroupOut, GroupKFold, GridSearchCV, KFold, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, PowerTransformer, RobustScaler
+from sklearn.preprocessing import StandardScaler, PowerTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge, ElasticNet, LogisticRegression
 from sklearn.metrics import r2_score, make_scorer, explained_variance_score, roc_auc_score
@@ -33,11 +33,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.base import clone
 from sklearn.compose import TransformedTargetRegressor
-from sklearn.feature_selection import VarianceThreshold, SelectFromModel, SelectKBest, f_regression
-import sys
-import os
-sys.path.append(os.path.dirname(__file__))
-from bounded_regressor import BoundedRegressor
+from sklearn.feature_selection import VarianceThreshold, SelectFromModel
 import json
 import hashlib
 import random as pyrandom
@@ -172,10 +168,10 @@ CONFIG = {
     "models": {
         "elasticnet": {
             "max_iter": 200000,
-            "tol": 1e-4,
+            "tol": 1e-3,
             "selection": "random",
             "grid": {
-                "alpha": [0.1, 1, 10, 100, 500, 1000],
+                "alpha": [1e-3, 1e-2, 1e-1, 1, 10, 100],
                 "l1_ratio": [0.2, 0.5, 0.8],
             },
         },
@@ -224,38 +220,26 @@ def _create_base_preprocessing_pipeline(include_scaling: bool = True) -> Pipelin
     """Create standardized preprocessing pipeline to avoid code duplication.
     
     Args:
-        include_scaling: Whether to include RobustScaler step for better outlier handling
+        include_scaling: Whether to include StandardScaler step
     
     Returns:
-        Pipeline with imputation, variance threshold, and optionally robust scaling
+        Pipeline with imputation, variance threshold, and optionally scaling
     """
     steps = [
         ("impute", SimpleImputer(strategy="median")),
-        ("var", VarianceThreshold(threshold=0.01)),  # More aggressive variance filtering
+        ("var", VarianceThreshold(threshold=0.0)),
     ]
     if include_scaling:
-        steps.append(("scale", RobustScaler()))  # More robust to outliers than StandardScaler
+        steps.append(("scale", StandardScaler()))
     return Pipeline(steps)
 
 def _create_elasticnet_pipeline(seed: int = 42) -> Pipeline:
-    """Create ElasticNet pipeline with enhanced stability and prediction bounds."""
+    """Create ElasticNet pipeline with TransformedTargetRegressor."""
     base_steps = _create_base_preprocessing_pipeline(include_scaling=True).steps
-    
-    # Add feature selection to reduce dimensionality
-    base_steps.append(("feature_select", SelectKBest(score_func=f_regression, k=min(50, 186))))
-    
-    # Create bounded ElasticNet with numerical stability
-    bounded_elasticnet = BoundedRegressor(
-        regressor=ElasticNet(random_state=seed, max_iter=200000, tol=1e-4, selection="random"),
-        min_value=0.0, 
-        max_value=200.0,
-        check_finite=True
-    )
-    
     base_steps.append((
         "regressor", 
         TransformedTargetRegressor(
-            regressor=bounded_elasticnet,
+            regressor=ElasticNet(random_state=seed, max_iter=200000, tol=1e-3, selection="random"),
             transformer=PowerTransformer(method="yeo-johnson", standardize=True)
         )
     ))
@@ -2100,8 +2084,8 @@ def plot_learning_curve_en(X: pd.DataFrame, y: pd.Series, groups: np.ndarray, re
             en_params = best_params_map.get(fold, {})
             en_cfg = CONFIG["models"]["elasticnet"]
             en = ElasticNet(
-                alpha=en_params.get("regressor__regressor__regressor__alpha", 1.0),
-                l1_ratio=en_params.get("regressor__regressor__regressor__l1_ratio", 0.5),
+                alpha=en_params.get("regressor__regressor__alpha", 1.0),
+                l1_ratio=en_params.get("regressor__regressor__l1_ratio", 0.5),
                 max_iter=en_cfg["max_iter"],
                 tol=en_cfg["tol"],
                 selection=en_cfg["selection"],
@@ -4564,16 +4548,14 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     # Model 0: Elastic Net with feature selection (SelectFromModel) and target transform (TTR)
     en_cfg = CONFIG["models"]["elasticnet"]
     enet_pipe = _create_elasticnet_pipeline(seed=seed)
-    # Update with config parameters (nested: regressor -> BoundedRegressor -> ElasticNet)
-    enet_pipe.named_steps["regressor"].regressor.regressor.max_iter = en_cfg["max_iter"]
-    enet_pipe.named_steps["regressor"].regressor.regressor.tol = en_cfg["tol"]
-    enet_pipe.named_steps["regressor"].regressor.regressor.selection = en_cfg["selection"]
+    # Update with config parameters
+    enet_pipe.named_steps["regressor"].regressor.max_iter = en_cfg["max_iter"]
+    enet_pipe.named_steps["regressor"].regressor.tol = en_cfg["tol"]
+    enet_pipe.named_steps["regressor"].regressor.selection = en_cfg["selection"]
     enet_grid = {
-        # ElasticNet inside BoundedRegressor inside TransformedTargetRegressor
-        "regressor__regressor__regressor__alpha": en_cfg["grid"]["alpha"],
-        "regressor__regressor__regressor__l1_ratio": en_cfg["grid"]["l1_ratio"],
-        # Feature selection k parameter
-        "feature_select__k": [20, 50, min(100, 186)],
+        # Final ElasticNet inside TransformedTargetRegressor
+        "regressor__regressor__alpha": en_cfg["grid"]["alpha"],
+        "regressor__regressor__l1_ratio": en_cfg["grid"]["l1_ratio"],
     }
 
     # Model 1: Random Forest (no scaling)
