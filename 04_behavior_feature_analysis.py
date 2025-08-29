@@ -189,7 +189,7 @@ def _features_dir(subject: str) -> Path:
 
 
 def _plots_dir(subject: str) -> Path:
-    return DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots"
+    return DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / "04_behavior_feature_analysis"
 
 
 def _stats_dir(subject: str) -> Path:
