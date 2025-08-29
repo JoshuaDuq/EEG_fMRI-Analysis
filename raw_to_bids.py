@@ -86,16 +86,37 @@ def ensure_dataset_description(bids_root: Path, name: str = "EEG BIDS dataset") 
     )
 
 
-def convert_one(vhdr_path: Path, bids_root: Path, task: str, montage_name: Optional[str], line_freq: Optional[float], overwrite: bool = False, merge_behavior: bool = False, zero_base_onsets: bool = False) -> BIDSPath:
+def convert_one(
+    vhdr_path: Path,
+    bids_root: Path,
+    task: str,
+    montage_name: Optional[str],
+    line_freq: Optional[float],
+    overwrite: bool = False,
+    merge_behavior: bool = False,
+    zero_base_onsets: bool = False,
+    trim_to_first_volume: bool = False,
+    event_prefixes: Optional[List[str]] = None,
+    keep_all_annotations: bool = False,
+) -> BIDSPath:
     """Convert a single BrainVision file to BIDS using MNE-BIDS.
 
     Returns the BIDSPath that was written.
     """
     sub_label = parse_subject_id(vhdr_path)
 
-    # Determine run index by sorting all runs for this subject
-    all_runs = sorted(vhdr_path.parent.glob("*.vhdr"))
-    run_idx = all_runs.index(vhdr_path) + 1 if len(all_runs) > 1 else None
+    # Determine run index, prefer parsing from filename (e.g., run1, run-02)
+    run_idx: Optional[int] = None
+    m_run = re.search(r"run[-_]?(\d+)", vhdr_path.stem, flags=re.IGNORECASE)
+    if m_run:
+        try:
+            run_idx = int(m_run.group(1))
+        except Exception:
+            run_idx = None
+    if run_idx is None:
+        # Fallback: position in sorted list
+        all_runs = sorted(vhdr_path.parent.glob("*.vhdr"))
+        run_idx = all_runs.index(vhdr_path) + 1 if len(all_runs) > 1 else None
 
     raw = mne.io.read_raw_brainvision(vhdr_path, preload=False, verbose=False)
 
@@ -109,6 +130,9 @@ def convert_one(vhdr_path: Path, bids_root: Path, task: str, montage_name: Optio
     if montage_name:
         try:
             montage = mne.channels.make_standard_montage(montage_name)
+            # Fix common naming mismatch for EasyCap: 'FPz' -> 'Fpz'
+            if "FPz" in raw.ch_names and "Fpz" not in raw.ch_names:
+                raw.rename_channels({"FPz": "Fpz"})
             raw.set_montage(montage, on_missing="warn")
         except Exception:
             # Continue without montage if template not applicable
@@ -121,12 +145,45 @@ def convert_one(vhdr_path: Path, bids_root: Path, task: str, montage_name: Optio
     def _norm(s: str) -> str:
         return re.sub(r"\s+", " ", str(s)).strip()
 
-    target = "Stim_on/S 1"
+    # Optionally crop the raw to the first MRI volume trigger (e.g., "Volume/V 1" or "V  1") to remove dummy-scan period
+    did_trim = False
+    if trim_to_first_volume:
+        try:
+            anns0 = raw.annotations
+            if len(anns0) > 0:
+                # Match either 'Volume/V 1', 'Volume,V 1', or a bare 'V  1' (spaces normalized to single space)
+                _pat_v1 = re.compile(r"(^|[/,])V\s*1(\D|$)")
+                vol_idx = [
+                    i
+                    for i, d in enumerate(anns0.description)
+                    if _norm(d).startswith("Volume/V") or _pat_v1.search(_norm(d)) is not None
+                ]
+                if vol_idx:
+                    t0 = min(anns0.onset[i] for i in vol_idx)
+                    if isinstance(t0, (int, float)) and t0 > 0:
+                        # Crop so that time 0 aligns with the first detected volume trigger
+                        print(f"Trimming raw to first volume trigger at {t0:.3f}s relative to recording start.")
+                        raw.crop(tmin=float(t0), tmax=None)
+                        did_trim = True
+        except Exception:
+            # If cropping fails for any reason, proceed without cropping
+            pass
+
+    # If we trimmed/cropped the raw, preload to memory so write_raw_bids can write the modified data
+    if did_trim and not raw.preload:
+        raw.load_data()
+
+    # Normalize prefixes (default to ["Trig_therm/T 1"] if not provided)
+    prefixes = event_prefixes if event_prefixes is not None else ["Trig_therm"]
+    norm_prefixes = [_norm(p) for p in prefixes if str(p).strip() != ""]
     anns = raw.annotations
     try:
-        if len(anns) > 0:
-            keep_idx = [i for i, d in enumerate(anns.description)
-                        if _norm(d) == target or str(d).startswith("Stim_on")]
+        if len(anns) > 0 and not keep_all_annotations:
+            keep_idx = [
+                i
+                for i, d in enumerate(anns.description)
+                if any(_norm(d).startswith(tp) for tp in norm_prefixes)
+            ]
             if keep_idx:
                 new_onset = [anns.onset[i] for i in keep_idx]
                 new_duration = [anns.duration[i] for i in keep_idx]
@@ -143,7 +200,7 @@ def convert_one(vhdr_path: Path, bids_root: Path, task: str, montage_name: Optio
                 )
                 raw.set_annotations(new_anns)
             else:
-                # No Stim_on found: clear annotations so nothing gets written
+                # No matches found: clear annotations so nothing gets written
                 raw.set_annotations(mne.Annotations([], [], [], orig_time=anns.orig_time))
     except Exception:
         # If annotation filtering fails, proceed with whatever annotations exist
@@ -164,7 +221,8 @@ def convert_one(vhdr_path: Path, bids_root: Path, task: str, montage_name: Optio
     kwargs = {}
     # Keep minimal compatibility toggles only
     if "allow_preload" in params:
-        kwargs["allow_preload"] = False
+        # Allow writing when data are preloaded (needed after cropping)
+        kwargs["allow_preload"] = bool(getattr(raw, "preload", False))
     if "format" in params:
         kwargs["format"] = "BrainVision"
     if "verbose" in params:
@@ -177,7 +235,7 @@ def convert_one(vhdr_path: Path, bids_root: Path, task: str, montage_name: Optio
         **kwargs,
     )
 
-    # Post-process: merge behavioral TrialSummary.csv onto Stim_on events if requested
+    # Post-process: merge behavioral TrialSummary.csv onto Trig_therm/T 1 events if requested
     if merge_behavior:
         try:
             # Locate events.tsv using BIDSPath utilities
@@ -194,15 +252,15 @@ def convert_one(vhdr_path: Path, bids_root: Path, task: str, montage_name: Optio
                     behav_df = pd.read_csv(csvs[0])
                     ev_df = pd.read_csv(events_tsv_path, sep="\t")
 
-                    # Keep only Stim_on rows (in case upstream didn't filter)
+                    # Keep only Trig_therm/T 1 rows (in case upstream didn't filter)
                     def _norm(s: str) -> str:
                         return re.sub(r"\s+", " ", str(s)).strip()
 
-                    ev_df = ev_df[ev_df["trial_type"].map(_norm) == "Stim_on/S 1"].reset_index(drop=True)
+                    ev_df = ev_df[ev_df["trial_type"].map(_norm) == "Trig_therm/T 1"].reset_index(drop=True)
 
                     # Align lengths, warn on mismatch
                     if len(behav_df) != len(ev_df):
-                        print(f"Warning: Stim_on events ({len(ev_df)}) != behavioral rows ({len(behav_df)}). Columns will be trimmed to min length.")
+                        print(f"Warning: Trig_therm/T 1 events ({len(ev_df)}) != behavioral rows ({len(behav_df)}). Columns will be trimmed to min length.")
                     n = min(len(behav_df), len(ev_df))
                     if n > 0:
                         behav_sub = behav_df.iloc[:n].reset_index(drop=True)
@@ -227,8 +285,27 @@ def main():
     parser.add_argument("--montage", type=str, default=MONTAGE_NAME, help="Standard montage name to set on raw (e.g., easycap-M1). Use '' to skip.")
     parser.add_argument("--line_freq", type=float, default=LINE_FREQ, help="Line noise frequency (Hz) metadata for sidecar.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing BIDS files")
-    parser.add_argument("--merge_behavior", action="store_true", help="Merge Psychopy TrialSummary.csv into Stim_on events.tsv (disabled by default)")
+    parser.add_argument("--merge_behavior", action="store_true", help="Merge Psychopy TrialSummary.csv into events.tsv (disabled by default)")
     parser.add_argument("--zero_base_onsets", action="store_true", help="Zero-base kept annotation onsets so events start at 0.0")
+    parser.add_argument(
+        "--trim_to_first_volume",
+        action="store_true",
+        help=(
+            "Crop raw to start at the first MRI volume trigger (e.g., 'Volume/V 1', 'Volume,V 1', or bare 'V  1') "
+            "to remove the initial dummy-scan period where the scanner may not send triggers."
+        ),
+    )
+    parser.add_argument(
+        "--event_prefix",
+        action="append",
+        default=None,
+        help=(
+            "Keep only annotations whose normalized label starts with this prefix. "
+            "Repeat this flag to keep multiple prefixes, e.g., --event_prefix Trig_therm/T 1 --event_prefix Reward_on. "
+            "If omitted, defaults to Trig_therm/T 1. Use --keep_all_annotations to keep all annotations."
+        ),
+    )
+    parser.add_argument("--keep_all_annotations", action="store_true", help="If set, do not filter annotations at all; write whatever exists.")
 
     args = parser.parse_args()
 
@@ -265,6 +342,9 @@ def main():
                 overwrite=args.overwrite,
                 merge_behavior=args.merge_behavior,
                 zero_base_onsets=args.zero_base_onsets,
+                trim_to_first_volume=args.trim_to_first_volume,
+                event_prefixes=args.event_prefix,
+                keep_all_annotations=args.keep_all_annotations,
             )
             written.append(bp)
             rel = str(bp.fpath).replace(str(bids_root) + os.sep, "") if bp.fpath else str(bp)
