@@ -426,6 +426,90 @@ def scatter_roi_power_vs_rating(
     _save_fig(fig, plots_dir / f"scatter_{_sanitize(roi_key)}_{band}_power_vs_rating_temp")
 
 
+# ROI power vs temperature
+# -----------------------------------------------------------------------------
+
+def plot_roi_power_vs_temperature(
+    subject: str,
+    task: str = TASK,
+    roi: str = "Central",
+    band: str = "beta",
+) -> None:
+    """Plot binned ROI power against trial-wise temperature."""
+
+    plots_dir = _plots_dir(subject)
+    _ensure_dir(plots_dir)
+
+    # Load power features and channel info
+    pow_df, _conn_df, _y, info = _load_features_and_targets(subject, task)
+
+    # Identify ROI channels
+    roi_map = _build_rois(info)
+    roi_key = None
+    for key in roi_map:
+        if key.lower() == roi.lower():
+            roi_key = key
+            break
+    if roi_key is None:
+        print(f"ROI '{roi}' not found for sub-{subject}. Available: {list(roi_map)}")
+        return
+
+    chs = roi_map[roi_key]
+    cols = [f"pow_{band}_{ch}" for ch in chs if f"pow_{band}_{ch}" in pow_df.columns]
+    if not cols:
+        print(f"No power columns for band '{band}' and ROI '{roi_key}' in sub-{subject}")
+        return
+    roi_power = pow_df[cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+
+    # Align temperatures with epochs
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None:
+        print(f"Could not find epochs for sub-{subject}")
+        return
+    epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+    events = _load_events_df(subject, task)
+    aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
+    if aligned_events is None or len(aligned_events) == 0:
+        print(f"No aligned events for sub-{subject}")
+        return
+
+    temp_col = _pick_first_column(aligned_events, PSYCH_TEMP_COLUMNS)
+    if temp_col is None:
+        print(f"No temperature column found for sub-{subject}")
+        return
+    temp = pd.to_numeric(aligned_events[temp_col], errors="coerce")
+
+    # Align lengths and drop missing
+    n = min(len(roi_power), len(temp))
+    df = pd.DataFrame({"power": roi_power.iloc[:n], "temp": temp.iloc[:n]}).dropna()
+    if df.empty:
+        print(f"Not enough valid data for power vs temperature: sub-{subject}")
+        return
+
+    # Bin temperatures: unique levels or equal-width bins
+    uniq = np.sort(df["temp"].unique())
+    if len(uniq) <= 6:
+        grouped = df.groupby("temp")
+        x = grouped.mean().index.to_numpy()
+    else:
+        df["temp_bin"] = pd.cut(df["temp"], bins=5)
+        grouped = df.groupby("temp_bin")
+        x = np.array([interval.mid for interval in grouped.mean().index])
+    y = grouped["power"].mean().to_numpy()
+    yerr = grouped["power"].sem().to_numpy()
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(4.5, 3.5))
+    ax.errorbar(x, y, yerr=yerr, fmt="o-", capsize=3)
+    band_rng = FEATURES_FREQ_BANDS.get(band)
+    band_label = f"{band} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band
+    ax.set_xlabel("Temperature")
+    ax.set_ylabel(f"{roi_key} {band_label} power")
+    ax.set_title(f"{roi_key} {band} power vs temperature")
+
+    _save_fig(fig, plots_dir / f"roi_{roi_key.lower()}_{band}_power_vs_temp")
+
+
 # Trial-wise trajectory: ROI power and rating
 # -----------------------------------------------------------------------------
 
