@@ -426,6 +426,7 @@ def scatter_roi_power_vs_rating(
     _save_fig(fig, plots_dir / f"scatter_{_sanitize(roi_key)}_{band}_power_vs_rating_temp")
 
 
+
 # ROI power vs temperature
 # -----------------------------------------------------------------------------
 
@@ -510,6 +511,7 @@ def plot_roi_power_vs_temperature(
     _save_fig(fig, plots_dir / f"roi_{roi_key.lower()}_{band}_power_vs_temp")
 
 
+
 # Trial-wise trajectory: ROI power and rating
 # -----------------------------------------------------------------------------
 
@@ -521,15 +523,20 @@ def plot_trialwise_power_and_rating(
 ) -> None:
     """Plot trial-wise trajectories of ROI-averaged power and rating.
 
-    A simple rolling-average smoothing is applied; adjust ``roll_window`` to
-    modify the smoothing window or set it to ``None``/``1`` to disable.
+    Uses the target rating vector exported alongside features, ensuring the
+    ratings and power features remain synchronized. A simple rolling-average
+    smoothing is applied; adjust ``roll_window`` to modify the smoothing window
+    or set it to ``None``/``1`` to disable.
+
     """
 
     plots_dir = _plots_dir(subject)
     _ensure_dir(plots_dir)
 
-    # Load power features and channel info
-    pow_df, _conn_df, _y, info = _load_features_and_targets(subject, task)
+
+    # Load power features, pre-aligned target ratings, and channel info
+    pow_df, _conn_df, y, info = _load_features_and_targets(subject, task)
+
 
     # Identify ROI channels
     roi_map = _build_rois(info)
@@ -548,22 +555,30 @@ def plot_trialwise_power_and_rating(
         return
     roi_power = pow_df[cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
 
-    # Load epochs and align events for ratings
-    epo_path = _find_clean_epochs_path(subject, task)
-    if epo_path is None:
-        print(f"Could not find epochs for sub-{subject}")
-        return
-    epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
-    events = _load_events_df(subject, task)
-    aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
-    if aligned_events is None or len(aligned_events) == 0:
-        print(f"No aligned events for sub-{subject}")
-        return
-    rating_col = _pick_first_column(aligned_events, RATING_COLUMNS)
-    if rating_col is None:
-        print(f"No rating column found for sub-{subject}")
-        return
-    rating = pd.to_numeric(aligned_events[rating_col], errors="coerce")
+
+    # Use target ratings returned by _load_features_and_targets, which are
+    # already aligned to pow_df. Fallback to events alignment only if ratings
+    # are entirely missing.
+    rating = pd.to_numeric(y, errors="coerce")
+    rating_label = "Rating"
+    if rating.isna().all():
+        events = _load_events_df(subject, task)
+        epo_path = _find_clean_epochs_path(subject, task)
+        if events is None or epo_path is None:
+            print(f"No rating data for sub-{subject}")
+            return
+        epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+        aligned_events = _align_events_to_epochs(events, epochs)
+        if aligned_events is None or len(aligned_events) == 0:
+            print(f"No aligned events for sub-{subject}")
+            return
+        rating_col = _pick_first_column(aligned_events, RATING_COLUMNS)
+        if rating_col is None:
+            print(f"No rating column found for sub-{subject}")
+            return
+        rating = pd.to_numeric(aligned_events[rating_col], errors="coerce")
+        rating_label = f"Rating ({rating_col})"
+
 
     # Build DataFrame aligning trials
     n = min(len(roi_power), len(rating))
@@ -596,7 +611,9 @@ def plot_trialwise_power_and_rating(
     band_rng = FEATURES_FREQ_BANDS.get(band)
     band_label = f"{band} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band
     ax1.set_ylabel(f"{roi_key} {band_label} power", color="tab:blue")
-    ax2.set_ylabel(f"Rating ({rating_col})", color="tab:orange")
+
+    ax2.set_ylabel(rating_label, color="tab:orange")
+
     ax1.set_title(f"{roi_key} {band} power and rating over trials")
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
