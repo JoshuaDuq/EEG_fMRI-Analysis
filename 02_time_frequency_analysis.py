@@ -51,7 +51,7 @@ TFR_PICKS = "eeg"
 # Baseline and windows
 BASELINE = (None, 0.0)  # pre-stim
 DEFAULT_PLATEAU_TMIN = 3.0
-DEFAULT_PLATEAU_TMAX = 10.5
+DEFAULT_PLATEAU_TMAX = 10.0
 
 # Bands (upper bound None => capped at data's max freq)
 BAND_BOUNDS = {
@@ -61,7 +61,7 @@ BAND_BOUNDS = {
 }
 
 # Plot styling
-FIG_DPI = 200
+FIG_DPI = 300
 FIG_PAD_INCH = 0.2
 TOPO_CONTOURS = 6
 TOPO_CMAP = "RdBu_r"
@@ -266,7 +266,7 @@ def _pick_central_channel(info: mne.Info, preferred: str = "Cz") -> str:
     return fallback
 
 
-def _save_fig(fig_obj: Any, out_dir: Path, name: str) -> None:
+def _save_fig(fig_obj: Any, out_dir: Path, name: str, formats: Optional[list[str]] = None) -> None:
     """Save a matplotlib Figure or a list of Figures.
 
     If a list is provided, the first figure uses the given name; subsequent
@@ -281,25 +281,13 @@ def _save_fig(fig_obj: Any, out_dir: Path, name: str) -> None:
 
     base = name
     stem, ext = (base.rsplit(".", 1) + [""])[:2]
+    exts = formats if formats is not None else ([ext] if ext else ["png"])  # default to PNG if no ext
     for i, f in enumerate(figs):
-        out_name = base if i == 0 else f"{stem}_{i+1}.{ext}" if ext else f"{stem}_{i+1}"
-        out_path = out_dir / out_name
-        saved_ok = False
-        # Primary attempt: try constrained layout, but be ready to fall back if it errors
-        try:
-            try:
-                f.set_constrained_layout(True)
-            except Exception:
-                # Ignore if backend/mpl version doesn't support or errors
-                pass
-            try:
-                f.canvas.draw()
-            except Exception:
-                pass
-            f.savefig(out_path, dpi=FIG_DPI, bbox_inches="tight", pad_inches=FIG_PAD_INCH)
-            saved_ok = True
-        except Exception as e:
-            # Fallback: disable constrained layout and use tight_layout/subplots_adjust
+        saved_any = False
+        # Robust save without constrained_layout to avoid layout warnings
+        for ext_i in exts:
+            out_name = (f"{stem}.{ext_i}" if i == 0 else f"{stem}_{i+1}.{ext_i}")
+            out_path = out_dir / out_name
             try:
                 try:
                     f.set_constrained_layout(False)
@@ -308,20 +296,28 @@ def _save_fig(fig_obj: Any, out_dir: Path, name: str) -> None:
                 try:
                     f.tight_layout()
                 except Exception:
-                    # As an alternative, apply small margins
                     try:
                         f.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.08)
                     except Exception:
                         pass
+                try:
+                    f.canvas.draw()
+                except Exception:
+                    pass
                 f.savefig(out_path, dpi=FIG_DPI, bbox_inches="tight", pad_inches=FIG_PAD_INCH)
-                saved_ok = True
-                print(f"Constrained layout failed, used tight_layout fallback for: {out_path}. Reason: {e}")
-            except Exception as e2:
-                print(f"Failed to save figure to {out_path}: {e2} (original error: {e})")
-        finally:
-            plt.close(f)
-        if saved_ok:
-            print(f"Saved: {out_path}")
+                saved_any = True
+                print(f"Saved: {out_path}")
+            except Exception as e:
+                # Fallback: try saving without tight bbox (some backends raise 'float division by zero')
+                try:
+                    f.savefig(out_path, dpi=FIG_DPI)
+                    saved_any = True
+                    print(f"Saved (no tight bbox) due to layout error for: {out_path}. Reason: {e}")
+                except Exception as e2:
+                    print(f"Failed to save figure to {out_path}: {e2} (original error: {e})")
+        plt.close(f)
+        if not saved_any:
+            print(f"Warning: no output saved for figure named '{name}'")
 
 
 def _average_tfr_band(
@@ -432,16 +428,30 @@ def contrast_pain_nonpain(
     if n_epochs != n_meta:
         print(f"Warning: tfr epochs ({n_epochs}) != events rows ({n_meta}); trimming to {n}.")
 
-    pain_vec = pd.to_numeric(events_df.loc[: n - 1, "pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
-    pain_mask = pain_vec == 1
-    non_mask = pain_vec == 0
+    # Prefer labels from TFR metadata if available to ensure perfect alignment
+    if getattr(tfr, "metadata", None) is not None and "pain_binary_coded" in tfr.metadata.columns:
+        pain_vec = pd.to_numeric(tfr.metadata.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+    else:
+        pain_vec = pd.to_numeric(events_df.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+    pain_mask = np.asarray(pain_vec == 1, dtype=bool)
+    non_mask = np.asarray(pain_vec == 0, dtype=bool)
 
+    # Debug counts before deciding to skip
+    print(f"Debug: n_epochs={n_epochs}, n_meta={n_meta}, n={n}, len_pain_vec={len(pain_vec)}")
+    print(f"Pain/non-pain counts (n={n}): pain={int(pain_mask.sum())}, non-pain={int(non_mask.sum())}.")
     if pain_mask.sum() == 0 or non_mask.sum() == 0:
         print("One of the groups has zero trials; skipping contrasts.")
         return
 
     # Subset and baseline-correct per-epoch before averaging
     tfr_sub = tfr.copy()[:n]
+    if len(pain_mask) != len(tfr_sub):
+        print(f"Warning: mask length ({len(pain_mask)}) != TFR epochs ({len(tfr_sub)}); reslicing to match.")
+        n2 = min(len(tfr_sub), len(pain_mask))
+        tfr_sub = tfr_sub[:n2]
+        pain_mask = pain_mask[:n2]
+        non_mask = non_mask[:n2]
+        print(f"Debug after reslice: len(tfr_sub)={len(tfr_sub)}, len(pain_mask)={len(pain_mask)}")
     _apply_baseline_safe(tfr_sub, baseline=baseline, mode="logratio")
 
     tfr_pain = tfr_sub[pain_mask].average()
@@ -472,18 +482,32 @@ def contrast_pain_nonpain(
         print(f"Cz difference plot failed: {e}")
 
     # Grouped topomap grid for alpha/beta/gamma x (pain/non/diff)
+    times = np.asarray(tfr_pain.times)
+    tmin_req, tmax_req = plateau_window
+    tmin_eff = float(max(times.min(), tmin_req))
+    tmax_eff = float(min(times.max(), tmax_req))
     fmax_available = float(np.max(tfr_pain.freqs))
     bands: Dict[str, Tuple[float, float]] = {
         "alpha": BAND_BOUNDS["alpha"],
         "beta": BAND_BOUNDS["beta"],
         "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
     }
-    tmin, tmax = plateau_window
+    tmin, tmax = tmin_eff, tmax_eff
 
-    cond_labels = ["painful", "non-painful", "pain - non"]
+    # Final counts after potential reslicing
+    n_pain = int(pain_mask.sum())
+    n_non = int(non_mask.sum())
+    cond_labels = [f"Pain (n={n_pain})", f"Non-pain (n={n_non})", "", "Pain - Non"]
     n_rows = len(bands)
-    n_cols = len(cond_labels)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.0 * n_cols, 3.5 * n_rows), squeeze=False)
+    # Insert a narrow spacer column between Non-pain and Diff
+    n_cols = 4
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.0 * n_cols, 3.5 * n_rows),
+        squeeze=False,
+        gridspec_kw={"width_ratios": [1.0, 1.0, 0.25, 1.0], "wspace": 0.3},
+    )
     for r, (band, (fmin, fmax)) in enumerate(bands.items()):
         fmax_eff = min(fmax, fmax_available)
         if fmin >= fmax_eff:
@@ -502,35 +526,60 @@ def contrast_pain_nonpain(
         vmin = float(min(pain_data.min(), non_data.min()))
         vmax = float(max(pain_data.max(), non_data.max()))
         diff_abs = float(np.nanmax(np.abs(diff_data))) if np.isfinite(diff_data).any() else 0.0
-        for c, arr in enumerate([pain_data, non_data, diff_data]):
-            ax = axes[r, c]
-            try:
-                # For diff, leave autoscale; for others, use common vmin/vmax
-                if c < 2:
-                    mne.viz.plot_topomap(arr, tfr_pain.info, axes=ax, show=False, vmin=vmin, vmax=vmax, cmap=TOPO_CMAP)
-                else:
-                    mne.viz.plot_topomap(arr, tfr_pain.info, axes=ax, show=False,
-                                         vmin=-diff_abs if diff_abs > 0 else None,
-                                         vmax=+diff_abs if diff_abs > 0 else None,
-                                         cmap=TOPO_CMAP)
-            except Exception:
-                _plot_topomap_on_ax(ax, arr, tfr_pain.info)
-            if r == 0:
-                ax.set_title(cond_labels[c], fontsize=10)
-        axes[r, 0].set_ylabel(band, fontsize=10)
+        # Plot Pain (col 0), Non-pain (col 1), leave col 2 empty, Diff (col 3)
+        # Pain
+        ax = axes[r, 0]
+        try:
+            mne.viz.plot_topomap(pain_data, tfr_pain.info, axes=ax, show=False, vmin=vmin, vmax=vmax, cmap=TOPO_CMAP)
+        except Exception:
+            _plot_topomap_on_ax(ax, pain_data, tfr_pain.info)
+        # Non-pain
+        ax = axes[r, 1]
+        try:
+            mne.viz.plot_topomap(non_data, tfr_pain.info, axes=ax, show=False, vmin=vmin, vmax=vmax, cmap=TOPO_CMAP)
+        except Exception:
+            _plot_topomap_on_ax(ax, non_data, tfr_pain.info)
+        # Spacer column (col 2)
+        axes[r, 2].axis('off')
+        # Diff
+        ax = axes[r, 3]
+        try:
+            mne.viz.plot_topomap(diff_data, tfr_pain.info, axes=ax, show=False,
+                                 vmin=-diff_abs if diff_abs > 0 else None,
+                                 vmax=+diff_abs if diff_abs > 0 else None,
+                                 cmap=TOPO_CMAP)
+        except Exception:
+            _plot_topomap_on_ax(ax, diff_data, tfr_pain.info)
+        if r == 0:
+            for c_title in (0, 1, 3):
+                axes[r, c_title].set_title(cond_labels[c_title], fontsize=9, pad=4)
+        axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
         # Add compact colorbars per row
         try:
             sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=TOPO_CMAP)
             sm_pn.set_array([])
-            fig.colorbar(sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            cbar_pn = fig.colorbar(sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            try:
+                cbar_pn.set_label("log10(power/baseline)")
+            except Exception:
+                pass
             if diff_abs > 0:
                 sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-diff_abs, vcenter=0.0, vmax=diff_abs), cmap=TOPO_CMAP)
                 sm_diff.set_array([])
-                fig.colorbar(sm_diff, ax=axes[r, 2], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                cbar_diff = fig.colorbar(sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                try:
+                    cbar_diff.set_label("log10(power/baseline)")
+                except Exception:
+                    pass
         except Exception:
             pass
-    fig.suptitle("Topomaps (baseline logratio): bands x conditions", fontsize=12)
-    _save_fig(fig, out_dir, "topomap_grid_bands_pain_non_diff_baseline_logratio.png")
+    fig.suptitle(f"Topomaps (baseline: logratio; t=[{tmin:.1f}, {tmax:.1f}] s)", fontsize=12)
+    try:
+        # Removed bottom 'Conditions' label per request; keep y-label for frequency bands
+        fig.supylabel("Frequency bands", fontsize=10)
+    except Exception:
+        pass
+    _save_fig(fig, out_dir, "topomap_grid_bands_pain_non_diff_baseline_logratio.png", formats=["png", "svg"])
 
 
 def contrast_pain_nonpain_topomaps_rois(
@@ -538,8 +587,8 @@ def contrast_pain_nonpain_topomaps_rois(
     events_df: Optional[pd.DataFrame],
     roi_map: Dict[str, list[str]],
     out_dir: Path,
-    baseline: Tuple[Optional[float], Optional[float]] = (None, 0.0),
-    plateau_window: Tuple[float, float] = (0.5, 8.0),
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
 ) -> None:
     """Topomaps per ROI (highlighting ROI sensors) for pain/non-pain and difference.
 
@@ -558,14 +607,26 @@ def contrast_pain_nonpain_topomaps_rois(
     if n_epochs != n_meta:
         print(f"ROI topomaps: tfr epochs ({n_epochs}) != events rows ({n_meta}); trimming to {n}.")
 
-    pain_vec = pd.to_numeric(events_df.loc[: n - 1, "pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
-    pain_mask = pain_vec == 1
-    non_mask = pain_vec == 0
+    # Prefer labels from TFR metadata if available
+    if getattr(tfr, "metadata", None) is not None and "pain_binary_coded" in tfr.metadata.columns:
+        pain_vec = pd.to_numeric(tfr.metadata.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+    else:
+        pain_vec = pd.to_numeric(events_df.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+    pain_mask = np.asarray(pain_vec == 1, dtype=bool)
+    non_mask = np.asarray(pain_vec == 0, dtype=bool)
+    print(f"ROI topomaps pain/non-pain counts (n={n}): pain={int(pain_mask.sum())}, non-pain={int(non_mask.sum())}.")
     if pain_mask.sum() == 0 or non_mask.sum() == 0:
         print("ROI topomaps: one of the groups has zero trials; skipping.")
         return
 
     tfr_sub = tfr.copy()[:n]
+    if len(pain_mask) != len(tfr_sub):
+        print(f"Warning (ROI topomaps): mask length ({len(pain_mask)}) != TFR epochs ({len(tfr_sub)}); reslicing to match.")
+        n2 = min(len(tfr_sub), len(pain_mask))
+        tfr_sub = tfr_sub[:n2]
+        pain_mask = pain_mask[:n2]
+        non_mask = non_mask[:n2]
+        print(f"Debug after reslice (ROI topomaps): len(tfr_sub)={len(tfr_sub)}, len(pain_mask)={len(pain_mask)}")
     _apply_baseline_safe(tfr_sub, baseline=baseline, mode="logratio")
     tfr_pain = tfr_sub[pain_mask].average()
     tfr_non = tfr_sub[non_mask].average()
@@ -576,18 +637,31 @@ def contrast_pain_nonpain_topomaps_rois(
         "beta": BAND_BOUNDS["beta"],
         "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
     }
-    tmin, tmax = plateau_window
+    times = np.asarray(tfr_pain.times)
+    tmin_req, tmax_req = plateau_window
+    tmin_eff = float(max(times.min(), tmin_req))
+    tmax_eff = float(min(times.max(), tmax_req))
+    tmin, tmax = tmin_eff, tmax_eff
 
     ch_names = tfr_pain.info["ch_names"]
-    cond_labels = ["painful", "non-painful", "pain - non"]
+    # Add counts to condition labels
+    n_pain = int(pain_mask.sum())
+    n_non = int(non_mask.sum())
+    cond_labels = [f"Pain (n={n_pain})", f"Non-pain (n={n_non})", "", "Pain - Non"]
     for roi, roi_chs in roi_map.items():
         # Build boolean mask for channels in this ROI
         mask_vec = np.array([ch in roi_chs for ch in ch_names], dtype=bool)
         mask_params = ROI_MASK_PARAMS_DEFAULT
 
         n_rows = len(bands)
-        n_cols = len(cond_labels)
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.0 * n_cols, 3.5 * n_rows), squeeze=False)
+        n_cols = 4
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(4.0 * n_cols, 3.5 * n_rows),
+            squeeze=False,
+            gridspec_kw={"width_ratios": [1.0, 1.0, 0.25, 1.0], "wspace": 0.4},
+        )
         for r, (band, (fmin, fmax)) in enumerate(bands.items()):
             fmax_eff = min(fmax, fmax_available)
             if fmin >= fmax_eff:
@@ -604,35 +678,61 @@ def contrast_pain_nonpain_topomaps_rois(
             vmin = float(min(pain_data.min(), non_data.min()))
             vmax = float(max(pain_data.max(), non_data.max()))
             diff_abs = float(np.nanmax(np.abs(diff_data))) if np.isfinite(diff_data).any() else 0.0
-            for c, arr in enumerate([pain_data, non_data, diff_data]):
-                ax = axes[r, c]
-                try:
-                    if c < 2:
-                        mne.viz.plot_topomap(arr, tfr_pain.info, axes=ax, show=False, vmin=vmin, vmax=vmax,
-                                             mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
-                    else:
-                        mne.viz.plot_topomap(arr, tfr_pain.info, axes=ax, show=False,
-                                             vmin=-diff_abs if diff_abs > 0 else None,
-                                             vmax=+diff_abs if diff_abs > 0 else None,
-                                             mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
-                except Exception:
-                    _plot_topomap_on_ax(ax, arr, tfr_pain.info, mask=mask_vec, mask_params=mask_params)
-                if r == 0:
-                    ax.set_title(cond_labels[c], fontsize=10)
-            axes[r, 0].set_ylabel(band, fontsize=10)
+            # Pain (col 0)
+            ax = axes[r, 0]
+            try:
+                mne.viz.plot_topomap(pain_data, tfr_pain.info, axes=ax, show=False, vmin=vmin, vmax=vmax,
+                                     mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
+            except Exception:
+                _plot_topomap_on_ax(ax, pain_data, tfr_pain.info, mask=mask_vec, mask_params=mask_params)
+            # Non-pain (col 1)
+            ax = axes[r, 1]
+            try:
+                mne.viz.plot_topomap(non_data, tfr_pain.info, axes=ax, show=False, vmin=vmin, vmax=vmax,
+                                     mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
+            except Exception:
+                _plot_topomap_on_ax(ax, non_data, tfr_pain.info, mask=mask_vec, mask_params=mask_params)
+            # Spacer (col 2)
+            axes[r, 2].axis('off')
+            # Diff (col 3)
+            ax = axes[r, 3]
+            try:
+                mne.viz.plot_topomap(diff_data, tfr_pain.info, axes=ax, show=False,
+                                     vmin=-diff_abs if diff_abs > 0 else None,
+                                     vmax=+diff_abs if diff_abs > 0 else None,
+                                     mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
+            except Exception:
+                _plot_topomap_on_ax(ax, diff_data, tfr_pain.info, mask=mask_vec, mask_params=mask_params)
+            if r == 0:
+                for c_title in (0, 1, 3):
+                    axes[r, c_title].set_title(cond_labels[c_title], fontsize=9, pad=4)
+            axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
             # Add compact colorbars per row
             try:
                 sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=TOPO_CMAP)
                 sm_pn.set_array([])
-                fig.colorbar(sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                cbar_pn = fig.colorbar(sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                try:
+                    cbar_pn.set_label("log10(power/baseline)")
+                except Exception:
+                    pass
                 if diff_abs > 0:
                     sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-diff_abs, vcenter=0.0, vmax=diff_abs), cmap=TOPO_CMAP)
                     sm_diff.set_array([])
-                    fig.colorbar(sm_diff, ax=axes[r, 2], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                    cbar_diff = fig.colorbar(sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                    try:
+                        cbar_diff.set_label("log10(power/baseline)")
+                    except Exception:
+                        pass
             except Exception:
                 pass
-        fig.suptitle(f"ROI: {roi} — Topomaps (baseline logratio)", fontsize=12)
-        _save_fig(fig, out_dir, f"topomap_ROI-{_sanitize(roi)}_grid_bands_pain_non_diff_baseline_logratio.png")
+        try:
+            fig.suptitle(f"ROI: {roi} — Topomaps (baseline: logratio; t=[{tmin:.1f}, {tmax:.1f}] s)", fontsize=12)
+            # Removed bottom 'Conditions' label per request; keep frequency bands label
+            fig.supylabel("Frequency bands", fontsize=10)
+        except Exception:
+            pass
+        _save_fig(fig, out_dir, f"topomap_ROI-{_sanitize(roi)}_grid_bands_pain_non_diff_baseline_logratio.png", formats=["png", "svg"])
 
 def _epochs_mean_roi(epochs: mne.Epochs, roi_name: str, roi_chs: list[str]) -> Optional[mne.Epochs]:
     """Create an Epochs object with a single virtual channel as the mean of ROI channels."""
@@ -756,7 +856,10 @@ def plot_topomaps_rois_all_trials(
         "beta": BAND_BOUNDS["beta"],
         "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
     }
-    tmin, tmax = plateau_window
+    times = np.asarray(tfr_avg.times)
+    tmin_req, tmax_req = plateau_window
+    tmin = float(max(times.min(), tmin_req))
+    tmax = float(min(times.max(), tmax_req))
 
     ch_names = tfr_avg.info["ch_names"]
     for roi, roi_chs in roi_map.items():
@@ -783,15 +886,24 @@ def plot_topomaps_rois_all_trials(
                                      mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
             except Exception:
                 _plot_topomap_on_ax(axes[r, 0], data, tfr_avg.info, mask=mask_vec, mask_params=mask_params)
-            axes[r, 0].set_ylabel(band, fontsize=10)
+            axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
             try:
                 sm = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=TOPO_CMAP)
                 sm.set_array([])
-                fig.colorbar(sm, ax=axes[r, 0], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                cbar = fig.colorbar(sm, ax=axes[r, 0], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                try:
+                    cbar.set_label("log10(power/baseline)")
+                except Exception:
+                    pass
             except Exception:
                 pass
-        fig.suptitle(f"ROI: {roi} — Topomaps (all trials, baseline logratio)", fontsize=12)
-        _save_fig(fig, out_dir, f"topomap_ROI-{_sanitize(roi)}_grid_bands_all_trials_baseline_logratio.png")
+        fig.suptitle(f"ROI: {roi} — Topomaps (all trials; baseline: logratio; t=[{tmin:.1f}, {tmax:.1f}] s)", fontsize=12)
+        try:
+            fig.supylabel("Frequency bands", fontsize=10)
+            fig.supxlabel("All trials", fontsize=10)
+        except Exception:
+            pass
+        _save_fig(fig, out_dir, f"topomap_ROI-{_sanitize(roi)}_grid_bands_all_trials_baseline_logratio.png", formats=["png", "svg"])
 
 
 def contrast_pain_nonpain_rois(
@@ -813,14 +925,24 @@ def contrast_pain_nonpain_rois(
             if n_epochs != n_meta:
                 print(f"ROI {roi}: trimming to {n} epochs to match events.")
 
-            pain_vec = pd.to_numeric(events_df.loc[: n - 1, "pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
-            pain_mask = pain_vec == 1
-            non_mask = pain_vec == 0
+            if getattr(tfr, "metadata", None) is not None and "pain_binary_coded" in tfr.metadata.columns:
+                pain_vec = pd.to_numeric(tfr.metadata.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+            else:
+                pain_vec = pd.to_numeric(events_df.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+            pain_mask = np.asarray(pain_vec == 1, dtype=bool)
+            non_mask = np.asarray(pain_vec == 0, dtype=bool)
             if pain_mask.sum() == 0 or non_mask.sum() == 0:
                 print(f"ROI {roi}: one group has zero trials; skipping.")
                 continue
 
             tfr_sub = tfr.copy()[:n]
+            if len(pain_mask) != len(tfr_sub):
+                print(f"Warning (ROI {roi}): mask length ({len(pain_mask)}) != TFR epochs ({len(tfr_sub)}); reslicing to match.")
+                n2 = min(len(tfr_sub), len(pain_mask))
+                tfr_sub = tfr_sub[:n2]
+                pain_mask = pain_mask[:n2]
+                non_mask = non_mask[:n2]
+                print(f"Debug after reslice (ROI {roi}): len(tfr_sub)={len(tfr_sub)}, len(pain_mask)={len(pain_mask)}")
             _apply_baseline_safe(tfr_sub, baseline=baseline, mode="logratio")
             tfr_pain = tfr_sub[pain_mask].average()
             tfr_non = tfr_sub[non_mask].average()
