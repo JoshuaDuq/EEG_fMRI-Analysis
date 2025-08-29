@@ -426,6 +426,202 @@ def scatter_roi_power_vs_rating(
     _save_fig(fig, plots_dir / f"scatter_{_sanitize(roi_key)}_{band}_power_vs_rating_temp")
 
 
+# Power high vs low rating topographic difference
+# -----------------------------------------------------------------------------
+
+def plot_power_topomap_high_vs_low(subject: str, task: str = TASK, band: str = "alpha") -> None:
+    plots_dir = _plots_dir(subject)
+    stats_dir = _stats_dir(subject)
+    _ensure_dir(plots_dir)
+    _ensure_dir(stats_dir)
+
+    # Load power features and ratings
+    pow_df, _conn_df, y, info = _load_features_and_targets(subject, task)
+
+    cols = [c for c in pow_df.columns if c.startswith(f"pow_{band}_")]
+    if not cols:
+        print(f"No power features found for band {band} in sub-{subject}")
+        return
+
+    # Order channels according to info
+    chan_order = [ch for ch in info["ch_names"] if f"pow_{band}_{ch}" in cols]
+    if not chan_order:
+        print(f"No matching channels for band {band} in sub-{subject}")
+        return
+
+    X = pow_df[[f"pow_{band}_{ch}" for ch in chan_order]].apply(pd.to_numeric, errors="coerce")
+
+    # Align lengths and drop NaN ratings
+    n = min(len(X), len(y))
+    X = X.iloc[:n, :]
+    y = pd.to_numeric(y.iloc[:n], errors="coerce")
+    mask = y.notna()
+    X = X[mask]
+    y = y[mask]
+    if len(y) < 4:
+        print(f"Too few trials for high/low split: sub-{subject}, band {band}")
+        return
+
+    med = float(np.nanmedian(y))
+    hi_mask = y > med
+    lo_mask = y <= med
+    if hi_mask.sum() == 0 or lo_mask.sum() == 0:
+        print(f"High/low groups empty for sub-{subject}, band {band}")
+        return
+
+    hi_mean = X.loc[hi_mask].mean(axis=0)
+    lo_mean = X.loc[lo_mask].mean(axis=0)
+    diff = hi_mean - lo_mean
+
+    tvals: List[float] = []
+    pvals: List[float] = []
+    for ch in X.columns:
+        xh = X.loc[hi_mask, ch]
+        xl = X.loc[lo_mask, ch]
+        if xh.notna().sum() >= 2 and xl.notna().sum() >= 2:
+            t, p = stats.ttest_ind(xh, xl, equal_var=False, nan_policy="omit")
+        else:
+            t, p = np.nan, np.nan
+        tvals.append(float(t))
+        pvals.append(float(p))
+
+    channel_names = [c.split(f"pow_{band}_", 1)[-1] for c in X.columns]
+    stats_df = pd.DataFrame(
+        {
+            "channel": channel_names,
+            "mean_high": hi_mean.to_numpy(),
+            "mean_low": lo_mean.to_numpy(),
+            "diff": diff.to_numpy(),
+            "t": tvals,
+            "p": pvals,
+        }
+    )
+    stats_df.to_csv(stats_dir / f"topomap_diff_{band}_high_vs_low.tsv", sep="\t", index=False)
+
+    # Plot topomap
+    picks = mne.pick_channels(info["ch_names"], include=chan_order)
+    info_sub = mne.pick_info(info, picks, copy=True)
+    data = diff.to_numpy(dtype=float)
+    vmax = np.nanmax(np.abs(data)) if np.isfinite(data).any() else 1.0
+    mask_arr = np.array(pvals) < 0.05
+    mask_plot = mask_arr if mask_arr.any() else None
+    mask_params = (
+        dict(marker='o', markerfacecolor='w', markeredgecolor='k', linewidth=0.5, markersize=4)
+        if mask_arr.any()
+        else None
+    )
+    fig, ax = plt.subplots()
+    try:
+        mne.viz.plot_topomap(
+            data,
+            info_sub,
+            axes=ax,
+            show=False,
+            vlim=(-vmax, vmax),
+            cmap=TOPO_CMAP,
+            contours=TOPO_CONTOURS,
+            mask=mask_plot,
+            mask_params=mask_params,
+        )
+    except TypeError:
+        mne.viz.plot_topomap(
+            data,
+            info_sub,
+            axes=ax,
+            show=False,
+            vmin=-vmax,
+            vmax=vmax,
+            cmap=TOPO_CMAP,
+            contours=TOPO_CONTOURS,
+            mask=mask_plot,
+            mask_params=mask_params,
+        )
+    ax.set_title(f"{band} high\u2013low power")
+    _save_fig(fig, plots_dir / f"topomap_diff_{band}_high_vs_low")
+
+# Trial-level TFR sorted by rating
+# -----------------------------------------------------------------------------
+
+def plot_tfr_sorted_by_rating(subject: str, task: str = TASK, channel: str = "Cz") -> None:
+    """Plot per-trial TFR power for a channel sorted by behavioral ratings."""
+
+    plots_dir = _plots_dir(subject)
+    _ensure_dir(plots_dir)
+
+    # ------------------------------------------------------------------
+    # Load epochs
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None:
+        print(f"No cleaned epochs found for sub-{subject}, task-{task}")
+        return
+    epochs = mne.read_epochs(epo_path, preload=True, verbose=False)
+
+    # ------------------------------------------------------------------
+    # Load and align ratings to epochs
+    events = _load_events_df(subject, task)
+    events = _align_events_to_epochs(events, epochs)
+    rating_col = _pick_first_column(events, RATING_COLUMNS) if events is not None else None
+    if rating_col is None:
+        print(f"TFR sorted by rating: no rating column found for sub-{subject}")
+        return
+    ratings = pd.to_numeric(events[rating_col], errors="coerce").to_numpy()
+    valid = ~np.isnan(ratings)
+    if valid.sum() == 0:
+        print(f"TFR sorted by rating: no valid ratings for sub-{subject}")
+        return
+    epochs = epochs[valid]
+    ratings = ratings[valid]
+
+    # ------------------------------------------------------------------
+    # Compute trial-level TFR
+    freqs = np.linspace(4.0, 40.0, 20)
+    n_cycles = freqs / 2.0
+    power = mne.time_frequency.tfr_morlet(
+        epochs,
+        freqs=freqs,
+        n_cycles=n_cycles,
+        use_fft=True,
+        return_itc=False,
+        average=False,
+        decim=2,
+        n_jobs=1,
+        picks="eeg",
+        verbose=False,
+    )
+
+    if channel not in power.ch_names:
+        print(f"Channel {channel} not found for sub-{subject}")
+        return
+
+    ch_idx = power.ch_names.index(channel)
+    data = power.data[:, ch_idx, :, :]  # (n_trials, n_freqs, n_times)
+    data = data.mean(axis=1)  # average over frequency -> (n_trials, n_times)
+
+    order = np.argsort(ratings)
+    data = data[order]
+    ratings_sorted = ratings[order]
+
+    # ------------------------------------------------------------------
+    # Plot heatmap
+    fig, ax = plt.subplots(figsize=(6, 4))
+    sns.heatmap(data, ax=ax, cmap="viridis", cbar_kws={"label": "Power"})
+
+    times = power.times
+    xticks = np.linspace(0, len(times) - 1, 5, dtype=int)
+    ax.set_xticks(xticks)
+    ax.set_xticklabels([f"{times[i]:.1f}" for i in xticks])
+
+    yticks = np.linspace(0, len(ratings_sorted) - 1, min(10, len(ratings_sorted)), dtype=int)
+    ax.set_yticks(yticks + 0.5)
+    ax.set_yticklabels([f"{ratings_sorted[i]:.1f}" for i in yticks])
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Rating (sorted)")
+    ax.set_title(f"{channel} power sorted by rating")
+
+    fname = f"tfr_sorted_by_rating_{_sanitize(channel)}"
+    _save_fig(fig, plots_dir / fname)
+
 # -----------------------------------------------------------------------------
 # Correlation: power features -> topographic maps
 # -----------------------------------------------------------------------------
@@ -1571,6 +1767,11 @@ def process_subject(
         correlate_power_topomaps(subject, task, use_spearman=use_spearman)
     except Exception as e:
         print(f"Power correlations failed for sub-{subject}: {e}")
+    try:
+        for b in POWER_BANDS_TO_USE:
+            plot_power_topomap_high_vs_low(subject, task, band=b)
+    except Exception as e:
+        print(f"High/low power topomap failed for sub-{subject}: {e}")
     try:
         correlate_power_roi_stats(
             subject,
