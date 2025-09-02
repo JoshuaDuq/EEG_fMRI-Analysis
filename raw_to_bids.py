@@ -17,27 +17,29 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-# Try to import project config if present
-DEFAULT_TASK = "thermalactive"
-DEFAULT_MONTAGE = "easycap-M1"
-DEFAULT_LINE_FREQ = 60.0
+# Load centralized configuration
+from config_loader import load_config, get_legacy_constants
 
 try:
-    # Resolve to project root: this file sits in eeg_pipeline/
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    sys.path.append(str(PROJECT_ROOT / "eeg_pipeline"))
-    import config as project_cfg  # type: ignore
-
-    BIDS_ROOT = Path(getattr(project_cfg, "bids_root", PROJECT_ROOT / "eeg_pipeline" / "bids_output"))
-    TASK = getattr(project_cfg, "task", DEFAULT_TASK)
-    MONTAGE_NAME = getattr(project_cfg, "eeg_template_montage", DEFAULT_MONTAGE)
-    LINE_FREQ = float(getattr(project_cfg, "zapline_fline", DEFAULT_LINE_FREQ) or DEFAULT_LINE_FREQ)
-except Exception:
+    config = load_config()
+    _constants = get_legacy_constants(config)
+    
+    PROJECT_ROOT = _constants["PROJECT_ROOT"]
+    BIDS_ROOT = _constants["BIDS_ROOT"]
+    TASK = _constants["TASK"]
+    MONTAGE_NAME = _constants["DEFAULT_MONTAGE"]
+    LINE_FREQ = _constants["DEFAULT_LINE_FREQ"]
+    
+except ImportError as e:
+    # Fallback to hardcoded values
+    import warnings
+    warnings.warn(f"Failed to load externalized config ({e}), using fallback values", UserWarning)
+    
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     BIDS_ROOT = PROJECT_ROOT / "eeg_pipeline" / "bids_output"
-    TASK = DEFAULT_TASK
-    MONTAGE_NAME = DEFAULT_MONTAGE
-    LINE_FREQ = DEFAULT_LINE_FREQ
+    TASK = "thermalactive"
+    MONTAGE_NAME = "easycap-M1"
+    LINE_FREQ = 60.0
 
 
 def find_brainvision_vhdrs(source_root: Path) -> List[Path]:
