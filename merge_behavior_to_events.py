@@ -13,6 +13,23 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+# Load centralized configuration
+try:
+    from config_loader import EEGConfig
+    config = EEGConfig()
+    
+    # Extract parameters from config
+    PROJECT_ROOT = config.project.root
+    BIDS_ROOT = config.project.bids_root
+    SOURCE_ROOT = config.project.source_root
+    TASK = config.project.task
+except Exception:
+    # Fallback if config loading fails
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    BIDS_ROOT = PROJECT_ROOT / "eeg_pipeline" / "bids_output"
+    SOURCE_ROOT = PROJECT_ROOT / "eeg_pipeline" / "source_data"
+    TASK = "thermalactive"
+
 
 def _norm_trial_type(s: str) -> str:
     # Collapse all whitespace runs to single spaces, strip ends
@@ -292,18 +309,10 @@ def _combine_runs_for_subject(sub_eeg_dir: Path, task: str) -> Optional[Path]:
 def main():
     import argparse
 
-    # Try to import project config to get defaults
-    default_project_root = Path(__file__).resolve().parents[1]
-    sys.path.append(str(default_project_root / "eeg_pipeline"))
-    try:
-        import config as project_cfg  # type: ignore
-        bids_root = Path(getattr(project_cfg, "bids_root", default_project_root / "eeg_pipeline" / "bids_output"))
-        source_root = Path(default_project_root / "eeg_pipeline" / "source_data")
-        task = str(getattr(project_cfg, "task", "thermalactive"))
-    except Exception:
-        bids_root = default_project_root / "eeg_pipeline" / "bids_output"
-        source_root = default_project_root / "eeg_pipeline" / "source_data"
-        task = "thermalactive"
+    # Use centralized config values
+    bids_root = BIDS_ROOT
+    source_root = SOURCE_ROOT
+    task = TASK
 
     parser = argparse.ArgumentParser(description="Merge behavioral TrialSummary.csv into BIDS events.tsv for each subject")
     parser.add_argument("--bids_root", type=str, default=str(bids_root), help="BIDS root containing sub-*/eeg/*_events.tsv")
