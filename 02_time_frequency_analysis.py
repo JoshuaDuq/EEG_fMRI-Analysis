@@ -1015,7 +1015,7 @@ def contrast_pain_nonpain(
         except Exception:
             _plot_topomap_on_ax(ax, pain_data, tfr_pain.info, vmin=-vabs_pn, vmax=+vabs_pn)
         # Annotate mean value
-        ax.text(0.5, 1.02, f"\u03bc={pain_mu:.3f} ({(10**pain_mu-1)*100:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"\u03bc={pain_mu:.3f} ({(10**(pain_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
         # Non-pain
         ax = axes[r, 1]
         try:
@@ -1023,7 +1023,7 @@ def contrast_pain_nonpain(
         except Exception:
             _plot_topomap_on_ax(ax, non_data, tfr_pain.info, vmin=-vabs_pn, vmax=+vabs_pn)
         # Annotate mean value
-        ax.text(0.5, 1.02, f"\u03bc={non_mu:.3f} ({(10**non_mu-1)*100:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"\u03bc={non_mu:.3f} ({(10**(non_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
         # Spacer column (col 2)
         axes[r, 2].axis('off')
         # Diff
@@ -1035,8 +1035,8 @@ def contrast_pain_nonpain(
         except Exception:
             _plot_topomap_on_ax(ax, diff_data, tfr_pain.info, vmin=(-diff_abs if diff_abs > 0 else None), vmax=(+diff_abs if diff_abs > 0 else None))
         # Annotate mean difference value
-        pct_mu = (10**diff_mu - 1.0) * 100.0
-        ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
+        ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
         if r == 0:
             for c_title in (0, 1, 3):
                 axes[r, c_title].set_title(cond_labels[c_title], fontsize=9, pad=4, y=1.04)
@@ -1202,7 +1202,7 @@ def contrast_maxmin_temperature(
             mne.viz.plot_topomap(max_data, tfr_max.info, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
         except Exception:
             _plot_topomap_on_ax(ax, max_data, tfr_max.info, vmin=-vabs_pn, vmax=+vabs_pn)
-        ax.text(0.5, 1.02, f"\u03bc={max_mu:.3f} ({(10**max_mu-1)*100:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"\u03bc={max_mu:.3f} ({(10**(max_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         # Min temp (col 1)
         ax = axes[r, 1]
@@ -1210,7 +1210,7 @@ def contrast_maxmin_temperature(
             mne.viz.plot_topomap(min_data, tfr_min.info, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
         except Exception:
             _plot_topomap_on_ax(ax, min_data, tfr_min.info, vmin=-vabs_pn, vmax=+vabs_pn)
-        ax.text(0.5, 1.02, f"\u03bc={min_mu:.3f} ({(10**min_mu-1)*100:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"\u03bc={min_mu:.3f} ({(10**(min_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         # Spacer (col 2)
         axes[r, 2].axis("off")
@@ -1228,8 +1228,8 @@ def contrast_maxmin_temperature(
             )
         except Exception:
             _plot_topomap_on_ax(ax, diff_data, tfr_max.info, vmin=(-diff_abs if diff_abs > 0 else None), vmax=(+diff_abs if diff_abs > 0 else None))
-        pct_mu = (10 ** diff_mu - 1.0) * 100.0
-        ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
+        ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         if r == 0:
             axes[r, 0].set_title(f"Max {t_max:.1f}°C (n={int(mask_max.sum())})", fontsize=9, pad=4, y=1.04)
@@ -1412,8 +1412,8 @@ def contrast_pain_nonpain_topomaps_rois(
             except Exception:
                 _plot_topomap_on_ax(ax, diff_data, tfr_pain.info, mask=mask_vec, mask_params=mask_params, vmin=(-diff_abs if diff_abs > 0 else None), vmax=(+diff_abs if diff_abs > 0 else None))
             # Annotate ROI-mean difference
-            pct_mu = (10**diff_mu - 1.0) * 100.0
-            ax.text(0.5, 1.02, f"\u0394\u03bc_ROI={diff_mu:.3f} ({pct_mu:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=8)
+            pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
+            ax.text(0.5, 1.02, f"\u0394\u03bc_ROI={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=8)
             if r == 0:
                 for c_title in (0, 1, 3):
                     axes[r, c_title].set_title(cond_labels[c_title], fontsize=9, pad=4, y=1.04)

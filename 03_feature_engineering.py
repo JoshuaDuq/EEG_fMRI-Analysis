@@ -43,6 +43,8 @@ TARGET_COLUMNS = _constants["TARGET_COLUMNS"]
 
 # Minimum number of samples required in the baseline window
 MIN_BASELINE_SAMPLES = 5
+# Baseline window for TFR computations (start, end) in seconds
+TFR_BASELINE = tuple(config.analysis.time_frequency.baseline_window)
 
 LOG_FILE_NAME = config.logging.file_names.feature_engineering  # Name of the log file for this script
 
@@ -58,6 +60,7 @@ TFR_SPECTROGRAM_VLIM = config.get(
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
 
 
 def _robust_sym_vlim(
@@ -90,6 +93,31 @@ def _robust_sym_vlim(
         return float(min(v, cap))
     except Exception:
         return cap
+
+def _validate_baseline_indices(
+    times: np.ndarray,
+    baseline: Tuple[Optional[float], Optional[float]],
+    min_samples: int = MIN_BASELINE_SAMPLES,
+) -> Tuple[float, float, np.ndarray]:
+    """Validate baseline window and return a time mask.
+
+    Ensures the baseline interval ends before stimulus onset and
+    contains at least ``min_samples`` samples.
+    """
+    b_start, b_end = baseline
+    if b_start is None:
+        b_start = float(times.min())
+    if b_end is None:
+        b_end = 0.0
+    if b_end >= 0:
+        raise ValueError("Baseline window must end before 0 s")
+    mask = (times >= b_start) & (times < b_end)
+    if mask.sum() < min_samples:
+        raise ValueError(
+            f"Baseline window has {int(mask.sum())} samples; at least {min_samples} required"
+        )
+    return b_start, b_end, mask
+
 
 
 def _find_clean_epochs_path(subject: str, task: str) -> Optional[Path]:
@@ -1088,11 +1116,22 @@ def process_subject(subject: str, task: str = TASK) -> None:
     tfr_raw = tfr.copy()
     
     # Normalize to pre-stimulus baseline as 10·log10(power/baseline) (dB) for comparability
-    # Baseline window: -5.0 to 0.0 s, where 0 is stimulus onset
     try:
-        tfr.apply_baseline(baseline=(-5.0, 0.0), mode='logratio')
+        times = np.asarray(tfr.times)
+        b_start, b_end, mask = _validate_baseline_indices(times, TFR_BASELINE, MIN_BASELINE_SAMPLES)
+        if b_end >= 0:
+            raise ValueError("Baseline window must end before 0 s")
+        if mask.sum() < MIN_BASELINE_SAMPLES:
+            raise ValueError(
+                f"Baseline window has {int(mask.sum())} samples; at least {MIN_BASELINE_SAMPLES} required"
+            )
+        tfr.apply_baseline(baseline=(b_start, b_end), mode="logratio")
+    except ValueError as e:
+        logger.error(f"Baseline normalization skipped: {e}")
     except Exception as e:
-        logger.warning(f"Baseline normalization failed; proceeding without baseline. Error: {e}")
+        logger.warning(
+            f"Baseline normalization failed; proceeding without baseline. Error: {e}"
+        )
 
     pow_df, pow_cols = _extract_band_power_features(tfr, POWER_BANDS, logger)
     # Connectivity features (if available)
