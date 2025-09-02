@@ -353,7 +353,11 @@ analysis:
     do_group_default: false
     group_only_default: false
     build_reports_default: false
-    
+
+  # Feature engineering plots
+  feature_engineering:
+    tfr_spectrogram_vlim: null  # Positive value to override robust vlim for ROI spectrograms
+
   # Raw-to-BIDS conversion
   raw_to_bids:
     default_montage: "easycap-M1"
