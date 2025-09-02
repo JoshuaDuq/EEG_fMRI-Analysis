@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
+import logging
 
 import matplotlib
 matplotlib.use("Agg")  # headless-friendly
@@ -11,45 +12,38 @@ import pandas as pd
 import mne
 from mne_bids import BIDSPath
 
-# Resolve project config
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(PROJECT_ROOT / "eeg_pipeline"))
-try:
-    import config as cfg  # type: ignore
-except Exception:
-    class _Fallback:
-        project_root = PROJECT_ROOT
-        bids_root = str(PROJECT_ROOT / "eeg_pipeline" / "bids_output")
-        deriv_root = str((PROJECT_ROOT / "eeg_pipeline" / "bids_output" / "derivatives"))
-        task = "thermalactive"
-    cfg = _Fallback()  # type: ignore
+# Load centralized configuration
+from config_loader import load_config, get_legacy_constants
 
-BIDS_ROOT = Path(getattr(cfg, "bids_root", PROJECT_ROOT / "eeg_pipeline" / "bids_output"))
-DERIV_ROOT = Path(getattr(cfg, "deriv_root", BIDS_ROOT / "derivatives"))
-TASK = getattr(cfg, "task", "thermalactive")
+config = load_config()
+config.setup_matplotlib()
 
+# Extract legacy constants
+_constants = get_legacy_constants(config)
 
-# ==========================
-# CONFIG
-# Centralized, user-tunable parameters
-# ==========================
-# Default task for CLI and main()
+PROJECT_ROOT = _constants["PROJECT_ROOT"]
+BIDS_ROOT = _constants["BIDS_ROOT"]
+DERIV_ROOT = _constants["DERIV_ROOT"]
+TASK = _constants["TASK"]
 DEFAULT_TASK = TASK
+FIG_DPI = _constants["FIG_DPI"]
+ERP_PICKS = _constants["ERP_PICKS"]
+PAIN_COLUMNS = _constants["PAIN_COLUMNS"]
+TEMPERATURE_COLUMNS = _constants["TEMPERATURE_COLUMNS"]
 
-# Figure saving
-FIG_DPI = 200
-FIG_PAD_INCH = 0.2
-
-# Plotting picks
-ERP_PICKS = "eeg"
-
-# Event/metadata column candidates
-PAIN_COLUMNS = ["pain_binary_coded", "pain_binary", "pain"]
-TEMPERATURE_COLUMNS = ["stimulus_temp", "temperature", "temp_level"]
-
-# Colors for ERP contrasts
-PAIN_COLOR = "crimson"
-NONPAIN_COLOR = "navy"
+# Extract parameters from config
+FIG_PAD_INCH = config.visualization.pad_inches
+BBOX_INCHES = config.visualization.bbox_inches
+PAIN_COLOR = config.analysis.erp.pain_color
+NONPAIN_COLOR = config.analysis.erp.nonpain_color
+INCLUDE_TMAX_IN_CROP = config.analysis.erp.include_tmax_in_crop
+DEFAULT_CROP_TMIN = config.analysis.erp.default_crop_tmin
+DEFAULT_CROP_TMAX = config.analysis.erp.default_crop_tmax
+ERP_COMBINE = config.analysis.erp.combine
+PLOTS_SUBDIR = config.analysis.erp.plots_subdir
+LOG_FILE_NAME = config.logging.file_names.foundational
+COUNTS_FILE_NAME = config.analysis.erp.counts_file_name
+ERP_OUTPUT_FILES = dict(config.analysis.erp.output_files)
 
 
 def _ensure_dir(p: Path) -> None:
@@ -99,7 +93,7 @@ def _find_clean_epochs_path(subject: str, task: str) -> Optional[Path]:
     return None
 
 
-def _load_events_df(subject: str, task: str) -> Optional[pd.DataFrame]:
+def _load_events_df(subject: str, task: str, logger: Optional[logging.Logger] = None) -> Optional[pd.DataFrame]:
     # Use BIDSPath to resolve events.tsv
     ebp = BIDSPath(
         subject=subject,
@@ -118,24 +112,65 @@ def _load_events_df(subject: str, task: str) -> Optional[pd.DataFrame]:
         try:
             return pd.read_csv(p, sep="\t")
         except Exception as e:
-            print(f"Warning: failed to read events TSV at {p}: {e}")
+            msg = f"Failed to read events TSV at {p}: {e}"
+            if logger:
+                logger.warning(msg)
+            else:
+                print(f"Warning: {msg}")
             return None
     else:
-        print(f"Warning: events TSV not found for subject {subject}: {p}")
+        msg = f"Events TSV not found for subject {subject}: {p}"
+        if logger:
+            logger.warning(msg)
+        else:
+            print(f"Warning: {msg}")
         return None
 
 
-def _save_fig(fig: plt.Figure, out_dir: Path, name: str) -> None:
+def _setup_logging(subject: str) -> logging.Logger:
+    """Set up logging with console and file handlers for foundational analysis."""
+    logger = logging.getLogger(f"foundational_analysis_sub_{subject}")
+    logger.setLevel(logging.INFO)
+    # Avoid duplicate handlers if already set
+    if logger.handlers:
+        return logger
+    
+    # Create formatters
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler
+    log_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "logs"  # e.g., derivatives/sub-001/eeg/logs/
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / LOG_FILE_NAME
+    file_handler = logging.FileHandler(log_file, mode='w')  # Overwrite each run
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+
+def _save_fig(fig: plt.Figure, out_dir: Path, name: str, logger: Optional[logging.Logger] = None) -> None:
     _ensure_dir(out_dir)
     out_path = out_dir / name
     fig.tight_layout()
-    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches="tight", pad_inches=FIG_PAD_INCH)
+    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches=BBOX_INCHES, pad_inches=FIG_PAD_INCH)
     plt.close(fig)
-    print(f"Saved: {out_path}")
+    msg = f"Saved: {out_path}"
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
 
 
 def _maybe_crop_epochs(
-    epochs: mne.Epochs, crop_tmin: Optional[float], crop_tmax: Optional[float]
+    epochs: mne.Epochs, crop_tmin: Optional[float], crop_tmax: Optional[float], logger: Optional[logging.Logger] = None
 ) -> mne.Epochs:
     """Optionally crop epochs in time.
 
@@ -152,18 +187,26 @@ def _maybe_crop_epochs(
     # Ensure valid order
     if tmax <= tmin:
         raise ValueError(f"Invalid crop window: tmin={tmin}, tmax={tmax}")
-    print(f"Cropping epochs to [{tmin:.3f}, {tmax:.3f}] s (include_tmax=False)")
+    msg = f"Cropping epochs to [{tmin:.3f}, {tmax:.3f}] s (include_tmax={INCLUDE_TMAX_IN_CROP})"
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
     ep = epochs.copy()
     # Cropping modifies epoch data; ensure it is loaded into memory
     if not getattr(ep, "preload", False):
         ep.load_data()
-    return ep.crop(tmin=tmin, tmax=tmax, include_tmax=False)
+    return ep.crop(tmin=tmin, tmax=tmax, include_tmax=INCLUDE_TMAX_IN_CROP)
 
 
-def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path) -> None:
+def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
     # Prefer MNE metadata-based selection
     if epochs.metadata is None:
-        print("ERP pain contrast: epochs.metadata is missing; skipping.")
+        msg = "ERP pain contrast: epochs.metadata is missing; skipping."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
         return
     col = None
     for candidate in PAIN_COLUMNS:
@@ -171,7 +214,11 @@ def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path) -> None:
             col = candidate
             break
     if col is None:
-        print("ERP pain contrast: No pain column found in metadata. Skipping.")
+        msg = "ERP pain contrast: No pain column found in metadata. Skipping."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
         return
 
     # Build selections using MNE metadata query
@@ -186,7 +233,11 @@ def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path) -> None:
         ep_non = epochs[np.asarray(pd.to_numeric(epochs.metadata[col], errors="coerce") == 0)]
 
     if len(ep_pain) == 0 or len(ep_non) == 0:
-        print("ERP pain contrast: one of the groups has zero trials; skipping.")
+        msg = "ERP pain contrast: one of the groups has zero trials; skipping."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
         return
 
     ev_pain = ep_pain.average(picks=ERP_PICKS)
@@ -197,15 +248,19 @@ def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path) -> None:
         fig = mne.viz.plot_compare_evokeds(
             {"painful": ev_pain, "non-painful": ev_non},
             picks=ERP_PICKS,
-            combine="gfp",
+            combine=ERP_COMBINE,
             show=False,
             colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
         )
         if isinstance(fig, list):
             fig = fig[0]
-        _save_fig(fig, out_dir, "erp_pain_binary_gfp.png")
+        _save_fig(fig, out_dir, ERP_OUTPUT_FILES["pain_gfp"], logger)
     except Exception as e:
-        print(f"ERP pain contrast (GFP) failed: {e}")
+        msg = f"ERP pain contrast (GFP) failed: {e}"
+        if logger:
+            logger.error(msg)
+        else:
+            print(msg)
 
     # Butterfly overlay
     try:
@@ -218,14 +273,22 @@ def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path) -> None:
         )
         if isinstance(fig, list):
             fig = fig[0]
-        _save_fig(fig, out_dir, "erp_pain_binary_butterfly.png")
+        _save_fig(fig, out_dir, ERP_OUTPUT_FILES["pain_butterfly"], logger)
     except Exception as e:
-        print(f"ERP pain contrast (butterfly) failed: {e}")
+        msg = f"ERP pain contrast (butterfly) failed: {e}"
+        if logger:
+            logger.error(msg)
+        else:
+            print(msg)
 
 
-def erp_by_temperature(epochs: mne.Epochs, out_dir: Path) -> None:
+def erp_by_temperature(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
     if epochs.metadata is None:
-        print("ERP by temperature: epochs.metadata is missing; skipping.")
+        msg = "ERP by temperature: epochs.metadata is missing; skipping."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
         return
     col = None
     for candidate in TEMPERATURE_COLUMNS:
@@ -233,7 +296,11 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path) -> None:
             col = candidate
             break
     if col is None:
-        print("ERP by temperature: No temperature column found in metadata. Skipping.")
+        msg = "ERP by temperature: No temperature column found in metadata. Skipping."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
         return
 
     # Determine unique, sensibly sorted levels
@@ -264,10 +331,18 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path) -> None:
         try:
             evokeds[label] = epochs[query].average(picks=ERP_PICKS)
         except Exception as e:
-            print(f"Temperature level {lvl}: selection/averaging failed: {e}")
+            msg = f"Temperature level {lvl}: selection/averaging failed: {e}"
+            if logger:
+                logger.warning(msg)
+            else:
+                print(msg)
 
     if len(evokeds) == 0:
-        print("ERP by temperature: No evokeds computed; skipping plot.")
+        msg = "ERP by temperature: No evokeds computed; skipping plot."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
         return
 
     # One plot per temperature level (Evoked butterfly) with title
@@ -286,44 +361,80 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path) -> None:
                 .replace(".", "p")
                 .replace(":", "-")
             )
-            _save_fig(fig, out_dir, f"erp_temperature_{safe_label}_butterfly.png")
+            _save_fig(fig, out_dir, ERP_OUTPUT_FILES["temp_butterfly_template"].format(label=safe_label), logger)
         except Exception as e:
-            print(f"Per-temperature plot failed for {label}: {e}")
+            msg = f"Per-temperature plot failed for {label}: {e}"
+            if logger:
+                logger.error(msg)
+            else:
+                print(msg)
 
     # Plot GFP across levels
     try:
-        fig = mne.viz.plot_compare_evokeds(evokeds, picks=ERP_PICKS, combine="gfp", show=False)
+        fig = mne.viz.plot_compare_evokeds(evokeds, picks=ERP_PICKS, combine=ERP_COMBINE, show=False)
         if isinstance(fig, list):
             fig = fig[0]
-        _save_fig(fig, out_dir, "erp_by_temperature_gfp.png")
+        _save_fig(fig, out_dir, ERP_OUTPUT_FILES["temp_gfp"], logger)
     except Exception as e:
-        print(f"ERP by temperature (GFP) failed: {e}")
+        msg = f"ERP by temperature (GFP) failed: {e}"
+        if logger:
+            logger.error(msg)
+        else:
+            print(msg)
 
 
 def main(
-    subject: str = "001",
+    subject: Optional[str] = None,
     task: str = DEFAULT_TASK,
-    crop_tmin: Optional[float] = None,
-    crop_tmax: Optional[float] = None,
+    crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
+    crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
 ) -> None:
+    # Resolve subject strictly from config if not provided
+    if subject is None:
+        subs = getattr(config, "subjects", [])
+        if isinstance(subs, list) and len(subs) > 0:
+            subject = subs[0]
+        else:
+            raise ValueError(
+                "No subject provided and config.project.subjects is empty or missing. "
+                "Pass --subject or set project.subjects in eeg_config.yaml."
+            )
+    logger = _setup_logging(subject)
+    logger.info(f"=== Foundational analysis: sub-{subject}, task-{task} ===")
     # Resolve paths
-    plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots"
+    plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / PLOTS_SUBDIR
     _ensure_dir(plots_dir)
 
     # Load epochs
     epo_path = _find_clean_epochs_path(subject, task)
     if epo_path is None or not epo_path.exists():
-        print(f"Error: could not find cleaned epochs file for sub-{subject}, task-{task} under {DERIV_ROOT}.")
+        msg = f"Error: could not find cleaned epochs file for sub-{subject}, task-{task} under {DERIV_ROOT}."
+        if logger:
+            logger.error(msg)
+        else:
+            print(msg)
         sys.exit(1)
-    print(f"Loading epochs: {epo_path}")
+    msg = f"Loading epochs: {epo_path}"
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
     epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
 
     # Load events dataframe and attach as metadata (MNE-native selection uses this)
-    events_df = _load_events_df(subject, task)
+    events_df = _load_events_df(subject, task, logger)
     if events_df is None:
-        print("Warning: events TSV not found; ERP contrasts will be skipped.")
+        msg = "Warning: events TSV not found; ERP contrasts will be skipped."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
     else:
-        print(f"Loaded events: {len(events_df)} rows")
+        msg = f"Loaded events: {len(events_df)} rows"
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
         # Align events to epochs using selection or sample index; fallback to trimming
         aligned = False
         sel = getattr(epochs, "selection", None)
@@ -334,11 +445,17 @@ def main(
                     epochs.metadata = events_aligned
                     aligned = True
                     if len(events_df) != len(epochs):
-                        print(
-                            f"Aligned metadata using epochs.selection (kept {len(epochs)} of {len(events_df)} events)."
-                        )
+                        msg = f"Aligned metadata using epochs.selection (kept {len(epochs)} of {len(events_df)} events)."
+                        if logger:
+                            logger.info(msg)
+                        else:
+                            print(msg)
             except Exception as e:
-                print(f"Selection-based alignment failed: {e}")
+                msg = f"Selection-based alignment failed: {e}"
+                if logger:
+                    logger.warning(msg)
+                else:
+                    print(msg)
 
         if not aligned and "sample" in events_df.columns and isinstance(getattr(epochs, "events", None), np.ndarray):
             try:
@@ -350,48 +467,61 @@ def main(
                 if len(events_aligned) == len(epochs) and not events_aligned.isna().all(axis=1).any():
                     epochs.metadata = events_aligned.reset_index()
                     aligned = True
-                    print("Aligned metadata using 'sample' column to epochs.events.")
+                    msg = "Aligned metadata using 'sample' column to epochs.events."
+                    if logger:
+                        logger.info(msg)
+                    else:
+                        print(msg)
             except Exception as e:
-                print(f"Sample-based alignment failed: {e}")
+                msg = f"Sample-based alignment failed: {e}"
+                if logger:
+                    logger.warning(msg)
+                else:
+                    print(msg)
 
         if not aligned:
             # Fallback: naive min-length trimming in original order
             n = min(len(events_df), len(epochs))
             if len(events_df) != len(epochs):
-                print(f"Warning: events rows ({len(events_df)}) != epochs ({len(epochs)}); trimming to {n}.")
+                msg = f"Warning: events rows ({len(events_df)}) != epochs ({len(epochs)}); trimming to {n}."
+                if logger:
+                    logger.warning(msg)
+                else:
+                    print(msg)
             if len(epochs) != n:
                 epochs = epochs[:n]
             epochs.metadata = events_df.iloc[:n].reset_index(drop=True)
 
-        # Also save counts for pain if available
-        for candidate in ["pain_binary_coded", "pain_binary", "pain"]:
-            if candidate in epochs.metadata.columns:
-                try:
-                    _save_counts_tsv(pd.to_numeric(epochs.metadata[candidate], errors="ignore"), plots_dir, "counts_pain.tsv")
-                except Exception as e:
-                    print(f"Saving counts_pain.tsv failed: {e}")
-                break
 
     # Optional epoch time cropping prior to averaging/plotting
     if crop_tmin is not None or crop_tmax is not None:
-        epochs = _maybe_crop_epochs(epochs, crop_tmin, crop_tmax)
+        epochs = _maybe_crop_epochs(epochs, crop_tmin, crop_tmax, logger)
 
     # ERP: pain vs non-pain and by temperature (requires metadata)
     if events_df is not None and epochs.metadata is not None:
-        erp_contrast_pain(epochs, plots_dir)
-        erp_by_temperature(epochs, plots_dir)
+        erp_contrast_pain(epochs, plots_dir, logger)
+        erp_by_temperature(epochs, plots_dir, logger)
 
-    print("Done.")
+    msg = "Done."
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Foundational EEG QC and ERP analysis for one subject")
-    parser.add_argument("--subject", "-s", type=str, default="001", help="BIDS subject label without 'sub-' prefix (e.g., 001)")
+    parser = argparse.ArgumentParser(description="Foundational EEG ERP analysis for one subject")
+    parser.add_argument(
+        "--subject", "-s", type=str,
+        default=None,
+        help=(
+            "BIDS subject label without 'sub-' prefix (e.g., 0000). "
+            "If omitted, uses the first entry in project.subjects from eeg_config.yaml."
+        ),
+    )
     parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label (default from config)")
-    parser.add_argument("--crop-tmin", type=float, default=None, help="Optional epoch crop start time in seconds")
-    parser.add_argument("--crop-tmax", type=float, default=None, help="Optional epoch crop end time in seconds (excluded)")
     args = parser.parse_args()
 
-    main(subject=args.subject, task=args.task, crop_tmin=args.crop_tmin, crop_tmax=args.crop_tmax)
+    main(subject=args.subject, task=args.task)
