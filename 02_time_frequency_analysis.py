@@ -1045,17 +1045,21 @@ def contrast_pain_nonpain(
         try:
             sm_pn = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-vabs_pn, vcenter=0.0, vmax=vabs_pn), cmap=TOPO_CMAP)
             sm_pn.set_array([])
-            cbar_pn = fig.colorbar(sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            cbar_pn = fig.colorbar(
+                sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
+            )
             try:
-                cbar_pn.set_label("log10(power/baseline)")
+                cbar_pn.set_label("10·log10(power/baseline) (dB)")
             except Exception:
                 pass
             if diff_abs > 0:
                 sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-diff_abs, vcenter=0.0, vmax=diff_abs), cmap=TOPO_CMAP)
                 sm_diff.set_array([])
-                cbar_diff = fig.colorbar(sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                cbar_diff = fig.colorbar(
+                    sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
+                )
                 try:
-                    cbar_diff.set_label("log10(power/baseline)")
+                    cbar_diff.set_label("10·log10(power/baseline) (dB)")
                 except Exception:
                     pass
         except Exception:
@@ -1076,7 +1080,7 @@ def contrast_maxmin_temperature(
     baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
     plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
 ) -> None:
-    """Topomap grid comparing highest vs lowest temperature (Δ=log10(power/baseline)).
+    """Topomap grid comparing highest vs lowest temperature (Δ=10·log10(power/baseline) (dB)).
 
     Layout mirrors pain/non-pain grid: [Max temp, Min temp, spacer, Max - Min] across alpha/beta/gamma.
     """
@@ -1237,17 +1241,21 @@ def contrast_maxmin_temperature(
         try:
             sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=TOPO_CMAP)
             sm_pn.set_array([])
-            cbar_pn = fig.colorbar(sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            cbar_pn = fig.colorbar(
+                sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
+            )
             try:
-                cbar_pn.set_label("log10(power/baseline)")
+                cbar_pn.set_label("10·log10(power/baseline) (dB)")
             except Exception:
                 pass
             if diff_abs > 0:
                 sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-diff_abs, vcenter=0.0, vmax=diff_abs), cmap=TOPO_CMAP)
                 sm_diff.set_array([])
-                cbar_diff = fig.colorbar(sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                cbar_diff = fig.colorbar(
+                    sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
+                )
                 try:
-                    cbar_diff.set_label("log10(power/baseline)")
+                    cbar_diff.set_label("10·log10(power/baseline) (dB)")
                 except Exception:
                     pass
         except Exception:
@@ -1414,17 +1422,21 @@ def contrast_pain_nonpain_topomaps_rois(
             try:
                 sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=TOPO_CMAP)
                 sm_pn.set_array([])
-                cbar_pn = fig.colorbar(sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                cbar_pn = fig.colorbar(
+                    sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
+                )
                 try:
-                    cbar_pn.set_label("log10(power/baseline)")
+                    cbar_pn.set_label("10·log10(power/baseline) (dB)")
                 except Exception:
                     pass
                 if diff_abs > 0:
                     sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-diff_abs, vcenter=0.0, vmax=diff_abs), cmap=TOPO_CMAP)
                     sm_diff.set_array([])
-                    cbar_diff = fig.colorbar(sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                    cbar_diff = fig.colorbar(
+                        sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
+                    )
                     try:
-                        cbar_diff.set_label("log10(power/baseline)")
+                        cbar_diff.set_label("10·log10(power/baseline) (dB)")
                     except Exception:
                         pass
             except Exception:
@@ -1435,7 +1447,12 @@ def contrast_pain_nonpain_topomaps_rois(
             fig.supylabel("Frequency bands", fontsize=10)
         except Exception:
             pass
-        _save_fig(fig, out_dir, f"topomap_ROI-{_sanitize(roi)}_grid_bands_pain_non_diff_baseline_logratio.png", formats=["png", "svg"])
+        _save_fig(
+            fig,
+            out_dir,
+            f"topomap_ROI-{_sanitize(roi)}_grid_bands_pain_non_diff_baseline_logratio.png",
+            formats=["png", "svg"],
+        )
 
 def _epochs_mean_roi(epochs: mne.Epochs, roi_name: str, roi_chs: list[str]) -> Optional[mne.Epochs]:
     """Create an Epochs object with a single virtual channel as the mean of ROI channels."""
@@ -1602,7 +1619,7 @@ def plot_topomaps_rois_all_trials(
             sm.set_array([])
             cbar = fig.colorbar(sm, ax=axes[r, 0], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
             try:
-                cbar.set_label("log10(power/baseline)")
+                cbar.set_label("10·log10(power/baseline) (dB)")
             except Exception:
                 pass
         except Exception:
@@ -1623,7 +1640,7 @@ def plot_topomap_grid_baseline_temps(
     baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
     plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
 ) -> None:
-    """Topomap grid of Δ=log10(power/baseline) by temperature (no baseline column).
+    """Topomap grid of Δ=10·log10(power/baseline) (dB) by temperature (no baseline column).
 
     - Columns: All trials (Δ) followed by each temperature level (Δ), per frequency band.
     - Layout made more compact horizontally by reducing inter-column spacing.
@@ -1749,9 +1766,11 @@ def plot_topomap_grid_baseline_temps(
         try:
             sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-diff_abs, vcenter=0.0, vmax=diff_abs), cmap=TOPO_CMAP)
             sm_diff.set_array([])
-            cbar_d = fig.colorbar(sm_diff, ax=axes[r, :].ravel().tolist(), fraction=0.045, pad=0.06, shrink=0.9)
+            cbar_d = fig.colorbar(
+                sm_diff, ax=axes[r, :].ravel().tolist(), fraction=0.045, pad=0.06, shrink=0.9
+            )
             try:
-                cbar_d.set_label("log10(power/baseline)")
+                cbar_d.set_label("10·log10(power/baseline) (dB)")
             except Exception:
                 pass
         except Exception:
@@ -1759,7 +1778,7 @@ def plot_topomap_grid_baseline_temps(
 
     try:
         fig.suptitle(
-            f"Topomaps by temperature: \u0394=log10(power/baseline) over plateau t=[{tmin:.1f}, {tmax:.1f}] s",
+            f"Topomaps by temperature: \u0394=10·log10(power/baseline) (dB) over plateau t=[{tmin:.1f}, {tmax:.1f}] s",
             fontsize=12,
         )
     except Exception:

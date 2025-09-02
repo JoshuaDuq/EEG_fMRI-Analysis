@@ -85,23 +85,24 @@ def _save_fig(fig: matplotlib.figure.Figure, path_base: Path | str, formats: Tup
     plt.close(fig)
 
 
-def _logratio_to_pct(v):
-    """Transform log10(power/baseline) to percent change.
+def _db_to_pct(v):
+    """Transform 10·log10(power/baseline) (dB) to percent change.
 
     Accepts scalar or array-like. Returns values in percent.
     """
-    return (np.power(10.0, v) - 1.0) * 100.0
+    v_arr = np.asarray(v, dtype=float)
+    return (np.power(10.0, v_arr / 10.0) - 1.0) * 100.0
 
 
-def _pct_to_logratio(p):
-    """Inverse transform: percent change to log10(power/baseline).
+def _pct_to_db(p):
+    """Inverse transform: percent change to 10·log10(power/baseline) (dB).
 
     Accepts scalar or array-like. Clips 1 + p/100 to a small positive
     minimum (1e-9) to avoid log10 of non-positive values, which previously
     caused runtime warnings when percent was <= -100.
     """
     p_arr = np.asarray(p, dtype=float)
-    return np.log10(np.clip(1.0 + (p_arr / 100.0), 1e-9, None))
+    return 10.0 * np.log10(np.clip(1.0 + (p_arr / 100.0), 1e-9, None))
 
 
 def _find_connectivity_path(subject: str, task: str) -> Path:
@@ -1218,13 +1219,13 @@ def plot_power_roi_scatter(
         show_pct_axis = False
         if not is_partial_residuals and "log10(power" in x_label:
             show_pct_axis = True
-        elif is_partial_residuals and method_code == "pearson" and "residuals of log10(power" in x_label:
+        elif is_partial_residuals and method_code == "pearson" and "residuals of 10·log10(power" in x_label:
             show_pct_axis = True
             
         if show_pct_axis:
             try:
                 # Add percentage axis on top histogram
-                ax_pct = ax_histx.secondary_xaxis('top', functions=(_logratio_to_pct, _pct_to_logratio))
+                ax_pct = ax_histx.secondary_xaxis('top', functions=(_db_to_pct, _pct_to_db))
                 ax_pct.set_xlabel("Power Change (%)", fontsize=9)
                 ax_pct.xaxis.set_major_locator(MaxNLocator(nbins=5))
             except (AttributeError, TypeError, ValueError):
@@ -1319,7 +1320,7 @@ def plot_power_roi_scatter(
         _generate_correlation_scatter(
             x_data=overall_vals,
             y_data=y,
-            x_label="log10(power/baseline [-5–0 s])",
+            x_label="10·log10(power/baseline [-5–0 s]) (dB)",
             y_label="Rating",
             title_prefix=f"{band_title} power vs rating — Overall",
             band_color=band_color,
@@ -1339,7 +1340,11 @@ def plot_power_roi_scatter(
             Z_part = Z_df_full.iloc[:n_len_pt]
             x_res_sr, y_res_sr, n_res = _partial_residuals_xy_given_Z(x_part, y_part, Z_part, method_code)
             if n_res >= 5:
-                residual_xlabel = "Partial residuals (ranked) of log10(power/baseline)" if method_code == "spearman" else "Partial residuals of log10(power/baseline)"
+                residual_xlabel = (
+                    "Partial residuals (ranked) of 10·log10(power/baseline) (dB)"
+                    if method_code == "spearman"
+                    else "Partial residuals of 10·log10(power/baseline) (dB)"
+                )
                 residual_ylabel = "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
                 
                 _generate_correlation_scatter(
@@ -1366,7 +1371,7 @@ def plot_power_roi_scatter(
             _generate_correlation_scatter(
                 x_data=overall_vals,
                 y_data=temp_series,
-                x_label="log10(power/baseline [-5–0 s])",
+                x_label="10·log10(power/baseline [-5–0 s]) (dB)",
                 y_label="Temperature (°C)",
                 title_prefix=f"{band_title} power vs temperature — Overall",
                 band_color=band_color,
@@ -1386,7 +1391,11 @@ def plot_power_roi_scatter(
                 Z_part2 = Z_df_temp.iloc[:n_len_pt2]
                 x2_res_sr, y2_res_sr, n2_res = _partial_residuals_xy_given_Z(x_part2, y_part2, Z_part2, method2_code)
                 if n2_res >= 5:
-                    residual_xlabel = "Partial residuals (ranked) of log10(power/baseline)" if method2_code == "spearman" else "Partial residuals of log10(power/baseline)"
+                    residual_xlabel = (
+                        "Partial residuals (ranked) of 10·log10(power/baseline) (dB)"
+                        if method2_code == "spearman"
+                        else "Partial residuals of 10·log10(power/baseline) (dB)"
+                    )
                     residual_ylabel = "Partial residuals (ranked) of temperature (°C)" if method2_code == "spearman" else "Partial residuals of temperature (°C)"
                     
                     _generate_correlation_scatter(
@@ -1413,7 +1422,7 @@ def plot_power_roi_scatter(
             _generate_correlation_scatter(
                 x_data=roi_vals,
                 y_data=y,
-                x_label="log10(power/baseline [-5–0 s])",
+                x_label="10·log10(power/baseline [-5–0 s]) (dB)",
                 y_label="Rating",
                 title_prefix=f"{band_title} power vs rating — {roi}",
                 band_color=band_color,
@@ -1434,7 +1443,11 @@ def plot_power_roi_scatter(
                 Z_part = Z_df_full.iloc[:n_len_pt]
                 x_res_sr, y_res_sr, n_res = _partial_residuals_xy_given_Z(x_part, y_part, Z_part, method_code)
                 if n_res >= 5:
-                    residual_xlabel = "Partial residuals (ranked) of log10(power/baseline)" if method_code == "spearman" else "Partial residuals of log10(power/baseline)"
+                    residual_xlabel = (
+                        "Partial residuals (ranked) of 10·log10(power/baseline) (dB)"
+                        if method_code == "spearman"
+                        else "Partial residuals of 10·log10(power/baseline) (dB)"
+                    )
                     residual_ylabel = "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
                     
                     _generate_correlation_scatter(
@@ -1462,7 +1475,7 @@ def plot_power_roi_scatter(
                 _generate_correlation_scatter(
                     x_data=roi_vals,
                     y_data=temp_series,
-                    x_label="log10(power/baseline [-5–0 s])",
+                    x_label="10·log10(power/baseline [-5–0 s]) (dB)",
                     y_label="Temperature (°C)",
                     title_prefix=f"{band_title} power vs temperature — {roi}",
                     band_color=band_color,
@@ -1483,7 +1496,11 @@ def plot_power_roi_scatter(
                     Z_part2 = Z_df_temp.iloc[:n_len_pt2]
                     x2_res_sr, y2_res_sr, n2_res = _partial_residuals_xy_given_Z(x_part2, y_part2, Z_part2, method2_code)
                     if n2_res >= 5:
-                        residual_xlabel = "Partial residuals (ranked) of log10(power/baseline)" if method2_code == "spearman" else "Partial residuals of log10(power/baseline)"
+                        residual_xlabel = (
+                            "Partial residuals (ranked) of 10·log10(power/baseline) (dB)"
+                            if method2_code == "spearman"
+                            else "Partial residuals of 10·log10(power/baseline) (dB)"
+                        )
                         residual_ylabel = "Partial residuals (ranked) of temperature (°C)" if method2_code == "spearman" else "Partial residuals of temperature (°C)"
                         
                         _generate_correlation_scatter(
@@ -1550,7 +1567,7 @@ def plot_power_behavior_correlation(pow_df: pd.DataFrame, y: pd.Series, bands: L
             x_line = np.linspace(x_valid.min(), x_valid.max(), 100)
             axes[i].plot(x_line, p(x_line), 'r--', alpha=0.8)
             
-            axes[i].set_xlabel(f'{band.capitalize()} Power\n(log10(power/baseline))')
+            axes[i].set_xlabel(f'{band.capitalize()} Power\n(10·log10(power/baseline) (dB))')
             axes[i].set_ylabel('Behavioral Rating')
             axes[i].set_title(f'{band.capitalize()} Power vs Behavior')
             axes[i].grid(True, alpha=0.3)
