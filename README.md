@@ -22,7 +22,9 @@ All scripts live in `eeg_pipeline/` and write outputs into a BIDS-style tree und
   - `04_behavior_feature_analysis.py` - Behavioral correlations with advanced statistics
   - `05_decode_pain_experience.py` - Advanced pain decoding with comprehensive diagnostics
   - `verify_decoding_outputs.py` - Validation tool for decoding pipeline outputs
-  - `config.py` - Central configuration file
+  - `plot_connectivity_edges_fdr.py` - Plotting connectivity edges with FDR correction
+  - `eeg_config.yaml` - Centralized configuration file (YAML format)
+  - `config_loader.py` - Configuration loader with fallback support
 - Project layout and data expectations
 - Configuration and defaults
 - Environment setup
@@ -65,12 +67,12 @@ python eeg_pipeline/raw_to_bids.py --zero_base_onsets
 
 Arguments:
 - `--source_root` (str): Path to `source_data` root containing `sub-*/eeg/*.vhdr`. Default: project `eeg_pipeline/source_data`
-- `--bids_root` (str): Output BIDS root directory. Default: from `config.py` if present, else `eeg_pipeline/bids_output`
-- `--task` (str): BIDS task label. Default: from `config.py` or `thermalactive`
+- `--bids_root` (str): Output BIDS root directory. Default: from `eeg_config.yaml` if present, else `eeg_pipeline/bids_output`
+- `--task` (str): BIDS task label. Default: from `eeg_config.yaml` or `thermalactive`
 - `--subjects` (list[str]): Optional list of subject labels to include, e.g., `001 002`. If omitted, all found are used
 - `--montage` (str): Standard montage name for `mne.channels.make_standard_montage` (e.g., `easycap-M1`). Use empty string `""` to skip
-- `--line_freq` (float): Line noise frequency metadata for sidecar (Hz). Default: from `config.py` (`zapline_fline`) or 60.0
-- `--event_prefix` (str): Event annotation prefix to keep (repeatable for multiple prefixes). Default: "Stim_on"
+- `--line_freq` (float): Line noise frequency metadata for sidecar (Hz). Default: from `eeg_config.yaml` (`preprocessing.line_freq`) or 60.0
+- `--event_prefix` (str): Event annotation prefix to keep (repeatable for multiple prefixes). Default: "Trig_therm"
 - `--keep_all_annotations` (flag): Keep all annotations instead of filtering by prefix
 - `--trim_to_first_volume` (flag): Trim EEG recording at first MRI volume trigger
 - `--overwrite` (flag): Overwrite existing BIDS files
@@ -97,9 +99,9 @@ python eeg_pipeline/merge_behavior_to_events.py --bids_root eeg_pipeline/bids_ou
 ```
 
 Arguments:
-- `--bids_root` (str): BIDS root containing `sub-*/eeg/*_events.tsv`. Default: from `config.py` if available
+- `--bids_root` (str): BIDS root containing `sub-*/eeg/*_events.tsv`. Default: from `eeg_config.yaml` if available
 - `--source_root` (str): Source root containing `sub-*/PsychoPy_Data/*TrialSummary.csv`. Default: `eeg_pipeline/source_data`
-- `--task` (str): Task label used in events filenames. Default: from `config.py` or `thermalactive`
+- `--task` (str): Task label used in events filenames. Default: from `eeg_config.yaml` or `thermalactive`
 - `--event_prefix` (str): Event prefix to target for behavioral merges (repeatable). Default: "Stim_on"
 - `--event_type` (str): Specific event type to target (repeatable)
 - `--dry_run` (flag): Print planned changes without writing
@@ -129,7 +131,9 @@ python eeg_pipeline/01_foundational_analysis.py --subject 001 --task thermalacti
 
 Arguments:
 - `--subject, -s` (str): BIDS subject label without the `sub-` prefix (e.g., `001`).
-- `--task, -t` (str): BIDS task label. Default: from `config.py` or `thermalactive`.
+- `--task, -t` (str): BIDS task label. Default: from `eeg_config.yaml` or `thermalactive`.
+- `--crop-tmin` (float): Optional epoch crop start time in seconds.
+- `--crop-tmax` (float): Optional epoch crop end time in seconds (excluded).
 
 **Detailed Analysis Pipeline:**
 
@@ -194,10 +198,10 @@ python eeg_pipeline/02_time_frequency_analysis.py --subject 001 --plateau_tmin 0
 
 Arguments:
 - `--subject, -s` (str): BIDS subject label without `sub-`.
-- `--task, -t` (str): BIDS task label. Default: from `config.py` or `thermalactive`.
-- `--plateau_tmin` (float): Start of plateau window in seconds (default `0.5`).
-- `--plateau_tmax` (float): End of plateau window in seconds (default `8.0`).
-- `--temperature_strategy` (str): One of `pooled`, `per`, or `both` (default `pooled`).
+- `--task, -t` (str): BIDS task label. Default: from `eeg_config.yaml` or `thermalactive`.
+- `--plateau_tmin` (float): Start of plateau window in seconds (default from config).
+- `--plateau_tmax` (float): End of plateau window in seconds (default from config).
+- `--temperature_strategy` (str): One of `pooled`, `per`, or `both` (default: `pooled`).
 
 **Detailed Analysis Pipeline:**
 
@@ -287,7 +291,7 @@ python eeg_pipeline/03_feature_engineering.py --subjects 001 002 --task thermala
 
 Arguments:
 - `--subjects` (list[str]): Subject labels without the `sub-` prefix; use space-separated list.
-- `--task` (str): BIDS task label. Default from `config.py` or `thermalactive`.
+- `--task` (str): BIDS task label. Default from `eeg_config.yaml` or `thermalactive`.
 
 **Detailed Feature Engineering Pipeline:**
 
@@ -395,7 +399,14 @@ python eeg_pipeline/04_behavior_feature_analysis.py --subjects 001 002 003 --tas
 
 Arguments:
 - `--subjects` (list[str]): Subject labels without the `sub-` prefix.
-- `--task` (str): BIDS task label. Default from `config.py` or `thermalactive`.
+- `--task` (str): BIDS task label. Default from `eeg_config.yaml` or `thermalactive`.
+- `--pearson` (flag): Use Pearson correlations instead of default Spearman when appropriate.
+- `--partial-covars` (list[str]): Event columns to control for in partial correlations (e.g., temperature trial_number).
+- `--bootstrap` (int): Number of bootstrap resamples for 95% confidence intervals (default 0, disabled).
+- `--n-perm` (int): Number of permutations for permutation p-values (default 0, disabled).
+- `--group` (flag): Also aggregate group-level results across subjects.
+- `--group-only` (flag): Only run group-level aggregation, skip per-subject analysis.
+- `--report` (flag): Build per-subject MNE HTML report.
 
 **Detailed Analysis Pipeline:**
 
@@ -506,7 +517,7 @@ python eeg_pipeline/05_decode_pain_experience.py --subjects 001 002 003 --n_jobs
 
 Arguments:
 - `--subjects` (list[str] or `all`): Subject labels without the `sub-` prefix, or `all` to include all with features present.
-- `--task` (str): BIDS task label. Default from `config.py` or `thermalactive`.
+- `--task` (str): BIDS task label. Default from `eeg_config.yaml` or `thermalactive`.
 - `--n_jobs` (int): Parallel jobs for inner CV/grid search. Use `-1` for all cores.
 - `--seed` (int): Random seed for reproducibility.
 - `--outer_n_jobs` (int): Parallel jobs for outer LOSO folds (default: 1 to avoid nested parallelism).
@@ -715,75 +726,226 @@ Outputs:
 ```
 EEG_fMRI_Analysis/
 ├─ eeg_pipeline/
-│  ├─ raw_to_bids.py                    # Convert BrainVision to BIDS with flexible filtering
-│  ├─ merge_behavior_to_events.py       # Merge behavioral data with per-run support
-│  ├─ 01_foundational_analysis.py       # Event-related potential (ERP) analysis
-│  ├─ 02_time_frequency_analysis.py     # Time-frequency analysis and spectral power
-│  ├─ 03_feature_engineering.py         # Extract ML-ready features from EEG data
-│  ├─ 04_behavior_feature_analysis.py   # Behavioral correlations with advanced statistics
-│  ├─ 05_decode_pain_experience.py      # Advanced pain decoding with comprehensive diagnostics
-│  ├─ verify_decoding_outputs.py        # Validation tool for decoding pipeline outputs
-│  ├─ config.py                         # Central configuration file
-│  ├─ coll_lab_eeg_pipeline.py          # Alternative comprehensive pipeline
+│  ├─ raw_to_bids.py                     # Convert BrainVision to BIDS with flexible event filtering
+│  ├─ merge_behavior_to_events.py        # Merge behavioral data with per-run support
+│  ├─ 01_foundational_analysis.py        # Event-related potential (ERP) analysis
+│  ├─ 02_time_frequency_analysis.py      # Time-frequency analysis and spectral power
+│  ├─ 03_feature_engineering.py          # Extract ML-ready features from EEG data
+│  ├─ 04_behavior_feature_analysis.py    # Behavioral correlations with advanced statistics
+│  ├─ 05_decode_pain_experience.py       # Advanced pain decoding with comprehensive diagnostics
+│  ├─ verify_decoding_outputs.py         # Validation tool for decoding pipeline outputs
+│  ├─ plot_connectivity_edges_fdr.py     # Plotting connectivity edges with FDR correction
+│  ├─ eeg_config.yaml                    # Centralized configuration file (YAML format)
+│  ├─ config_loader.py                   # Configuration loader with fallback support
+│  ├─ coll_lab_eeg_pipeline.py           # Alternative comprehensive pipeline
 │  ├─ source_data/
-│  │  ├─ Schaefer2018/                  # Atlas files for connectivity analysis
+│  │  ├─ Schaefer2018/                   # Atlas files for connectivity analysis
+│  │  │  ├─ Schaefer2018_400Parcels_7Networks_order.dscalar.nii
+│  │  │  ├─ Schaefer2018_400Parcels_7Networks_order.txt
+│  │  │  └─ ...                          # Additional atlas files
 │  │  └─ sub-XXX/
-│  │     ├─ eeg/                        # Raw BrainVision files (*.vhdr, *.eeg, *.vmrk)
-│  │     └─ PsychoPy_Data/              # Behavioral CSV (*TrialSummary.csv)
+│  │     ├─ eeg/                         # Raw BrainVision files (*.vhdr, *.eeg, *.vmrk)
+│  │     │  ├─ sub-XXX_task-thermalactive_run-01.vhdr
+│  │     │  ├─ sub-XXX_task-thermalactive_run-01.eeg
+│  │     │  ├─ sub-XXX_task-thermalactive_run-01.vmrk
+│  │     │  └─ ...                       # Additional runs if present
+│  │     └─ PsychoPy_Data/               # Behavioral CSV files
+│  │        └─ sub-XXX_task-thermalactive_run-01_TrialSummary.csv
 │  └─ bids_output/
 │     ├─ sub-XXX/
-│     │  └─ eeg/                        # Raw BIDS outputs (events.tsv, EEG data)
+│     │  └─ eeg/                         # Raw BIDS outputs
+│     │     ├─ sub-XXX_task-thermalactive_run-01_eeg.vhdr
+│     │     ├─ sub-XXX_task-thermalactive_run-01_eeg.eeg
+│     │     ├─ sub-XXX_task-thermalactive_run-01_eeg.vmrk
+│     │     ├─ sub-XXX_task-thermalactive_run-01_events.tsv
+│     │     └─ sub-XXX_task-thermalactive_run-01_electrodes.tsv
 │     └─ derivatives/
 │        ├─ sub-XXX/
 │        │  └─ eeg/
-│        │     ├─ plots/                # Subject-specific figures
-│        │     │  └─ temperature/       # Temperature-specific subdirectories
-│        │     ├─ features/             # ML-ready feature matrices
-│        │     └─ behavior_analysis/    # Behavioral correlation outputs
-│        └─ decoding/                   # Cross-subject decoding results
-│           ├─ plots/                   # Decoding diagnostic plots
-│           ├─ indices/                 # Cross-validation indices
-│           ├─ *_predictions.tsv        # Model predictions (ElasticNet, RF, Riemann)
-│           ├─ *_per_subject_metrics.tsv # Per-subject performance metrics
-│           ├─ best_params_*.jsonl      # Hyperparameters per fold
-│           ├─ baseline_*.tsv           # Baseline model results
-│           ├─ run_manifest.json        # Runtime environment and configuration
-│           └─ summary.json             # Overall performance metrics with CIs
-├─ .venv/                               # Python virtual environment
-├─ requirements.txt                     # Python dependencies
-└─ README.md                            # This documentation
+│        │     ├─ plots/                  # Subject-specific figures
+│        │     │  ├─ 01_foundational_analysis/
+│        │     │  │  ├─ erp_pain_binary_butterfly.png
+│        │     │  │  ├─ erp_pain_binary_topomaps.png
+│        │     │  │  ├─ erp_by_temperature_gfp.png
+│        │     │  │  └─ ...               # Additional ERP plots
+│        │     │  ├─ 02_time_frequency_analysis/
+│        │     │  │  ├─ tfr_Cz_all_trials_baseline_logratio.png
+│        │     │  │  ├─ topomap_alpha_all_trials_baseline_logratio.png
+│        │     │  │  ├─ temperature/      # Per-temperature plots
+│        │     │  │  └─ logs/             # Analysis logs
+│        │     │  ├─ 04_behavior_feature_analysis/
+│        │     │  │  ├─ power_behavior_correlations.png
+│        │     │  │  ├─ scatter_pow_roi_frontal_alpha_vs_rating.png
+│        │     │  │  └─ logs/             # Analysis logs
+│        │     │  └─ temperature/         # Temperature-specific subdirectories
+│        │     ├─ features/               # ML-ready feature matrices
+│        │     │  ├─ features_eeg_direct.tsv
+│        │     │  ├─ features_connectivity.tsv
+│        │     │  ├─ features_all.tsv
+│        │     │  └─ target_vas_ratings.tsv
+│        │     ├─ behavior_analysis/      # Behavioral correlation outputs
+│        │     │  ├─ corr_stats_pow_roi_vs_rating.tsv
+│        │     │  ├─ corr_stats_conn_roi_summary_aec_alpha_vs_rating.tsv
+│        │     │  ├─ power_behavior_correlations.png
+│        │     │  └─ ...                  # Additional correlation files
+│        │     ├─ stats/                  # Statistical outputs
+│        │     │  ├─ corr_stats_pow_vs_temp.tsv
+│        │     │  └─ psychometric_rating_vs_temp_stats.tsv
+│        │     └─ logs/                   # Log files for all analyses
+│        │        ├─ 01_foundational_analysis.log
+│        │        ├─ 02_time_frequency_analysis.log
+│        │        ├─ 03_feature_engineering.log
+│        │        └─ 04_behavior_feature_analysis.log
+│        └─ decoding/                     # Cross-subject decoding results
+│           ├─ plots/                     # Decoding diagnostic plots
+│           │  ├─ rf_loso_actual_vs_predicted.png
+│           │  ├─ rf_block_permutation_importance_top20.png
+│           │  ├─ rf_residuals_vs_temperature.png
+│           │  └─ ...                     # Additional diagnostic plots
+│           ├─ indices/                   # Cross-validation indices
+│           │  └─ loso_train_test_indices.json
+│           ├─ predictions/               # Model predictions
+│           │  ├─ elasticnet_loso_predictions.tsv
+│           │  ├─ rf_loso_predictions.tsv
+│           │  └─ ...                     # Additional prediction files
+│           ├─ metrics/                   # Performance metrics
+│           │  ├─ elasticnet_per_subject_metrics.tsv
+│           │  ├─ rf_per_subject_metrics.tsv
+│           │  └─ ...                     # Additional metric files
+│           ├─ hyperparameters/           # Best parameters per fold
+│           │  ├─ best_params_elasticnet.jsonl
+│           │  ├─ best_params_rf.jsonl
+│           │  └─ ...                     # Additional hyperparameter files
+│           ├─ baselines/                 # Baseline model results
+│           │  ├─ baseline_global_loso_predictions.tsv
+│           │  └─ ...                     # Additional baseline files
+│           ├─ summaries/                 # Summary statistics
+│           │  ├─ summary.json
+│           │  ├─ summary_bootstrap.json
+│           │  └─ ...                     # Additional summary files
+│           ├─ run_manifest.json          # Execution metadata
+│           └─ logs/                      # Decoding pipeline logs
+│              └─ decode_pain_YYYYMMDD_HHMMSS.log
+├─ .venv/                                # Python virtual environment
+│  ├─ Scripts/                           # Windows executables
+│  ├─ Lib/                               # Package installations
+│  └─ pyvenv.cfg                         # Environment configuration
+├─ requirements.txt                      # Python dependencies
+├─ commands.txt                          # Common command examples
+└─ README.md                             # This documentation
 ```
 
 
 ## Configuration and Defaults
 
-You may create `eeg_pipeline/config.py` to centralize defaults. The scripts gracefully fall back to built-ins if the module is missing.
+The EEG pipeline uses a centralized YAML configuration system (`eeg_config.yaml`) that provides a single source of truth for all pipeline parameters. This approach ensures consistency, reproducibility, and easy customization without modifying source code.
 
-Key configuration sections in `config.py`:
+### Key Configuration Sections
 
-**General Settings:**
-- `bids_root` (str): Path to the BIDS root (default: `eeg_pipeline/bids_output`)
-- `deriv_root` (str): Path to the derivatives root (default: `<bids_root>/derivatives`)
-- `task` (str): Default BIDS task label (default: `thermalactive`)
-- `subjects` (list): Default subject list for processing
+#### Core Project Settings
+- `project.root` (str): Project root directory (automatically resolved to absolute path)
+- `project.task` (str): BIDS task label (default: `thermalactive`)
+- `project.subjects` (list): Default subject list for processing (default: `["0000"]`)
+- `project.bids_root` (str): BIDS output directory path
+- `project.source_root` (str): Source data directory path
 
-**Preprocessing Parameters:**
-- `l_freq` (float): High-pass filter frequency (default: 1.0 Hz)
-- `h_freq` (float): Low-pass filter frequency (default: 100 Hz)
-- `raw_resample_sfreq` (int): Resampling frequency (default: 500 Hz)
-- `eeg_template_montage` (str): Montage name (default: `easycap-M1`)
-- `zapline_fline` (float): Line noise frequency (default: 60.0 Hz)
+#### Preprocessing Parameters
+- `preprocessing.line_freq` (float): Line noise frequency for notch filtering (Hz)
+- `preprocessing.high_pass` (float): High-pass filter cutoff (Hz)
+- `preprocessing.low_pass` (float): Low-pass filter cutoff (Hz)
+- `preprocessing.resample_sfreq` (int): Resampling frequency (Hz)
+- `preprocessing.montage` (str): EEG electrode montage name
 
-**Epoching and Analysis:**
-- `conditions` (list): Event conditions for epoching
-- `epochs_tmin`, `epochs_tmax` (float): Epoch time window
-- `baseline` (tuple): Baseline correction window
-- `spatial_filter` (str): Artifact correction method (default: `ica`)
+#### Frequency Band Definitions
+- `frequency_bands` (dict): Frequency band definitions for analysis:
+  ```yaml
+  theta: [4.0, 8.0]
+  alpha: [8.0, 13.0]
+  beta: [13.0, 30.0]
+  gamma: [30.0, 80.0]
+  ```
 
-**Feature Engineering:**
-- `features_freq_bands` (dict): Frequency band definitions (theta, alpha, beta, gamma)
-- `features_sourcecoords_file` (str): Path to atlas coordinates for connectivity
-- `features_compute_sourcespace_features` (bool): Enable connectivity analysis
+#### Analysis Windows and Parameters
+- `power.baseline_window` (list): Baseline correction window [start, end] in seconds
+- `power.plateau_window` (list): Time window for power averaging [start, end] in seconds
+- `analysis.erp.picks` (str): Channel type for ERP averaging
+- `analysis.erp.pain_color` (str): Color for pain condition in plots
+- `analysis.erp.nonpain_color` (str): Color for non-pain condition in plots
+
+#### Visualization Settings
+- `visualization.dpi` (int): Figure resolution (default: 300)
+- `visualization.save_formats` (list): Output formats (default: ["png", "svg"])
+- `visualization.band_colors` (dict): Color mapping for frequency bands
+- `visualization.montage` (str): Montage for topographic plotting
+- `visualization.advanced` (dict): Specialized plotting parameters
+
+#### Machine Learning Parameters
+- `decoding.models.elasticnet.alpha` (list): Regularization strengths for ElasticNet
+- `decoding.models.rf.n_estimators` (int): Number of trees in Random Forest
+- `decoding.analysis.n_perm_quick` (int): Permutations for quick significance tests
+- `decoding.analysis.bootstrap_n` (int): Bootstrap samples for confidence intervals
+
+#### Random Seed and Reproducibility
+- `random.seed` (int): Global random seed for reproducibility (default: 42)
+- `random.bootstrap_default` (int): Default bootstrap iterations
+
+### How to Modify Configuration
+
+1. **Edit `eeg_config.yaml`** directly with any text editor:
+   ```yaml
+   # Example customizations
+   project:
+     subjects: ["001", "002", "003"]
+     task: "pain_study"
+   
+   preprocessing:
+     line_freq: 50.0  # For European power grid
+     high_pass: 0.1   # More aggressive high-pass
+   
+   visualization:
+     dpi: 600  # Higher resolution figures
+   ```
+
+2. **Restart Python session** or reload configuration:
+   ```python
+   # The scripts automatically reload configuration
+   from config_loader import load_config
+   config = load_config()
+   ```
+
+3. **Verify changes** by running any script - it will use your updated parameters
+
+### Configuration Benefits
+
+- **Centralized**: All parameters in one YAML file
+- **Human-readable**: Easy to understand and modify
+- **Version-controllable**: Track parameter changes in git
+- **Validated**: Automatic type checking and fallback defaults
+- **Documented**: Self-documenting with comments and structure
+- **Reproducible**: Ensures consistent results across runs
+
+### Legacy Compatibility
+
+The system maintains backward compatibility:
+- Scripts fall back to built-in defaults if configuration loading fails
+- Environment variables and command-line arguments override config values
+- Missing config sections use sensible defaults
+
+### Advanced Configuration Options
+
+For complex setups, you can:
+- Use environment variable substitution: `${MY_CUSTOM_PATH}`
+- Include external YAML files with anchors and references
+- Set up different config files for different analysis scenarios
+- Use the config_loader API for programmatic access
+
+### Configuration Validation
+
+The system includes built-in validation:
+- Type checking for numeric parameters
+- Path validation for file/directory parameters
+- Range checking for frequency and time parameters
+- Automatic fallback to defaults for invalid values
 
 
 ## Environment Setup
@@ -792,8 +954,12 @@ Key configuration sections in `config.py`:
 - **Python 3.8-3.11** (3.11 recommended for optimal performance)
 - **Windows, macOS, or Linux** (examples show Windows PowerShell)
 - **Git** for version control
+- **Minimum 16 GB RAM** recommended for TFR computations
+- **At least 100 GB free disk space** for large datasets and outputs
 
 ### Installation Steps
+
+#### Option 1: Virtual Environment (Recommended)
 
 ```powershell
 # 1. Clone or download the repository
@@ -805,77 +971,255 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1  # Windows PowerShell
 # source .venv/bin/activate    # macOS/Linux
 
-# 3. Install dependencies
+# 3. Upgrade pip and install dependencies
 pip install --upgrade pip
 pip install -r requirements.txt
 
 # 4. Verify installation
 python -c "import mne, mne_bids; print('MNE version:', mne.__version__)"
+python -c "import sklearn; print('scikit-learn version:', sklearn.__version__)"
+python -c "import numpy; print('NumPy version:', numpy.__version__)"
 ```
 
+#### Option 2: Conda/Mamba Environment
+
+```bash
+# Using conda (or mamba for faster package resolution)
+conda create -n eeg_pipeline python=3.11
+conda activate eeg_pipeline
+
+# Install core dependencies
+conda install -c conda-forge mne mne-bids scikit-learn numpy scipy matplotlib pandas seaborn
+
+# Install remaining dependencies
+pip install -r requirements.txt
+```
+
+#### Option 3: Docker Container
+
+```bash
+# Build Docker image
+docker build -t eeg-pipeline .
+
+# Run container with data volume mounted
+docker run -it -v /path/to/data:/data eeg-pipeline
+```
+
+### Data Preparation
+
+Before running the pipeline:
+
+1. **Organize raw EEG data** in BIDS-like structure:
+   ```
+   source_data/
+   ├── sub-001/
+   │   ├── eeg/
+   │   │   ├── sub-001_task-thermalactive_run-01.vhdr
+   │   │   ├── sub-001_task-thermalactive_run-01.eeg
+   │   │   ├── sub-001_task-thermalactive_run-01.vmrk
+   │   │   └── ...
+   │   └── PsychoPy_Data/
+   │       └── sub-001_task-thermalactive_run-01_TrialSummary.csv
+   └── sub-002/
+       └── ...
+   ```
+
+2. **Download atlas files** for connectivity analysis:
+   ```bash
+   # Download Schaefer2018 atlas (7 networks, 400 parcels)
+   # Place in source_data/Schaefer2018/
+   ```
+
+3. **Verify montage compatibility**:
+   - Check that your EEG system matches `easycap-M1` or `standard_1005` electrode layouts
+   - Custom montages can be added via `mne.channels.make_dig_montage()`
+
+### Verification Steps
+
+After installation, verify all components:
+
+```python
+# Test core EEG functionality
+import mne
+import numpy as np
+
+# Test TFR computation
+data = np.random.randn(10, 64, 1000)  # (n_epochs, n_channels, n_times)
+epochs = mne.EpochsArray(data, mne.create_info(64, 1000, ch_types='eeg'))
+tfr = mne.time_frequency.tfr_morlet(epochs, freqs=[10, 20], n_cycles=2)
+print("TFR computation: SUCCESS")
+
+# Test ML functionality
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import cross_val_score
+
+X = np.random.randn(100, 10)
+y = np.random.randn(100)
+rf = RandomForestRegressor(n_estimators=10, random_state=42)
+scores = cross_val_score(rf, X, y, cv=3)
+print(f"Random Forest CV scores: {scores}")
+
+# Test BIDS functionality
+import mne_bids
+print(f"MNE-BIDS version: {mne_bids.__version__}")
+
+print("All core components verified successfully!")
+```
+
+### Optional Dependencies
+
+Install additional packages for enhanced functionality:
+
+```bash
+# Riemannian geometry analysis
+pip install pyriemann
+
+# GPU acceleration for ML
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Automated IC classification
+pip install onnxruntime  # or pip install torch for alternative backend
+
+# Enhanced statistical analysis
+pip install statsmodels>=0.14
+
+# Parallel processing improvements
+pip install joblib
+```
+
+### Environment Configuration
+
+Set environment variables for optimal performance:
+
+```bash
+# Windows PowerShell
+$env:OMP_NUM_THREADS = "1"
+$env:MKL_NUM_THREADS = "1"
+$env:OPENBLAS_NUM_THREADS = "1"
+$env:NUMEXPR_NUM_THREADS = "1"
+
+# Linux/macOS
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+```
+
+### Troubleshooting Installation
+
+- **ImportError**: Check Python version compatibility (3.8-3.11)
+- **MemoryError during pip install**: Use `pip install --no-cache-dir`
+- **NumPy compatibility**: Ensure NumPy <2.0 for Python 3.11
+- **CUDA issues**: Verify PyTorch CUDA version matches your GPU drivers
+- **Permission denied**: Run terminal as administrator or use user installation
+
 ### Key Dependencies
+
+**Core Requirements:**
 - **MNE-Python ≥1.6**: Core EEG analysis functionality
 - **MNE-BIDS ≥0.15**: BIDS format handling
+- **PyYAML ≥6.0**: YAML configuration file parsing (required for centralized configuration)
 - **scikit-learn ≥1.2**: Machine learning algorithms
-- **PyRiemann ≥0.3**: Riemannian geometry for covariance-based analysis
-- **statsmodels ≥0.14**: Advanced statistical methods (LOESS, partial correlation)
-- **NumPy <2.0**: Constrained for ecosystem compatibility on Python 3.11
+- **NumPy <2.0**: Array computations (constrained for Python 3.11 compatibility)
+- **SciPy ≥1.7**: Scientific computing
+- **Matplotlib ≥3.5**: Plotting and visualization
+- **Pandas ≥1.5**: Data manipulation
+- **Seaborn ≥0.11**: Statistical visualization
 
 **Optional but Recommended:**
+- **PyRiemann ≥0.3**: Riemannian geometry for covariance-based analysis
+- **statsmodels ≥0.14**: Advanced statistical methods (LOESS, partial correlation)
 - **ICLabel support**: Requires `onnxruntime` or `torch` for automated IC classification
-- **CUDA support**: For GPU-accelerated computations (PyTorch backend)
+- **CUDA support**: PyTorch with CUDA for GPU-accelerated computations
 
-If you encounter dependency conflicts, consider using conda/mamba for environment management.
+**Development Dependencies:**
+- **joblib ≥1.1**: Parallel processing
+- **tqdm**: Progress bars
+- **json5**: Enhanced JSON parsing
+- **psutil**: System monitoring
+
+If you encounter dependency conflicts, consider using conda/mamba for environment management as it handles complex dependency resolution better than pip.
 
 
 ## Typical Workflows
+
+Below are detailed workflow examples with precise commands, expected outputs, and explanations. All commands assume you are in the `eeg_pipeline/` directory.
 
 ### Workflow A: Basic pipeline from raw → BIDS → ERP → TFR
 
 ```powershell
 # 1) Convert BrainVision to BIDS with flexible event filtering
+# Expected: Creates BIDS dataset in bids_output/, merges behavior if --merge_behavior used
 python eeg_pipeline/raw_to_bids.py --merge_behavior --overwrite
 
 # 2) (Optional) Standalone behavior merge with per-run support
+# Expected: Updates events.tsv files with behavioral columns, creates combined per-subject events.tsv
 python eeg_pipeline/merge_behavior_to_events.py
 
 # 3) Event-related potential analysis
+# Expected: ERP plots in bids_output/derivatives/sub-001/eeg/plots/01_foundational_analysis/
 python eeg_pipeline/01_foundational_analysis.py --subject 001 --task thermalactive
 
 # 4) Time–frequency analysis (pooled across conditions)
+# Expected: TFR plots and topomaps in bids_output/derivatives/sub-001/eeg/plots/02_time_frequency_analysis/
 python eeg_pipeline/02_time_frequency_analysis.py --subject 001 --task thermalactive
 
 # 5) Time–frequency analysis (per-temperature stratified)
+# Expected: Additional temperature-specific plots in plots/temperature/ subdirectories
 python eeg_pipeline/02_time_frequency_analysis.py --subject 001 --task thermalactive --temperature_strategy per
 ```
+
+**Expected Outputs from Workflow A:**
+- `bids_output/sub-001/eeg/sub-001_task-thermalactive_eeg.vhdr` (BIDS EEG data)
+- `bids_output/sub-001/eeg/sub-001_task-thermalactive_events.tsv` (BIDS events with merged behavior)
+- `derivatives/sub-001/eeg/plots/01_foundational_analysis/erp_pain_binary_butterfly.png`
+- `derivatives/sub-001/eeg/plots/02_time_frequency_analysis/tfr_Cz_all_trials_baseline_logratio.png`
+- `derivatives/sub-001/eeg/plots/02_time_frequency_analysis/topomap_alpha_all_trials_baseline_logratio.png`
 
 ### Workflow B: Re-run TFR with both pooled and per-temperature
 
 ```powershell
+# Run both pooled and per-temperature analyses in one command
+# Expected: All plots from pooled + temperature-specific subdirectories created
 python eeg_pipeline/02_time_frequency_analysis.py --subject 001 --temperature_strategy both
 ```
+
+**Expected Additional Outputs:**
+- `derivatives/sub-001/eeg/plots/02_time_frequency_analysis/temperature/temp-47p3/tfr_Cz_painful_baseline_logratio.png`
+- `derivatives/sub-001/eeg/plots/02_time_frequency_analysis/temperature/temp-47p3/topomap_beta_pain_vs_nonpain_baseline_logratio.png`
 
 ### Workflow C: Complete analysis pipeline with behavioral correlations and pain decoding
 
 ```powershell
 # 1) Build features for all desired subjects
+# Expected: Feature matrices saved in derivatives/sub-XXX/eeg/features/
 python eeg_pipeline/03_feature_engineering.py --subjects 001 002 003 004 005 --task thermalactive
 
 # 2) Analyze behavioral correlations with EEG features
+# Expected: Correlation heatmaps and statistics in derivatives/sub-XXX/eeg/behavior_analysis/
 python eeg_pipeline/04_behavior_feature_analysis.py --subjects 001 002 003 004 005 --task thermalactive
 
 # 3) Run advanced LOSO pain decoding with comprehensive diagnostics
+# Expected: Decoding results in derivatives/decoding/ with plots and metrics
 python eeg_pipeline/05_decode_pain_experience.py --subjects all --n_jobs -1 --seed 42
 ```
+
+**Expected Outputs from Workflow C:**
+- `derivatives/sub-001/eeg/features/features_eeg_direct.tsv` (Power features)
+- `derivatives/sub-001/eeg/behavior_analysis/power_behavior_correlations.png` (Correlation heatmap)
+- `derivatives/decoding/summary.json` (Decoding performance metrics)
+- `derivatives/decoding/plots/rf_loso_actual_vs_predicted.png` (Prediction scatter plot)
 
 ### Workflow D: Advanced decoding analysis with validation
 
 ```powershell
 # Complete pipeline for pain decoding research
 # 1) Prepare all subjects through feature engineering
+# Expected: All feature matrices created for available subjects
 python eeg_pipeline/03_feature_engineering.py --subjects all --task thermalactive
 
 # 2) Run behavioral feature analysis to understand EEG-behavior relationships
+# Expected: Full correlation analysis including ROI-level and connectivity analyses
 python eeg_pipeline/04_behavior_feature_analysis.py --subjects all --task thermalactive
 
 # 3) Execute comprehensive pain decoding with all advanced features:
@@ -883,11 +1227,37 @@ python eeg_pipeline/04_behavior_feature_analysis.py --subjects all --task therma
 #    - Partial correlation analysis controlling for covariates
 #    - BCa confidence intervals with cluster bootstrap
 #    - Residual diagnostics and calibration analysis
+# Expected: Complete decoding analysis with all diagnostics enabled
 python eeg_pipeline/05_decode_pain_experience.py --subjects all --n_jobs -1 --seed 42
 
 # 4) Validate pipeline outputs
+# Expected: Verification report of all generated files and their integrity
 python eeg_pipeline/verify_decoding_outputs.py
 ```
+
+**Expected Outputs from Workflow D:**
+- `derivatives/decoding/plots/rf_block_permutation_importance_top20.png` (Feature importance)
+- `derivatives/decoding/plots/rf_residuals_vs_temperature.png` (Model diagnostics)
+- `derivatives/decoding/summary.json` (Complete performance summary with CIs)
+- `derivatives/decoding/run_manifest.json` (Execution metadata)
+
+### Workflow E: Custom analysis with specific parameters
+
+```powershell
+# Custom time-frequency analysis with adjusted parameters
+python eeg_pipeline/02_time_frequency_analysis.py --subject 001 --plateau_tmin 1.0 --plateau_tmax 8.0 --temperature_strategy pooled
+
+# Behavioral analysis with advanced statistics
+python eeg_pipeline/04_behavior_feature_analysis.py --subjects 001 --bootstrap 1000 --n-perm 1000 --partial-covars temperature trial_number
+
+# Decoding with custom settings
+python eeg_pipeline/05_decode_pain_experience.py --subjects 001 002 --n_jobs 2 --seed 123
+```
+
+**Expected Outputs from Workflow E:**
+- `derivatives/sub-001/eeg/plots/02_time_frequency_analysis/topomap_gamma_all_trials_baseline_logratio.png` (Custom plateau window)
+- `derivatives/sub-001/eeg/behavior_analysis/corr_stats_pow_roi_vs_rating.tsv` (Advanced statistics with bootstrap CIs)
+- `derivatives/decoding/elasticnet_per_subject_metrics.tsv` (Subset analysis metrics)
 
 
 ## Outputs and File Naming
@@ -911,6 +1281,14 @@ python eeg_pipeline/verify_decoding_outputs.py
 - `power_behavior_correlations.png` - EEG power vs behavior correlation heatmaps
 - `connectivity_behavior_correlations.png` - Connectivity vs behavior correlations
 - `correlation_summary.tsv` - Statistical summary of significant correlations
+- `corr_stats_pow_roi_vs_rating.tsv` - ROI-averaged power correlations with ratings
+- `corr_stats_pow_roi_vs_temp.tsv` - ROI-averaged power correlations with temperature
+- `corr_stats_conn_roi_summary_<measure_band>_vs_rating.tsv` - Connectivity ROI summary correlations with ratings
+- `corr_stats_conn_roi_summary_<measure_band>_vs_temp.tsv` - Connectivity ROI summary correlations with temperature
+- `scatter_pow_overall_<band>_vs_rating.png` - Overall power vs rating scatter plots
+- `scatter_pow_overall_<band>_vs_temp.png` - Overall power vs temperature scatter plots
+- `scatter_pow_roi_<roi>_<band>_vs_rating.png` - ROI-specific power vs rating scatter plots
+- `scatter_pow_roi_<roi>_<band>_vs_temp.png` - ROI-specific power vs temperature scatter plots
 
 **Advanced Decoding outputs** (under `eeg_pipeline/bids_output/derivatives/decoding/`):
 - **Predictions**: `elasticnet_loso_predictions.tsv`, `rf_loso_predictions.tsv`, `riemann_loso_predictions.tsv`
@@ -932,13 +1310,15 @@ python eeg_pipeline/verify_decoding_outputs.py
 ## Troubleshooting
 
 ### Common Data Issues
+
 - **Missing or misaligned events length**: Scripts will trim to the min length and warn. Ensure `events.tsv` matches the epochs count
 - **No `pain_binary_coded` column**: Pain/non-pain contrasts will be skipped. Check for alternative column names (`pain_binary`, `pain`)
 - **No temperature column**: Per-temperature analyses will be skipped. Expected columns: `stimulus_temp`, `stimulus_temperature`, `temp`, `temperature`
 - **Channel name mismatches**: If channel names don't match the montage template, `raw_to_bids.py` will continue without setting coordinates
 - **Missing source coordinates**: Connectivity analysis requires Schaefer atlas files in `source_data/Schaefer2018/`
 
-### Performance and Runtime
+### Performance and Runtime Issues
+
 - **TFR computation slowness**: Time-frequency analysis is the most intensive step. Consider:
   - Running pooled analysis only (`--temperature_strategy pooled`)
   - Processing subjects individually rather than batches
@@ -947,6 +1327,7 @@ python eeg_pipeline/verify_decoding_outputs.py
 - **Long bootstrap times**: Reduce `bootstrap_n` in decoding config for faster confidence intervals
 
 ### Installation and Dependencies
+
 - **MNE-BIDS compatibility**: Ensure MNE-Python and MNE-BIDS versions are compatible (see `requirements.txt`)
 - **NumPy version conflicts**: Use NumPy <2.0 for Python 3.11 compatibility
 - **PyRiemann missing**: Install with `pip install pyriemann` or run only ElasticNet/RF models
@@ -955,17 +1336,48 @@ python eeg_pipeline/verify_decoding_outputs.py
 
 ### Pipeline-Specific Issues
 
-**Raw-to-BIDS Conversion:**
-- **Event annotation filtering**: Use `--keep_all_annotations` if default "Stim_on" filtering is too restrictive
+#### Raw-to-BIDS Conversion (`raw_to_bids.py`)
+- **Event annotation filtering**: Use `--keep_all_annotations` if default "Trig_therm" filtering is too restrictive
 - **Multiple event prefixes**: Use multiple `--event_prefix` flags for complex event structures
 - **MRI volume trimming**: `--trim_to_first_volume` requires "Volume" annotations in the data
+- **Montage template mismatch**: Check that your EEG system matches the `easycap-M1` or `standard_1005` templates
+- **Line noise frequency**: Ensure `zapline_fline` matches your local power grid frequency (60 Hz in North America, 50 Hz elsewhere)
 
-**Behavioral Merging:**
+#### Behavioral Merging (`merge_behavior_to_events.py`)
 - **Per-run CSV matching**: Ensure PsychoPy CSV files follow `run<N>` naming convention
 - **Column alignment**: Length mismatches between events and behavioral data are automatically trimmed
 - **Event type selection**: Use `--event_prefix` and `--event_type` for targeted merging
+- **Run number extraction**: Scripts extract run numbers from BIDS filenames (e.g., `sub-001_task-thermalactive_run-01_events.tsv`)
 
-**Advanced Decoding:**
+#### ERP Analysis (`01_foundational_analysis.py`)
+- **Epoch cropping**: Use `--crop-tmin` and `--crop-tmax` to focus on specific time windows
+- **Pain column detection**: Script tries multiple column names automatically; check your behavioral data
+- **Global Field Power (GFP)**: Requires multiple channels for meaningful computation
+- **Statistical contrasts**: Skip if insufficient trials in pain/non-pain conditions
+
+#### Time-Frequency Analysis (`02_time_frequency_analysis.py`)
+- **TFR memory usage**: Large frequency ranges or many time points can cause memory issues
+- **Baseline correction**: Ensure pre-stimulus data exists for baseline correction (default: None to 0.0 s)
+- **Plateau window**: Adjust `plateau_tmin`/`plateau_tmax` based on your stimulus timing
+- **ROI definitions**: Script uses standard 10-10 electrode names for anatomical regions
+- **Temperature stratification**: Requires temperature column in metadata for per-temperature analysis
+
+#### Feature Engineering (`03_feature_engineering.py`)
+- **Connectivity analysis**: Requires Schaefer atlas files for ROI-based connectivity
+- **Frequency band selection**: Modify `POWER_BANDS` in config for different bands
+- **Target column detection**: Script tries multiple column names for behavioral targets
+- **Trial alignment**: Ensures epochs, events, and features have matching trial counts
+- **Memory for large datasets**: Process subjects individually if memory is limited
+
+#### Behavioral Analysis (`04_behavior_feature_analysis.py`)
+- **Correlation computation**: Handles missing data with pairwise deletion
+- **Permutation testing**: Can be computationally intensive; reduce `n_perm` for faster results
+- **Bootstrap confidence intervals**: Subject-level clustering for proper statistical inference
+- **ROI analysis**: Requires sensor montage information for anatomical grouping
+- **Partial correlations**: Control for covariates like temperature and trial effects
+
+#### Advanced Decoding (`05_decode_pain_experience.py`)
+- **LOSO requirements**: Requires ≥2 subjects for leave-one-subject-out cross-validation
 - **ConstantInputWarning**: Check for duplicated subjects with identical data causing leakage
 - **ElasticNet convergence**: Warnings are normal; increase `max_iter` only if performance degrades
 - **Random Forest parallelism**: RF uses `n_jobs=1` to avoid conflicts; use `--n_jobs` for inner CV only
@@ -974,17 +1386,76 @@ python eeg_pipeline/verify_decoding_outputs.py
 - **LOESS calibration**: Cross-validation for span selection adds computational time but improves accuracy
 - **Riemann analysis robustness**: Uses channel intersection across subjects to handle heterogeneous montages
 
-### Validation and Quality Control
-- **Output verification**: Run `verify_decoding_outputs.py` to check for missing or corrupted files
-- **Missing baseline files**: Some baseline models may be skipped if insufficient subjects or data
-- **JSON/JSONL corruption**: Verification script checks file structure and reports parsing errors
-- **Plot generation failures**: Check for sufficient data points and valid statistical comparisons
+### Configuration Issues
+
+#### Path Configuration
+- **Custom paths**: Ensure all paths in `config.py` are absolute or relative to the project root
+- **BIDS root**: Must contain the raw EEG data and will receive processed outputs
+- **Derivatives root**: Auto-created if missing; contains all analysis results
+
+#### Frequency Band Configuration
+- **Band definitions**: Ensure no overlap between adjacent bands
+- **Frequency limits**: Must be within your EEG sampling rate limits
+- **Band naming**: Use consistent naming across all configuration sections
+
+#### Model Hyperparameters
+- **ElasticNet**: `alpha` controls regularization strength, `l1_ratio` balances L1/L2 penalties
+- **Random Forest**: `n_estimators` trades off performance vs computation time
+- **Grid search**: Parameter ranges are optimized for typical EEG datasets
+
+### File System Issues
+
+#### Permissions
+- **Write permissions**: Ensure the user has write access to BIDS and derivatives directories
+- **File locking**: Some operations may fail if files are open in other applications
+- **Network drives**: Performance may be slower on network-mounted storage
+
+#### File Format Issues
+- **TSV format**: Ensure tab-separated values with proper headers
+- **JSON/JSONL corruption**: Use `verify_decoding_outputs.py` to check file integrity
+- **Figure formats**: PNG for compact storage, SVG for scalable vector graphics
+
+#### Missing Files
+- **Atlas files**: Download Schaefer2018 atlas files for connectivity analysis
+- **Montage templates**: Use standard montages or provide custom electrode positions
+- **Feature matrices**: Ensure feature engineering completes before downstream analyses
+
+### Statistical and Computational Issues
+
+#### Statistical Power
+- **Sample size**: Small datasets may not yield reliable statistical results
+- **Multiple comparisons**: FDR correction controls false discovery rate across tests
+- **Effect sizes**: Small correlations (r < 0.1) may not be practically meaningful
+
+#### Computational Resources
+- **CPU cores**: Use `--n_jobs` to control parallel processing
+- **Memory limits**: Large TFR computations may require system memory upgrades
+- **Disk space**: Analysis outputs can be substantial; monitor available storage
+
+#### Cross-Validation Stability
+- **Fold consistency**: Ensure sufficient data per fold for stable model training
+- **Random seeds**: Use consistent seeds for reproducible results
+- **Data leakage**: Check for subject-level information leakage in features
 
 ### Getting Help
+
+#### Logging and Debugging
 - **Verbose logging**: Most scripts support detailed console output for debugging
-- **Configuration validation**: Use `config_validation = "warn"` in config.py for parameter checking
+- **Configuration validation**: Add `config_validation = "warn"` to config.py for parameter checking
 - **File path debugging**: Scripts provide detailed path resolution logs when files are missing
 - **Statistical diagnostics**: Decoding pipeline includes extensive diagnostic plots for model validation
+
+#### Common Error Messages
+- **"No cleaned epochs found"**: Ensure preprocessing completed successfully
+- **"Feature matrix missing"**: Run feature engineering before behavioral analysis
+- **"MemoryError"**: Reduce batch size or process subjects individually
+- **"ValueError: array shapes"**: Check data alignment between epochs, events, and features
+
+#### Support Resources
+- **Script help**: Run any script with `--help` for detailed argument information
+- **Configuration examples**: See the Configuration section for customization examples
+- **Output verification**: Use `verify_decoding_outputs.py` to validate pipeline integrity
+- **GitHub issues**: Report bugs with detailed error messages and configuration details
 
 
 ---
