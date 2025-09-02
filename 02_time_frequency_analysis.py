@@ -476,7 +476,6 @@ def _plot_topomap_on_ax(
 
     Tries to pass the Info directly to MNE's topomap; falls back if needed.
     """
-    vlim = (vmin, vmax) if vmin is not None and vmax is not None else (None, None)
     try:
         mne.viz.plot_topomap(
             data,
@@ -488,7 +487,8 @@ def _plot_topomap_on_ax(
             sensors=True,
             contours=TOPO_CONTOURS,
             cmap=TOPO_CMAP,
-            vlim=vlim,
+            vmin=vmin,
+            vmax=vmax,
         )
     except Exception:
         # Fallback: pick EEG channels explicitly
@@ -504,7 +504,8 @@ def _plot_topomap_on_ax(
             sensors=True,
             contours=TOPO_CONTOURS,
             cmap=TOPO_CMAP,
-            vlim=vlim,
+            vmin=vmin,
+            vmax=vmax,
         )
 
 
@@ -595,8 +596,8 @@ def plot_cz_all_trials(
         if not np.any(tmask):
             tmask = np.ones_like(times, dtype=bool)
         mu = float(np.nanmean(arr[:, tmask]))
-        pct = (10.0 ** mu - 1.0) * 100.0
-        fig = tfr_avg.plot(picks=cz, vlim=(-vabs, +vabs), show=False)
+        pct = (10.0 ** (mu / 10.0) - 1.0) * 100.0
+        fig = tfr_avg.plot(picks=cz, vmin=-vabs, vmax=+vabs, show=False)
         try:
             fig.suptitle(
                 f"Cz TFR — all trials (baseline logratio)\nvlim ±{vabs:.2f}; \u03bc_plateau={mu:.3f} ({pct:+.0f}%)",
@@ -898,10 +899,10 @@ def contrast_pain_nonpain(
         if not np.any(tmask):
             tmask = np.ones_like(times, dtype=bool)
         mu_pain = float(np.nanmean(arr_pain[:, tmask]))
-        pct_pain = (10.0 ** mu_pain - 1.0) * 100.0
+        pct_pain = (10.0 ** (mu_pain / 10.0) - 1.0) * 100.0
         mu_non = float(np.nanmean(arr_non[:, tmask]))
-        pct_non = (10.0 ** mu_non - 1.0) * 100.0
-        fig = tfr_pain.plot(picks=cz, vlim=(-vabs_pn, +vabs_pn), show=False)
+        pct_non = (10.0 ** (mu_non / 10.0) - 1.0) * 100.0
+        fig = tfr_pain.plot(picks=cz, vmin=-vabs_pn, vmax=+vabs_pn, show=False)
         try:
             fig.suptitle(
                 f"Cz — Pain (baseline logratio)\nvlim ±{vabs_pn:.2f}; \u03bc_plateau={mu_pain:.3f} ({pct_pain:+.0f}%)",
@@ -917,7 +918,7 @@ def contrast_pain_nonpain(
         else:
             print(msg)
     try:
-        fig = tfr_non.plot(picks=cz, vlim=(-vabs_pn, +vabs_pn), show=False)
+        fig = tfr_non.plot(picks=cz, vmin=-vabs_pn, vmax=+vabs_pn, show=False)
         try:
             fig.suptitle(
                 f"Cz — Non-pain (baseline logratio)\nvlim ±{vabs_pn:.2f}; \u03bc_plateau={mu_non:.3f} ({pct_non:+.0f}%)",
@@ -942,8 +943,8 @@ def contrast_pain_nonpain(
         arr_diff = np.asarray(arr_pain) - np.asarray(arr_non)
         vabs_diff = _robust_sym_vlim(arr_diff)
         mu_diff = float(np.nanmean(arr_diff[:, tmask]))
-        pct_diff = (10.0 ** mu_diff - 1.0) * 100.0
-        fig = tfr_diff.plot(picks=cz, vlim=(-vabs_diff, +vabs_diff), show=False)
+        pct_diff = (10.0 ** (mu_diff / 10.0) - 1.0) * 100.0
+        fig = tfr_diff.plot(picks=cz, vmin=-vabs_diff, vmax=+vabs_diff, show=False)
         try:
             fig.suptitle(
                 f"Cz — Pain minus Non (baseline logratio)\nvlim ±{vabs_diff:.2f}; \u0394\u03bc_plateau={mu_diff:.3f} ({pct_diff:+.0f}%)",
@@ -1011,7 +1012,15 @@ def contrast_pain_nonpain(
         # Pain
         ax = axes[r, 0]
         try:
-            mne.viz.plot_topomap(pain_data, tfr_pain.info, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
+            mne.viz.plot_topomap(
+                pain_data,
+                tfr_pain.info,
+                axes=ax,
+                show=False,
+                vmin=-vabs_pn,
+                vmax=+vabs_pn,
+                cmap=TOPO_CMAP,
+            )
         except Exception:
             _plot_topomap_on_ax(ax, pain_data, tfr_pain.info, vmin=-vabs_pn, vmax=+vabs_pn)
         # Annotate mean value
@@ -1019,7 +1028,15 @@ def contrast_pain_nonpain(
         # Non-pain
         ax = axes[r, 1]
         try:
-            mne.viz.plot_topomap(non_data, tfr_pain.info, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
+            mne.viz.plot_topomap(
+                non_data,
+                tfr_pain.info,
+                axes=ax,
+                show=False,
+                vmin=-vabs_pn,
+                vmax=+vabs_pn,
+                cmap=TOPO_CMAP,
+            )
         except Exception:
             _plot_topomap_on_ax(ax, non_data, tfr_pain.info, vmin=-vabs_pn, vmax=+vabs_pn)
         # Annotate mean value
@@ -1029,11 +1046,23 @@ def contrast_pain_nonpain(
         # Diff
         ax = axes[r, 3]
         try:
-            mne.viz.plot_topomap(diff_data, tfr_pain.info, axes=ax, show=False,
-                                 vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else (None, None)),
-                                 cmap=TOPO_CMAP)
+            mne.viz.plot_topomap(
+                diff_data,
+                tfr_pain.info,
+                axes=ax,
+                show=False,
+                vmin=(-diff_abs if diff_abs > 0 else None),
+                vmax=(+diff_abs if diff_abs > 0 else None),
+                cmap=TOPO_CMAP,
+            )
         except Exception:
-            _plot_topomap_on_ax(ax, diff_data, tfr_pain.info, vmin=(-diff_abs if diff_abs > 0 else None), vmax=(+diff_abs if diff_abs > 0 else None))
+            _plot_topomap_on_ax(
+                ax,
+                diff_data,
+                tfr_pain.info,
+                vmin=(-diff_abs if diff_abs > 0 else None),
+                vmax=(+diff_abs if diff_abs > 0 else None),
+            )
         # Annotate mean difference value
         pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
         ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
@@ -1199,7 +1228,15 @@ def contrast_maxmin_temperature(
         # Max temp (col 0)
         ax = axes[r, 0]
         try:
-            mne.viz.plot_topomap(max_data, tfr_max.info, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
+            mne.viz.plot_topomap(
+                max_data,
+                tfr_max.info,
+                axes=ax,
+                show=False,
+                vmin=-vabs_pn,
+                vmax=+vabs_pn,
+                cmap=TOPO_CMAP,
+            )
         except Exception:
             _plot_topomap_on_ax(ax, max_data, tfr_max.info, vmin=-vabs_pn, vmax=+vabs_pn)
         ax.text(0.5, 1.02, f"\u03bc={max_mu:.3f} ({(10**(max_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
@@ -1207,7 +1244,15 @@ def contrast_maxmin_temperature(
         # Min temp (col 1)
         ax = axes[r, 1]
         try:
-            mne.viz.plot_topomap(min_data, tfr_min.info, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
+            mne.viz.plot_topomap(
+                min_data,
+                tfr_min.info,
+                axes=ax,
+                show=False,
+                vmin=-vabs_pn,
+                vmax=+vabs_pn,
+                cmap=TOPO_CMAP,
+            )
         except Exception:
             _plot_topomap_on_ax(ax, min_data, tfr_min.info, vmin=-vabs_pn, vmax=+vabs_pn)
         ax.text(0.5, 1.02, f"\u03bc={min_mu:.3f} ({(10**(min_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
@@ -1223,11 +1268,18 @@ def contrast_maxmin_temperature(
                 tfr_max.info,
                 axes=ax,
                 show=False,
-                vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else (None, None)),
+                vmin=(-diff_abs if diff_abs > 0 else None),
+                vmax=(+diff_abs if diff_abs > 0 else None),
                 cmap=TOPO_CMAP,
             )
         except Exception:
-            _plot_topomap_on_ax(ax, diff_data, tfr_max.info, vmin=(-diff_abs if diff_abs > 0 else None), vmax=(+diff_abs if diff_abs > 0 else None))
+            _plot_topomap_on_ax(
+                ax,
+                diff_data,
+                tfr_max.info,
+                vmin=(-diff_abs if diff_abs > 0 else None),
+                vmax=(+diff_abs if diff_abs > 0 else None),
+            )
         pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
         ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
@@ -1386,19 +1438,53 @@ def contrast_pain_nonpain_topomaps_rois(
             # Pain (col 0)
             ax = axes[r, 0]
             try:
-                mne.viz.plot_topomap(pain_data, tfr_pain.info, axes=ax, show=False, vlim=(vmin, vmax),
-                                     mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
+                mne.viz.plot_topomap(
+                    pain_data,
+                    tfr_pain.info,
+                    axes=ax,
+                    show=False,
+                    vmin=vmin,
+                    vmax=vmax,
+                    mask=mask_vec,
+                    mask_params=mask_params,
+                    cmap=TOPO_CMAP,
+                )
             except Exception:
-                _plot_topomap_on_ax(ax, pain_data, tfr_pain.info, mask=mask_vec, mask_params=mask_params, vmin=vmin, vmax=vmax)
+                _plot_topomap_on_ax(
+                    ax,
+                    pain_data,
+                    tfr_pain.info,
+                    mask=mask_vec,
+                    mask_params=mask_params,
+                    vmin=vmin,
+                    vmax=vmax,
+                )
             # Annotate ROI-mean
             ax.text(0.5, 1.02, f"\u03bc_ROI={pain_mu:.3f}", transform=ax.transAxes, ha="center", va="top", fontsize=8)
             # Non-pain (col 1)
             ax = axes[r, 1]
             try:
-                mne.viz.plot_topomap(non_data, tfr_pain.info, axes=ax, show=False, vlim=(vmin, vmax),
-                                     mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
+                mne.viz.plot_topomap(
+                    non_data,
+                    tfr_pain.info,
+                    axes=ax,
+                    show=False,
+                    vmin=vmin,
+                    vmax=vmax,
+                    mask=mask_vec,
+                    mask_params=mask_params,
+                    cmap=TOPO_CMAP,
+                )
             except Exception:
-                _plot_topomap_on_ax(ax, non_data, tfr_pain.info, mask=mask_vec, mask_params=mask_params, vmin=vmin, vmax=vmax)
+                _plot_topomap_on_ax(
+                    ax,
+                    non_data,
+                    tfr_pain.info,
+                    mask=mask_vec,
+                    mask_params=mask_params,
+                    vmin=vmin,
+                    vmax=vmax,
+                )
             # Annotate ROI-mean
             ax.text(0.5, 1.02, f"\u03bc_ROI={non_mu:.3f}", transform=ax.transAxes, ha="center", va="top", fontsize=8)
             # Spacer (col 2)
@@ -1406,11 +1492,27 @@ def contrast_pain_nonpain_topomaps_rois(
             # Diff (col 3)
             ax = axes[r, 3]
             try:
-                mne.viz.plot_topomap(diff_data, tfr_pain.info, axes=ax, show=False,
-                                     vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else (None, None)),
-                                     mask=mask_vec, mask_params=mask_params, cmap=TOPO_CMAP)
+                mne.viz.plot_topomap(
+                    diff_data,
+                    tfr_pain.info,
+                    axes=ax,
+                    show=False,
+                    vmin=(-diff_abs if diff_abs > 0 else None),
+                    vmax=(+diff_abs if diff_abs > 0 else None),
+                    mask=mask_vec,
+                    mask_params=mask_params,
+                    cmap=TOPO_CMAP,
+                )
             except Exception:
-                _plot_topomap_on_ax(ax, diff_data, tfr_pain.info, mask=mask_vec, mask_params=mask_params, vmin=(-diff_abs if diff_abs > 0 else None), vmax=(+diff_abs if diff_abs > 0 else None))
+                _plot_topomap_on_ax(
+                    ax,
+                    diff_data,
+                    tfr_pain.info,
+                    mask=mask_vec,
+                    mask_params=mask_params,
+                    vmin=(-diff_abs if diff_abs > 0 else None),
+                    vmax=(+diff_abs if diff_abs > 0 else None),
+                )
             # Annotate ROI-mean difference
             pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
             ax.text(0.5, 1.02, f"\u0394\u03bc_ROI={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=8)
@@ -1609,8 +1711,15 @@ def plot_topomaps_rois_all_trials(
         vabs = _robust_sym_vlim(data)
         vmin, vmax = -vabs, +vabs
         try:
-            mne.viz.plot_topomap(data, tfr_avg.info, axes=axes[r, 0], show=False,
-                                 vlim=(vmin, vmax), cmap=TOPO_CMAP)
+            mne.viz.plot_topomap(
+                data,
+                tfr_avg.info,
+                axes=axes[r, 0],
+                show=False,
+                vmin=vmin,
+                vmax=vmax,
+                cmap=TOPO_CMAP,
+            )
         except Exception:
             _plot_topomap_on_ax(axes[r, 0], data, tfr_avg.info, vmin=vmin, vmax=vmax)
         axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
@@ -1751,12 +1860,19 @@ def plot_topomap_grid_baseline_temps(
                 ax.axis("off")
                 continue
             try:
-                mne.viz.plot_topomap(data, tfr_cond.info, axes=ax, show=False,
-                                     vlim=(-diff_abs, +diff_abs), cmap=TOPO_CMAP)
+                mne.viz.plot_topomap(
+                    data,
+                    tfr_cond.info,
+                    axes=ax,
+                    show=False,
+                    vmin=-diff_abs,
+                    vmax=+diff_abs,
+                    cmap=TOPO_CMAP,
+                )
             except Exception:
                 _plot_topomap_on_ax(ax, data, tfr_cond.info, vmin=-diff_abs, vmax=+diff_abs)
             mu = float(np.nanmean(data))
-            pct = (10.0 ** mu - 1.0) * 100.0
+            pct = (10.0 ** (mu / 10.0) - 1.0) * 100.0
             ax.text(0.5, 1.02, f"\u0394\u03bc={mu:.3f} ({pct:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
             if r == 0:
                 ax.set_title(f"{label} (n={n_cond})", fontsize=9, pad=4, y=1.04)
