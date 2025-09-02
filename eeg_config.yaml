@@ -28,7 +28,7 @@ frequency_bands:
 power:
   bands_to_use: ["theta", "alpha", "beta", "gamma"]  # Subset of frequency_bands for power features
   plateau_window: [0.0, 10.0]  # Time window for plateau analysis (seconds)
-  baseline_window: [-5.0, 0.0]  # Baseline window (seconds)
+  baseline_window: [-5.0, -0.1]  # Baseline window (seconds)
   
 # Event column mappings for behavioral data
 event_columns:
@@ -322,7 +322,7 @@ analysis:
   # Time-frequency analysis
   time_frequency:
     default_temperature_strategy: "pooled"  # "pooled", "per", "both"
-    baseline_window: [-5.0, 0.0]  # TFR baseline window
+    baseline_window: [-5.0, -0.1]  # TFR baseline window
     default_plateau_tmin: 0.0
     default_plateau_tmax: 10.0
     # TFR computation

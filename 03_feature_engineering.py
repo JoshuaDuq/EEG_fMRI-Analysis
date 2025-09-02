@@ -41,6 +41,9 @@ PLATEAU_START = _constants["PLATEAU_START"]
 PLATEAU_END = _constants["PLATEAU_END"]
 TARGET_COLUMNS = _constants["TARGET_COLUMNS"]
 
+# Minimum number of samples required in the baseline window
+MIN_BASELINE_SAMPLES = 5
+
 LOG_FILE_NAME = config.logging.file_names.feature_engineering  # Name of the log file for this script
 
 
@@ -534,8 +537,23 @@ def plot_tfr_spectrograms_roi(tfr, subject: str, save_dir: Path, logger: logging
 def plot_baseline_vs_stimulus_power(tfr_raw, bands: List[str], subject: str, save_dir: Path, logger: logging.Logger):
     """Compare raw power in baseline vs stimulus periods."""
     try:
-        # Extract baseline and stimulus periods from raw TFR (before baseline correction)
-        baseline_tfr = tfr_raw.copy().crop(-5.0, 0.0)  # Baseline window
+        # Extract baseline strictly before stimulus onset
+        times = np.asarray(tfr_raw.times)
+        if not np.any(times < 0):
+            logger.warning("No baseline samples available before stimulus onset; skipping plot.")
+            return
+
+        baseline_start = max(-5.0, times.min())
+        baseline_end = np.max(times[times < 0])
+        baseline_tfr = tfr_raw.copy().crop(baseline_start, baseline_end)
+
+        # Verify sufficient baseline coverage
+        if baseline_tfr.times.size < MIN_BASELINE_SAMPLES:
+            logger.warning(
+                f"Baseline window has {baseline_tfr.times.size} samples; requires at least {MIN_BASELINE_SAMPLES}."
+            )
+            return
+
         stimulus_tfr = tfr_raw.copy().crop(PLATEAU_START, PLATEAU_END)  # Stimulus window
         
         n_bands = len(bands)
