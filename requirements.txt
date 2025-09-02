@@ -33,3 +33,6 @@ bctpy>=0.6
 
 # Riemannian geometry for covariance-based decoding
 pyriemann>=0.3
+
+# Configuration management
+pyyaml>=6.0
