@@ -8,10 +8,10 @@ bids_root = os.path.join(project_root, "eeg_pipeline", "bids_output")
 
 log_type = "file"  # 'file' or 'console'
 
-use_pyprep = False
-use_icalabel = False
-compute_features = False
-custom_tfr = True
+use_pyprep = True
+use_icalabel = True
+compute_features = True
+custom_tfr = False
 
 tasks_to_process = ["thermalactive"]
 sessions_to_process = []
@@ -21,7 +21,7 @@ deriv_root = os.path.join(bids_root, "derivatives")
 config_validation = "warn"
 # Subjects to analyze. If `'all'`, include all subjects.
 # Otherwise, a list of subject IDs.
-subjects = ["002", "003", "004", "005"]
+subjects = ["0000"]
 
 ##################################
 # Pyprep bad channels detection
@@ -30,7 +30,7 @@ subjects = ["002", "003", "004", "005"]
 pyprep_bids_path = bids_root
 pyprep_subjects = subjects
 pyprep_pipeline_path = deriv_root
-pyprep_task = task  # Rest eyes closed
+pyprep_task = task  
 pyprep_ransac = False
 pyprep_repeats = 3
 pyprep_average_reref = False
@@ -84,7 +84,7 @@ random_state = 42
 # The low-frequency cut-off in the highpass filtering step.
 l_freq = 1.0
 # The high-frequency cut-off in the lowpass filtering step.
-h_freq = 100.0
+h_freq = 100
 # Specifies frequency to remove using Zapline filtering. If None, zapline will not be used.
 zapline_fline = 60.0
 # Resampling
@@ -93,9 +93,9 @@ raw_resample_sfreq = 500
 # ## Epoching
 # Use the pain conditions for epoching. the -5 s will be in the Hz and the 10 s will be in the Hz+pain
 # Also add additional conditions for the 10, 20, 40 Hz and CNHz time locked on the onset of the svr
-conditions = ["Stim_on/S  1"]
+conditions = ["Trig_therm/T  1"]
 epochs_tmin = -5
-epochs_tmax = 10.5
+epochs_tmax = 10
 
 find_breaks = False
 
@@ -174,7 +174,7 @@ custom_tfr_task = task
 custom_tfr_subjects = subjects
 custom_tfr_n_jobs = -1  # Number of jobs for TFR computation
 custom_tfr_freqs = np.arange(1, 101, 1)  # Frequencies to compute
-custom_tfr_crop = None  # Time interval to crop the TFR
+custom_tfr_crop = False  # Time interval to crop the TFR
 custom_tfr_n_cycles = (
     custom_tfr_freqs / 3.0
 )  # Number of cycles for TFR computation (7 for now, should be adjusted based on the data)
