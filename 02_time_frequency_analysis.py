@@ -76,6 +76,34 @@ DEFAULT_TEMPERATURE_STRATEGY = config.analysis.time_frequency.default_temperatur
 DEFAULT_PLATEAU_TMIN = config.analysis.time_frequency.default_plateau_tmin
 DEFAULT_PLATEAU_TMAX = config.analysis.time_frequency.default_plateau_tmax
 
+# Minimum baseline coverage
+MIN_BASELINE_SAMPLES = 5
+
+
+def _validate_baseline_indices(
+    times: np.ndarray,
+    baseline: Tuple[Optional[float], Optional[float]],
+    min_samples: int = MIN_BASELINE_SAMPLES,
+) -> Tuple[float, float, np.ndarray]:
+    """Validate baseline window and return a time mask.
+
+    Ensures the baseline interval ends before stimulus onset and
+    contains at least ``min_samples`` samples.
+    """
+    b_start, b_end = baseline
+    if b_start is None:
+        b_start = float(times.min())
+    if b_end is None:
+        b_end = 0.0
+    if b_end >= 0:
+        raise ValueError("Baseline window must end before 0 s")
+    mask = (times >= b_start) & (times < b_end)
+    if mask.sum() < min_samples:
+        raise ValueError(
+            f"Baseline window has {int(mask.sum())} samples; at least {min_samples} required"
+        )
+    return b_start, b_end, mask
+
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
@@ -280,10 +308,17 @@ def _find_tfr_path(subject: str, task: str) -> Optional[Path]:
     return None
 
 
-def _apply_baseline_safe(tfr_obj, baseline: Tuple[Optional[float], Optional[float]] = BASELINE, mode: str = "logratio", logger: Optional[logging.Logger] = None):
+def _apply_baseline_safe(
+    tfr_obj,
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
+    mode: str = "logratio",
+    logger: Optional[logging.Logger] = None,
+):
     try:
-        tfr_obj.apply_baseline(baseline=baseline, mode=mode)
-        msg = f"Applied baseline {baseline} with mode='{mode}'."
+        times = np.asarray(tfr_obj.times)
+        b_start, b_end, _ = _validate_baseline_indices(times, baseline)
+        tfr_obj.apply_baseline(baseline=(b_start, b_end), mode=mode)
+        msg = f"Applied baseline {(b_start, b_end)} with mode='{mode}'."
         if logger:
             logger.info(msg)
         else:
@@ -608,19 +643,21 @@ def qc_baseline_plateau_power(
         freqs = np.asarray(tfr.freqs)
         times = np.asarray(tfr.times)
 
-        # Build time masks
-        b_start, b_end = baseline
-        if b_start is None:
-            b_start = float(times.min())
-        if b_end is None:
-            b_end = 0.0
-        tmask_base = (times >= b_start) & (times <= b_end)
+        # Build time masks and validate baseline coverage
+        try:
+            b_start, b_end, tmask_base = _validate_baseline_indices(times, baseline)
+        except ValueError as e:
+            msg = f"QC skipped: {e}"
+            if logger:
+                logger.warning(msg)
+            else:
+                print(msg)
+            return
+
         tmask_plat = (times >= plateau_window[0]) & (times <= plateau_window[1])
 
-        if not np.any(tmask_base) or not np.any(tmask_plat):
-            msg = (
-                f"QC skipped: baseline samples={int(tmask_base.sum())}, plateau samples={int(tmask_plat.sum())}"
-            )
+        if not np.any(tmask_plat):
+            msg = f"QC skipped: plateau samples={int(tmask_plat.sum())}"
             if logger:
                 logger.warning(msg)
             else:
