@@ -401,7 +401,7 @@ def plot_power_distributions(pow_df: pd.DataFrame, bands: List[str], subject: st
             
             axes[i].axhline(y=0, color='red', linestyle='--', alpha=0.7, label='Baseline')
             axes[i].set_title(f'{band.capitalize()} Power Distribution\n(All channels, all trials)')
-            axes[i].set_ylabel('log10(power/baseline)')
+            axes[i].set_ylabel('10·log10(power/baseline) (dB)')
             axes[i].set_xticks([])
             axes[i].grid(True, alpha=0.3)
             
@@ -463,10 +463,10 @@ def plot_channel_power_heatmap(pow_df: pd.DataFrame, bands: List[str], subject: 
         ax.set_xticklabels(channel_names, rotation=45, ha='right')
         ax.set_yticks(range(len(valid_bands)))
         ax.set_yticklabels([b.capitalize() for b in valid_bands])
-        ax.set_title(f'Mean Power per Channel and Band\n(log10(power/baseline))')
-        
+        ax.set_title(f'Mean Power per Channel and Band\n(10·log10(power/baseline) (dB))')
+
         # Add colorbar
-        cbar = plt.colorbar(im, ax=ax, label='log10(power/baseline)', shrink=0.8)
+        cbar = plt.colorbar(im, ax=ax, label='10·log10(power/baseline) (dB)', shrink=0.8)
         
         # Add text annotations for values (only if not too many)
         if len(channel_names) * len(valid_bands) <= 200:  # Avoid overcrowding
@@ -509,9 +509,15 @@ def plot_tfr_spectrograms_roi(tfr, subject: str, save_dir: Path, logger: logging
             tfr_ch = tfr.copy().pick_channels([ch]).average()
             
             # Create spectrogram plot
-            tfr_ch.plot(picks=[0], axes=axes[i], show=False, colorbar=True,
-                       title=f'{ch} - log10(power/baseline)', 
-                       vlim=(-0.5, 0.5), cmap='RdBu_r')  # Symmetric around 0 for logratio
+            tfr_ch.plot(
+                picks=[0],
+                axes=axes[i],
+                show=False,
+                colorbar=True,
+                title=f'{ch} - 10·log10(power/baseline) (dB)',
+                vlim=(-0.5, 0.5),
+                cmap='RdBu_r',
+            )  # Symmetric around 0 for logratio
             
             # Add vertical lines for key time points
             axes[i].axvline(x=0, color='black', linestyle='--', alpha=0.7, label='Stimulus onset')
@@ -742,7 +748,7 @@ def plot_trial_power_variability(pow_df: pd.DataFrame, bands: List[str], subject
             axes[i].fill_between(trial_nums, mean_power - std_power, mean_power + std_power, 
                                alpha=0.2, color='red', label=f'±1 SD = ±{std_power:.3f}')
             
-            axes[i].set_ylabel(f'{band.capitalize()}\nlog10(power/baseline)')
+            axes[i].set_ylabel(f'{band.capitalize()}\n10·log10(power/baseline) (dB)')
             axes[i].set_title(f'{band.capitalize()} Band Power Variability (CV = {cv_power:.3f})')
             axes[i].grid(True, alpha=0.3)
             axes[i].legend()
@@ -1020,7 +1026,7 @@ def process_subject(subject: str, task: str = TASK) -> None:
     # Keep a copy of raw TFR before baseline correction for comparison plots
     tfr_raw = tfr.copy()
     
-    # Normalize to pre-stimulus baseline as log10(power/baseline) for comparability
+    # Normalize to pre-stimulus baseline as 10·log10(power/baseline) (dB) for comparability
     # Baseline window: -5.0 to 0.0 s, where 0 is stimulus onset
     try:
         tfr.apply_baseline(baseline=(-5.0, 0.0), mode='logratio')
@@ -1157,7 +1163,7 @@ def process_subject(subject: str, task: str = TASK) -> None:
     logger.info(
         f"Done: sub-{subject}, n_trials={n}, n_direct_features={pow_df.shape[1]}, "
         f"n_conn_features={(conn_df.shape[1] if conn_df is not None and len(conn_df) > 0 else 0)}, "
-        f"n_all_features={X_all.shape[1]} (power = log10(power/baseline [-5–0 s]))"
+        f"n_all_features={X_all.shape[1]} (power = 10·log10(power/baseline [-5–0 s]) (dB))"
     )
 
 

@@ -212,7 +212,7 @@ Arguments:
 - **Frequency Bands**: Automatic segmentation into theta (4-8 Hz), alpha (8-13 Hz), beta (13-30 Hz), gamma (30-100 Hz)
 
 **2. Baseline Correction:**
-- **Method**: Log-ratio baseline correction (`mode='logratio'`) for relative power changes
+- **Method**: Log-ratio baseline correction (`mode='logratio'`; returns 10·log10(power/baseline) in dB) for relative power changes
 - **Baseline Window**: Pre-stimulus period `(None, 0.0)` seconds
 - **Statistical Rationale**: Log-ratio provides interpretable percent change from baseline and normalizes across frequency bands
 
