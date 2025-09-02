@@ -17,6 +17,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy import stats
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 import mne
 from mne_bids import BIDSPath
 
@@ -1069,8 +1071,15 @@ def plot_power_roi_scatter(
         bootstrap_ci: int = 0,
         rng: Optional[np.random.Generator] = None,
         is_partial_residuals: bool = False,
+        roi_channels: Optional[List[str]] = None,
     ) -> None:
-        """Generic helper to generate correlation scatter plots with stats.
+        """Generate correlation scatter plots with marginal histograms and stats.
+        
+        Creates publication-ready scatter plots with:
+        - Main scatter plot with regression line and CI
+        - Marginal histograms on top and right
+        - Statistical annotations
+        - Secondary x-axis for power plots
         
         Args:
             x_data: X variable (power values)
@@ -1078,7 +1087,7 @@ def plot_power_roi_scatter(
             x_label: X-axis label
             y_label: Y-axis label  
             title_prefix: Title prefix (e.g., "Alpha power vs rating")
-            band_color: Color for scatter points
+            band_color: Color for scatter points and histograms
             output_path: Output file path (without extension)
             method_code: "spearman" or "pearson"
             Z_covars: Covariate matrix for partial correlation
@@ -1096,14 +1105,14 @@ def plot_power_roi_scatter(
             # Data is already residuals, use as-is
             m = pd.Series([True] * len(x), index=x.index if hasattr(x, 'index') else range(len(x)))
             n_eff = len(x)
-            x_plot = x
-            y_plot = y
+            x_clean = x
+            y_clean = y
         else:
             # Filter missing values
             m = x.notna() & y.notna()
             n_eff = int(m.sum())
-            x_plot = x
-            y_plot = y
+            x_clean = x[m]
+            y_clean = y[m]
             
         if n_eff < 5:
             return
@@ -1112,16 +1121,16 @@ def plot_power_roi_scatter(
         if is_partial_residuals:
             # For residuals, just compute correlation directly
             if method_code == "spearman":
-                r, p = stats.spearmanr(x, y, nan_policy="omit")
+                r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
             else:
-                r, p = stats.pearsonr(x, y)
+                r, p = stats.pearsonr(x_clean, y_clean)
             r_part, p_part, n_part = np.nan, np.nan, 0
         else:
             # Regular correlation
             if method_code == "spearman" and y.nunique() > 5:
-                r, p = stats.spearmanr(x[m], y[m], nan_policy="omit")
+                r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
             else:
-                r, p = stats.pearsonr(x[m], y[m])
+                r, p = stats.pearsonr(x_clean, y_clean)
                 
             # Optional partial correlation
             r_part, p_part, n_part = np.nan, np.nan, 0
@@ -1135,85 +1144,154 @@ def plot_power_roi_scatter(
         if method_code == "pearson" and n_eff >= 4:
             ci = _fisher_ci_r(r, n_eff)
         elif method_code == "spearman" and bootstrap_ci > 0:
-            if is_partial_residuals:
-                ci = _bootstrap_corr_ci(x, y, method_code, n_boot=int(bootstrap_ci), rng=rng)
-            else:
-                ci = _bootstrap_corr_ci(x[m], y[m], method_code, n_boot=int(bootstrap_ci), rng=rng)
+            ci = _bootstrap_corr_ci(x_clean, y_clean, method_code, n_boot=int(bootstrap_ci), rng=rng)
         else:
             ci = (np.nan, np.nan)
 
-        # Create and style figure
-        fig, ax = _new_single_ax()
+        # Create figure with marginal plots using gridspec
+        fig = plt.figure(figsize=(8, 6))
+        gs = fig.add_gridspec(2, 2, width_ratios=[4, 1], height_ratios=[1, 4], 
+                             hspace=0.15, wspace=0.15, 
+                             left=0.1, right=0.95, top=0.80, bottom=0.12)
+        
+        # Main scatter plot
+        ax_main = fig.add_subplot(gs[1, 0])
+        # Top histogram (x-axis marginal)
+        ax_histx = fig.add_subplot(gs[0, 0], sharex=ax_main)
+        # Right histogram (y-axis marginal)
+        ax_histy = fig.add_subplot(gs[1, 1], sharey=ax_main)
+        
+        # Configure histogram axes
+        ax_histx.tick_params(labelbottom=False)
+        ax_histy.tick_params(labelleft=False)
+        
+        # Plot main scatter with regression
         line_color = _sig_color(p)
         
         sns.regplot(
-            x=x_plot,
-            y=y_plot,
-            ax=ax,
+            x=x_clean,
+            y=y_clean,
+            ax=ax_main,
             ci=95,
-            scatter_kws={"s": 26, "alpha": 0.75, "color": band_color, "edgecolor": "white", "linewidths": 0.2},
-            line_kws={"color": line_color, "lw": 1.2},
+            scatter_kws={"s": 30, "alpha": 0.7, "color": band_color, "edgecolor": "white", "linewidths": 0.3},
+            line_kws={"color": line_color, "lw": 1.5},
         )
         
-        # Set labels and title
-        ax.set_xlabel(x_label)
-        ax.set_ylabel(y_label)
+        # Plot marginal histograms
+        # X marginal (top)
+        ax_histx.hist(x_clean, bins=15, color=band_color, alpha=0.7, edgecolor='white', linewidth=0.5)
+        # Add KDE curve on top histogram
+        try:
+            from scipy.stats import gaussian_kde
+            if len(x_clean) > 3:
+                kde_x = gaussian_kde(x_clean)
+                x_range = np.linspace(x_clean.min(), x_clean.max(), 100)
+                kde_vals = kde_x(x_range)
+                # Scale KDE to match histogram
+                hist_counts, _ = np.histogram(x_clean, bins=15)
+                kde_scale = hist_counts.max() / kde_vals.max() if kde_vals.max() > 0 else 1
+                ax_histx.plot(x_range, kde_vals * kde_scale, color='darkblue', linewidth=1.5, alpha=0.8)
+        except (ImportError, ValueError, ZeroDivisionError):
+            pass
+            
+        # Y marginal (right)
+        ax_histy.hist(y_clean, bins=15, orientation='horizontal', color=band_color, alpha=0.7, 
+                     edgecolor='white', linewidth=0.5)
+        # Add KDE curve on right histogram
+        try:
+            if len(y_clean) > 3:
+                kde_y = gaussian_kde(y_clean)
+                y_range = np.linspace(y_clean.min(), y_clean.max(), 100)
+                kde_vals_y = kde_y(y_range)
+                # Scale KDE to match histogram
+                hist_counts_y, _ = np.histogram(y_clean, bins=15)
+                kde_scale_y = hist_counts_y.max() / kde_vals_y.max() if kde_vals_y.max() > 0 else 1
+                ax_histy.plot(kde_vals_y * kde_scale_y, y_range, color='darkblue', linewidth=1.5, alpha=0.8)
+        except (ImportError, ValueError, ZeroDivisionError):
+            pass
         
-        # Add secondary x-axis for non-residual power plots
+        # Set labels
+        ax_main.set_xlabel(x_label)
+        ax_main.set_ylabel(y_label)
+        
+        # Add secondary x-axis for power plots (only if no histogram above)
+        show_pct_axis = False
         if not is_partial_residuals and "log10(power" in x_label:
-            try:
-                secax_top = ax.secondary_xaxis('top', functions=(_logratio_to_pct, _pct_to_logratio))
-                secax_top.set_xlabel("Percent change from baseline (%)")
-                secax_top.xaxis.set_major_locator(MaxNLocator(nbins=5))
-            except (AttributeError, TypeError, ValueError):
-                pass
+            show_pct_axis = True
         elif is_partial_residuals and method_code == "pearson" and "residuals of log10(power" in x_label:
+            show_pct_axis = True
+            
+        if show_pct_axis:
             try:
-                secax_top = ax.secondary_xaxis('top', functions=(_logratio_to_pct, _pct_to_logratio))
-                secax_top.set_xlabel("Percent change from baseline (%)")
-                secax_top.xaxis.set_major_locator(MaxNLocator(nbins=5))
+                # Add percentage axis on top histogram
+                ax_pct = ax_histx.secondary_xaxis('top', functions=(_logratio_to_pct, _pct_to_logratio))
+                ax_pct.set_xlabel("Power Change (%)", fontsize=9)
+                ax_pct.xaxis.set_major_locator(MaxNLocator(nbins=5))
             except (AttributeError, TypeError, ValueError):
                 pass
         
-        # Format title with stats
-        label = "ρ" if method_code == "spearman" else "r"
-        if is_partial_residuals:
-            title_stats = f"{label}={r:.2f}, p={p:.3g}, n={n_eff}"
-        else:
-            title_stats = f"{label}={r:.2f}, p={p:.3g}, n={n_eff}"
-        ax.set_title(f"{title_prefix} ({title_stats})", fontsize=10)
+        # Format title and stats annotation
+        label = "Spearman ρ" if method_code == "spearman" else "Pearson r"
+        title_parts = [title_prefix]
         
-        # Apply styling
+        # Add stats text box to main plot
+        stats_text = f"{label} = {r:.3f}\np = {p:.3f}\nn = {n_eff}"
+        
+        # Position stats box at the top-right of the FIGURE (not the axis)
+        # Using figure fraction coordinates avoids crowding the scatter/hist axes
+        fig.text(0.98, 0.94, stats_text,
+                 fontsize=10, va='top', ha='right',
+                 bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.8, edgecolor='gray'))
+        
+        # Set figure title, appending ROI channels if provided on a new line
+        base_title = " vs ".join(title_parts)
+        if roi_channels:
+            ch_list = ", ".join(roi_channels)
+            # Split into two lines for readability
+            full_title = f"{base_title}\n({ch_list})"
+        else:
+            full_title = base_title
+        fig.suptitle(full_title, fontsize=11.5, fontweight='bold', y=0.975)
+        
+        # Apply styling to main plot
         if "Rating" in y_label and not is_partial_residuals:
             try:
                 if y.min() >= 0 and y.max() <= 100:
-                    ax.set_ylim(0, 100)
+                    ax_main.set_ylim(0, 200)  # Give some breathing room
             except (AttributeError, TypeError, ValueError):
                 pass
         elif "Temperature" in y_label and not is_partial_residuals:
             # Align y-ticks to actual temperature values
-            unique_temps = np.sort(np.unique(np.asarray(y)))
+            unique_temps = np.sort(np.unique(np.asarray(y_clean)))
             if np.allclose(unique_temps, unique_temps.astype(int)):
                 unique_temps = unique_temps.astype(int)
             if len(unique_temps) >= 2:
-                ax.set_yticks(unique_temps.tolist())
+                ax_main.set_yticks(unique_temps.tolist())
                 ymin = unique_temps.min() - 0.5
                 ymax = unique_temps.max() + 0.5
-                ax.set_ylim(ymin, ymax)
+                ax_main.set_ylim(ymin, ymax)
         elif is_partial_residuals:
-            # Reduce y-axis tick clutter for residuals
+            # Reduce tick clutter for residuals
             try:
-                ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+                ax_main.yaxis.set_major_locator(MaxNLocator(nbins=6))
+                ax_main.xaxis.set_major_locator(MaxNLocator(nbins=6))
             except (AttributeError, TypeError, ValueError):
                 pass
                 
-        ax.grid(True, alpha=0.15, linestyle="--", linewidth=0.8)
-        try:
-            sns.despine(ax=ax)
-        except (AttributeError, TypeError):
-            pass
-            
-        fig.tight_layout()
+        # Style all axes
+        for ax in [ax_main, ax_histx, ax_histy]:
+            ax.grid(True, alpha=0.15, linestyle="--", linewidth=0.8)
+            try:
+                sns.despine(ax=ax)
+            except (AttributeError, TypeError):
+                pass
+        
+        # Clean up marginal plot spines
+        ax_histx.spines['top'].set_visible(False)
+        ax_histx.spines['right'].set_visible(False)
+        ax_histy.spines['top'].set_visible(False)
+        ax_histy.spines['right'].set_visible(False)
+                
         _save_fig(fig, output_path)
 
     # Build ROI map and iterate
@@ -1345,6 +1423,7 @@ def plot_power_roi_scatter(
                 covar_names=covar_names,
                 bootstrap_ci=bootstrap_ci,
                 rng=rng,
+                roi_channels=chs,
             )
             
             # ROI partial-residuals figure if covariates available
@@ -1370,6 +1449,7 @@ def plot_power_roi_scatter(
                         bootstrap_ci=bootstrap_ci,
                         rng=rng,
                         is_partial_residuals=True,
+                        roi_channels=chs,
                     )
 
             # ROI-specific temperature scatter (optional)
@@ -1392,6 +1472,7 @@ def plot_power_roi_scatter(
                     covar_names=covar_names_temp,
                     bootstrap_ci=bootstrap_ci,
                     rng=rng,
+                    roi_channels=chs,
                 )
                 
                 # ROI temperature partial-residuals figure if covariates available
@@ -1417,6 +1498,7 @@ def plot_power_roi_scatter(
                             bootstrap_ci=bootstrap_ci,
                             rng=rng,
                             is_partial_residuals=True,
+                            roi_channels=chs,
                         )
 
 # Power-Behavior Correlation Visualization (transferred from 03_feature_engineering.py)
@@ -1561,6 +1643,165 @@ def plot_power_behavior_correlation_matrix(pow_df: pd.DataFrame, y: pd.Series, b
             plt.close(fig)
 
 
+def plot_significant_correlations_topomap(pow_df: pd.DataFrame, y: pd.Series, bands: List[str], 
+                                         info: mne.Info, subject: str, save_dir: Path, 
+                                         logger: logging.Logger, alpha: float = 0.05):
+    """Create topographical maps showing significant correlations for each frequency band.
+    
+    Uses MNE's plot_topomap with mask parameter to highlight significant electrodes.
+    """
+    try:
+        # Calculate correlations for all bands
+        bands_with_data = []
+        
+        for band in bands:
+            band_cols = [col for col in pow_df.columns if col.startswith(f'pow_{band}_')]
+            if not band_cols:
+                continue
+                
+            # Extract channel names and calculate correlations
+            ch_names = [col.replace(f'pow_{band}_', '') for col in band_cols]
+            correlations = []
+            p_values = []
+            
+            for col in band_cols:
+                # Clean correlation calculation
+                valid_data = pd.concat([pow_df[col], y], axis=1).dropna()
+                if len(valid_data) >= 5:
+                    r, p = stats.spearmanr(valid_data.iloc[:, 0], valid_data.iloc[:, 1])
+                else:
+                    r, p = np.nan, 1.0
+                correlations.append(r)
+                p_values.append(p)
+            
+            # Check if any correlations are significant
+            sig_mask = np.array(p_values) < alpha
+            if np.any(sig_mask & np.isfinite(correlations)):
+                bands_with_data.append({
+                    'band': band,
+                    'channels': ch_names,
+                    'correlations': np.array(correlations),
+                    'p_values': np.array(p_values),
+                    'significant_mask': sig_mask
+                })
+        
+        if not bands_with_data:
+            logger.warning("No significant correlations found across any frequency band")
+            return
+        
+        # Create figure
+        n_bands = len(bands_with_data)
+        fig, axes = plt.subplots(1, n_bands, figsize=(4.8 * n_bands, 4.8))
+        if n_bands == 1:
+            axes = [axes]
+        # Make heads larger and reduce whitespace between them; reserve more space below for colorbar
+        plt.subplots_adjust(left=0.06, right=0.98, top=0.83, bottom=0.20, wspace=0.08)
+        
+        # Calculate global color limits based on all significant correlations
+        all_sig_corrs = []
+        for band_data in bands_with_data:
+            sig_corrs = band_data['correlations'][band_data['significant_mask']]
+            all_sig_corrs.extend(sig_corrs[np.isfinite(sig_corrs)])
+        
+        vmax = max(abs(np.min(all_sig_corrs)), abs(np.max(all_sig_corrs))) if all_sig_corrs else 0.5
+        
+        successful_plots = []
+        
+        for i, band_data in enumerate(bands_with_data):
+            ax = axes[i]
+            
+            try:
+                # Create data arrays matching info channel order
+                n_info_chs = len(info['ch_names'])
+                topo_data = np.zeros(n_info_chs)
+                topo_mask = np.zeros(n_info_chs, dtype=bool)
+                
+                # Map band data to info channels
+                for j, info_ch in enumerate(info['ch_names']):
+                    if info_ch in band_data['channels']:
+                        ch_idx = band_data['channels'].index(info_ch)
+                        topo_data[j] = band_data['correlations'][ch_idx] if np.isfinite(band_data['correlations'][ch_idx]) else 0
+                        topo_mask[j] = band_data['significant_mask'][ch_idx]
+                
+                # Select EEG channels
+                picks = mne.pick_types(info, meg=False, eeg=True, exclude='bads')
+                if len(picks) == 0:
+                    raise ValueError("No EEG channels found")
+                
+                # Plot topomap
+                im, _ = mne.viz.plot_topomap(
+                    topo_data[picks],
+                    mne.pick_info(info, picks),
+                    axes=ax,
+                    show=False,
+                    cmap='RdBu_r',
+                    vlim=(-vmax, vmax),
+                    contours=6,
+                    mask=topo_mask[picks],
+                    mask_params=dict(
+                        marker='o', 
+                        markerfacecolor='white', 
+                        markeredgecolor='black', 
+                        linewidth=1, 
+                        markersize=6
+                    )
+                )
+                
+                successful_plots.append(im)
+                
+                # Add title
+                n_sig = topo_mask[picks].sum()
+                n_total = len([ch for ch in band_data['channels'] if ch in info['ch_names']])
+                ax.set_title(
+                    f'{band_data["band"].upper()}\n{n_sig}/{n_total} significant',
+                    fontweight='bold', fontsize=12, pad=10
+                )
+                
+            except Exception as e:
+                logger.warning(f"Failed to plot {band_data['band']} topomap: {e}")
+                ax.text(0.5, 0.5, f'{band_data["band"].upper()}\nPlot failed', 
+                       ha='center', va='center', transform=ax.transAxes,
+                       bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+                ax.set_title(f'{band_data["band"].upper()}\n(Error)', fontweight='bold', pad=10)
+        
+        # Main title
+        plt.suptitle(
+            f'Significant EEG-Pain Correlations (p < {alpha})\nSubject {subject}',
+            fontweight='bold', fontsize=14, y=1.02
+        )
+        
+        # Add colorbar if successful plots exist
+        if successful_plots:
+            # Build a dynamic, centered colorbar under the span of the topomap axes
+            # Use axes positions (in figure fraction) to define cbar extents
+            left = min(ax.get_position().x0 for ax in axes)
+            right = max(ax.get_position().x1 for ax in axes)
+            bottom = min(ax.get_position().y0 for ax in axes)
+            span = right - left
+            # Colorbar occupies 55% of head span and sits with a fixed gap below
+            cb_width = 0.55 * span
+            cb_left = left + 0.225 * span  # center it
+            cb_bottom = max(0.04, bottom - 0.06)  # keep a bit away from heads and above bottom edge
+            cax = fig.add_axes([cb_left, cb_bottom, cb_width, 0.028])
+            cbar = fig.colorbar(successful_plots[-1], cax=cax, orientation='horizontal')
+            cbar.set_label('Spearman correlation (ρ)', fontweight='bold', fontsize=11)
+            cbar.ax.tick_params(pad=2, labelsize=9)
+        
+        # Save
+        _save_fig(fig, save_dir / f'sub-{subject}_significant_correlations_topomap')
+        plt.close(fig)
+        
+        logger.info(f"Created topomaps for {len(bands_with_data)} frequency bands: "
+                   f"{[bd['band'] for bd in bands_with_data]}")
+        
+    except Exception as e:
+        logger.error(f"Failed to create significant correlations topomap: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        if 'fig' in locals():
+            plt.close(fig)
+
+
 def plot_behavioral_response_patterns(y: pd.Series, aligned_events: Optional[pd.DataFrame], 
                                     subject: str, save_dir: Path, logger: logging.Logger):
     """Plot behavioral response patterns and distributions as separate figures."""
@@ -1626,120 +1867,6 @@ def plot_behavioral_response_patterns(y: pd.Series, aligned_events: Optional[pd.
 
 
 
-def plot_behavioral_predictor_importance(pow_df: pd.DataFrame, y: pd.Series, bands: List[str],
-                                       subject: str, save_dir: Path, logger: logging.Logger):
-    """Plot behavioral predictor importance ranking across channels and bands."""
-    try:
-        # Calculate correlations for all power features
-        correlations = []
-        p_values = []
-        feature_names = []
-        band_labels = []
-        
-        for band in bands:
-            band_cols = [col for col in pow_df.columns if col.startswith(f'pow_{band}_')]
-            
-            for col in band_cols:
-                valid_mask = ~(pow_df[col].isna() | y.isna())
-                if valid_mask.sum() < 5:
-                    continue
-                    
-                x_valid = pow_df[col][valid_mask]
-                y_valid = y[valid_mask]
-                
-                r, p = stats.spearmanr(x_valid, y_valid)
-                correlations.append(abs(r))  # Use absolute correlation for importance
-                p_values.append(p)
-                feature_names.append(col.replace(f'pow_{band}_', ''))
-                band_labels.append(band)
-        
-        if not correlations:
-            logger.warning("No valid correlations found for predictor importance")
-            return
-        
-        # Filter to only include significant correlations (p < 0.05)
-        significant_mask = np.array(p_values) < 0.05
-        significant_correlations = [correlations[i] for i in range(len(correlations)) if significant_mask[i]]
-        significant_features = [feature_names[i] for i in range(len(feature_names)) if significant_mask[i]]
-        significant_bands = [band_labels[i] for i in range(len(band_labels)) if significant_mask[i]]
-        significant_p_values = [p_values[i] for i in range(len(p_values)) if significant_mask[i]]
-        
-        if not significant_correlations:
-            logger.warning("No significant correlations (p < 0.05) found for predictor importance")
-            return
-            
-        # Sort by importance (absolute correlation) among significant results
-        sorted_indices = np.argsort(significant_correlations)[::-1]  # Descending order
-        top_n = min(20, len(significant_correlations))  # Show top 20 or all if fewer
-        
-        top_correlations = [significant_correlations[i] for i in sorted_indices[:top_n]]
-        top_features = [significant_features[i] for i in sorted_indices[:top_n]]
-        top_bands = [significant_bands[i] for i in sorted_indices[:top_n]]
-        top_p_values = [significant_p_values[i] for i in sorted_indices[:top_n]]
-        
-        # 1. Horizontal bar plot of top predictors
-        fig1, ax1 = plt.subplots(figsize=(10, 8))
-        y_pos = np.arange(top_n)
-        colors = [BAND_COLORS.get(band, '#4C4C4C') for band in top_bands]
-        
-        bars = ax1.barh(y_pos, top_correlations, color=colors, alpha=0.7)
-        ax1.set_yticks(y_pos)
-        ax1.set_yticklabels([f"{feat} ({band})" for feat, band in zip(top_features, top_bands)])
-        ax1.set_xlabel('|Spearman ρ| with Behavior (p < 0.05)')
-        ax1.set_title(f'Top {top_n} Significant Behavioral Predictors')
-        ax1.grid(True, alpha=0.3, axis='x')
-        
-        # Add correlation values and p-values on bars
-        for i, (bar, corr, p_val) in enumerate(zip(bars, top_correlations, top_p_values)):
-            ax1.text(corr + 0.01, bar.get_y() + bar.get_height()/2, 
-                    f'{corr:.3f} (p={p_val:.3f})', va='center', fontsize=8)
-        
-        plt.tight_layout()
-        _save_fig(fig1, save_dir / f'sub-{subject}_top_behavioral_predictors')
-        plt.close(fig1)
-        
-        # 2. Band-wise importance distribution (only for significant correlations)
-        band_importance = {}
-        for band in bands:
-            band_correlations = [significant_correlations[i] for i, b in enumerate(significant_bands) if b == band]
-            if band_correlations:
-                band_importance[band] = {
-                    'mean': np.mean(band_correlations),
-                    'std': np.std(band_correlations),
-                    'max': np.max(band_correlations)
-                }
-        
-        if band_importance:
-            fig2, ax2 = plt.subplots(figsize=(8, 6))
-            bands_plot = list(band_importance.keys())
-            means = [band_importance[b]['mean'] for b in bands_plot]
-            stds = [band_importance[b]['std'] for b in bands_plot]
-            colors_band = [BAND_COLORS.get(band, '#4C4C4C') for band in bands_plot]
-            
-            x_pos = np.arange(len(bands_plot))
-            bars2 = ax2.bar(x_pos, means, yerr=stds, capsize=5, 
-                           color=colors_band, alpha=0.7, error_kw={'alpha': 0.8})
-            ax2.set_xticks(x_pos)
-            ax2.set_xticklabels([b.capitalize() for b in bands_plot])
-            ax2.set_ylabel('Mean |Spearman ρ|')
-            ax2.set_title('Band-wise Predictor Importance')
-            ax2.grid(True, alpha=0.3, axis='y')
-            
-            # Add values on bars
-            for bar, mean, std in zip(bars2, means, stds):
-                ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.01,
-                        f'{mean:.3f}', ha='center', va='bottom', fontsize=10)
-            
-            plt.tight_layout()
-            _save_fig(fig2, save_dir / f'sub-{subject}_band_predictor_importance')
-            plt.close(fig2)
-        
-        logger.info(f"Saved behavioral predictor importance plots as separate figures in: {save_dir}")
-        
-    except Exception as e:
-        logger.error(f"Failed to create behavioral predictor importance: {e}")
-        if 'fig' in locals():
-            plt.close(fig)
 
 
 def plot_power_spectrogram_with_behavior(pow_df: pd.DataFrame, y: pd.Series, bands: List[str],
@@ -2043,55 +2170,6 @@ def plot_behavior_modulated_connectivity(subject: str, task: str, y: pd.Series,
 
 
 
-def plot_neural_state_pca(pow_df: pd.DataFrame, y: pd.Series, 
-                         subject: str, save_dir: Path, logger: logging.Logger):
-    """Create neural state space visualization using PCA."""
-    try:
-        from sklearn.decomposition import PCA
-        from sklearn.preprocessing import StandardScaler
-        
-        # Prepare data for PCA
-        pow_clean = pow_df.dropna()
-        if len(pow_clean) < 10:
-            logger.warning("Insufficient data for PCA analysis")
-            return
-            
-        scaler = StandardScaler()
-        pow_scaled = scaler.fit_transform(pow_clean)
-        
-        pca = PCA(n_components=2)
-        pca_coords = pca.fit_transform(pow_scaled)
-        
-        fig, ax = plt.subplots(figsize=(10, 8))
-        scatter = ax.scatter(pca_coords[:, 0], pca_coords[:, 1], 
-                           c=y.loc[pow_clean.index], cmap='RdYlBu_r', 
-                           s=60, alpha=0.8, edgecolor='black', linewidth=0.5)
-        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)', fontweight='bold')
-        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)', fontweight='bold')
-        ax.set_title(f'Neural State Space (PCA)\nSubject {subject}', fontweight='bold', fontsize=14)
-        ax.grid(True, alpha=0.3)
-        
-        # Add colorbar
-        cbar = plt.colorbar(scatter, ax=ax)
-        cbar.set_label('Pain Rating', fontweight='bold')
-        
-        # Add explained variance text
-        total_var = sum(pca.explained_variance_ratio_[:2])
-        ax.text(0.02, 0.98, f'Total Variance Explained: {total_var*100:.1f}%',
-               transform=ax.transAxes, ha='left', va='top',
-               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
-               fontweight='bold')
-        
-        plt.tight_layout()
-        _save_fig(fig, save_dir / f'sub-{subject}_neural_state_pca')
-        plt.close(fig)
-        
-        logger.info(f"Saved neural state PCA visualization")
-        
-    except Exception as e:
-        logger.error(f"Failed to create neural state PCA: {e}")
-        if 'fig' in locals():
-            plt.close(fig)
 
 
 def plot_band_power_summary(pow_df: pd.DataFrame, bands: List[str],
@@ -2141,135 +2219,6 @@ def plot_band_power_summary(pow_df: pd.DataFrame, bands: List[str],
             plt.close(fig)
 
 
-def plot_statistical_effect_size_summary(pow_df: pd.DataFrame, y: pd.Series, bands: List[str],
-                                        subject: str, save_dir: Path, logger: logging.Logger):
-    """Create statistical summary with effect sizes for publication."""
-    try:
-        from scipy.stats import pearsonr
-        
-        # Collect statistical metrics
-        stats_data = []
-        
-        for band in bands:
-            band_cols = [col for col in pow_df.columns if col.startswith(f'pow_{band}_')]
-            
-            for col in band_cols:
-                ch_name = col.replace(f'pow_{band}_', '')
-                valid_mask = ~(pow_df[col].isna() | y.isna())
-                
-                if valid_mask.sum() > 10:
-                    x_vals = pow_df[col][valid_mask]
-                    y_vals = y[valid_mask]
-                    
-                    # Spearman correlation
-                    r_spear, p_spear = stats.spearmanr(x_vals, y_vals)
-                    
-                    # Pearson correlation
-                    r_pears, p_pears = pearsonr(x_vals, y_vals)
-                    
-                    # Effect size (Cohen's r interpretation)
-                    effect_size = 'Small' if abs(r_spear) < 0.3 else ('Medium' if abs(r_spear) < 0.5 else 'Large')
-                    
-                    stats_data.append({
-                        'Band': band.capitalize(),
-                        'Channel': ch_name,
-                        'Spearman_r': r_spear,
-                        'Spearman_p': p_spear,
-                        'Pearson_r': r_pears,
-                        'Pearson_p': p_pears,
-                        'Effect_Size': effect_size,
-                        'N': valid_mask.sum()
-                    })
-        
-        if not stats_data:
-            logger.warning("No statistical data available")
-            return
-        
-        # Convert to DataFrame for easier handling
-        stats_df = pd.DataFrame(stats_data)
-        
-        # Create separate statistical summary figures
-        
-        # Figure 1: Effect size distribution by band
-        fig1, ax1 = plt.subplots(figsize=(8, 6))
-        effect_counts = stats_df.groupby(['Band', 'Effect_Size']).size().unstack(fill_value=0)
-        effect_counts.plot(kind='bar', ax=ax1, color=['lightcoral', 'khaki', 'lightgreen'])
-        ax1.set_title(f'Effect Size Distribution by Band\nSubject {subject}', fontweight='bold', fontsize=14)
-        ax1.set_ylabel('Number of Channels', fontweight='bold')
-        ax1.set_xlabel('Frequency Band', fontweight='bold')
-        ax1.legend(title='Effect Size')
-        ax1.grid(True, alpha=0.3, axis='y')
-        plt.tight_layout()
-        _save_fig(fig1, save_dir / f'sub-{subject}_effect_size_distribution')
-        plt.close(fig1)
-        
-        
-        # Figure 3: Significance by band
-        fig3, ax3 = plt.subplots(figsize=(8, 6))
-        sig_summary = stats_df.groupby('Band').apply(
-            lambda x: (x['Spearman_p'] < 0.05).sum() / len(x) * 100,
-            include_groups=False
-        ).reset_index()
-        sig_summary.columns = ['Band', 'Significant_Percent']
-        
-        colors = [BAND_COLORS.get(band.lower(), '#4C4C4C') for band in sig_summary['Band']]
-        bars = ax3.bar(sig_summary['Band'], sig_summary['Significant_Percent'], 
-                      color=colors, alpha=0.7)
-        ax3.set_ylabel('% Significant Channels', fontweight='bold')
-        ax3.set_xlabel('Frequency Band', fontweight='bold')
-        ax3.set_title(f'Significant Brain-Behavior Correlations by Band (p < 0.05)\nSubject {subject}', 
-                     fontweight='bold', fontsize=14)
-        ax3.grid(True, alpha=0.3, axis='y')
-        
-        # Add percentages on bars
-        for bar, pct in zip(bars, sig_summary['Significant_Percent']):
-            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                    f'{pct:.1f}%', ha='center', va='bottom', fontweight='bold')
-        plt.tight_layout()
-        _save_fig(fig3, save_dir / f'sub-{subject}_significance_by_band')
-        plt.close(fig3)
-        
-        # Figure 4: Top correlations table-style visualization (significant only)
-        fig4, ax4 = plt.subplots(figsize=(10, 8))
-        # Filter to only significant correlations first
-        significant_stats = stats_df[stats_df['Spearman_p'] < 0.05]
-        
-        if len(significant_stats) == 0:
-            logger.warning("No significant correlations (p < 0.05) found for top correlations plot")
-            plt.close(fig4)
-        else:
-            top_correlations = significant_stats.nlargest(min(15, len(significant_stats)), 'Spearman_r')
-            
-            y_pos = np.arange(len(top_correlations))
-            colors_top = [BAND_COLORS.get(band.lower(), '#4C4C4C') for band in top_correlations['Band']]
-            
-            bars = ax4.barh(y_pos, top_correlations['Spearman_r'], color=colors_top, alpha=0.7)
-            ax4.set_yticks(y_pos)
-            ax4.set_yticklabels([f"{row['Channel']} ({row['Band']})" for _, row in top_correlations.iterrows()])
-            ax4.set_xlabel('Spearman ρ (p < 0.05)', fontweight='bold')
-            ax4.set_title(f'Top {len(top_correlations)} Significant Brain-Behavior Correlations\nSubject {subject}', fontweight='bold', fontsize=14)
-            ax4.grid(True, alpha=0.3, axis='x')
-            
-            # Add correlation values and p-values
-            for i, (bar, _, row) in enumerate(zip(bars, top_correlations['Spearman_r'], top_correlations.itertuples())):
-                r_val = row.Spearman_r
-                p_val = row.Spearman_p
-                ax4.text(r_val + 0.01, bar.get_y() + bar.get_height()/2,
-                        f'{r_val:.3f} (p={p_val:.3f})', va='center', fontsize=8)
-            
-            plt.tight_layout()
-            _save_fig(fig4, save_dir / f'sub-{subject}_top_correlations')
-            plt.close(fig4)
-        
-        # Save statistical summary as CSV
-        stats_df.to_csv(save_dir / f'sub-{subject}_statistical_summary.csv', index=False)
-        
-        logger.info(f"Saved statistical effect size summary and CSV")
-        
-    except Exception as e:
-        logger.error(f"Failed to create statistical effect size summary: {e}")
-        if 'fig' in locals():
-            plt.close(fig)
 
 
 # Connectivity ROI summary correlations (within/between ROI averages)
@@ -2853,6 +2802,315 @@ def export_combined_power_corr_stats(subject: str) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Neural Behavioral State Space Visualization
+# -----------------------------------------------------------------------------
+
+def plot_neural_behavioral_state_space(
+    subject: str,
+    task: str = TASK,
+    method: str = 'pca',
+    n_components: int = 2,
+    rng: Optional[np.random.Generator] = None,
+) -> None:
+    """Create neural-behavioral state space visualization using dimensionality reduction.
+    
+    Maps high-dimensional neural feature space to behavioral ratings using PCA/UMAP,
+    showing behavioral trajectories through neural state space.
+    
+    Parameters
+    ----------
+    subject : str
+        Subject identifier
+    task : str
+        Task name
+    method : str
+        Dimensionality reduction method ('pca' or 'umap')
+    n_components : int
+        Number of components for dimensionality reduction (2 or 3)
+    rng : Optional[np.random.Generator]
+        Random number generator for reproducibility
+    """
+    logger = _setup_logging(subject)
+    logger.info(f"Creating neural-behavioral state space visualization for sub-{subject}")
+    
+    plots_dir = _plots_dir(subject)
+    stats_dir = _stats_dir(subject)
+    _ensure_dir(plots_dir)
+    _ensure_dir(stats_dir)
+    
+    if rng is None:
+        rng = np.random.default_rng(42)
+    
+    try:
+        # Load features and targets
+        pow_df, conn_df, y, info = _load_features_and_targets(subject, task)
+        y = pd.to_numeric(y, errors="coerce")
+        
+        # Load epochs for alignment and events for temperature
+        epo_path = _find_clean_epochs_path(subject, task)
+        if epo_path is None:
+            logger.error(f"Could not find epochs for state space analysis: sub-{subject}")
+            return
+            
+        epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+        events = _load_events_df(subject, task)
+        aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
+        
+        # Get temperature data if available
+        temp_series: Optional[pd.Series] = None
+        if aligned_events is not None:
+            temp_col = _pick_first_column(aligned_events, PSYCH_TEMP_COLUMNS)
+            if temp_col is not None:
+                temp_series = pd.to_numeric(aligned_events[temp_col], errors="coerce")
+        
+        # Prepare neural feature matrix (all power features across channels and bands)
+        feature_cols = [col for col in pow_df.columns if col.startswith('pow_')]
+        if len(feature_cols) < 2:
+            logger.warning(f"Insufficient power features ({len(feature_cols)}) for state space analysis")
+            return
+            
+        # Convert to numeric and handle missing data
+        X_raw = pow_df[feature_cols].apply(pd.to_numeric, errors='coerce')
+        
+        # Align all data to common length
+        min_len = min(len(X_raw), len(y))
+        if temp_series is not None:
+            min_len = min(min_len, len(temp_series))
+            
+        X = X_raw.iloc[:min_len]
+        y_aligned = y.iloc[:min_len]
+        temp_aligned = temp_series.iloc[:min_len] if temp_series is not None else None
+        
+        # Remove trials with missing behavioral data
+        valid_mask = y_aligned.notna()
+        if temp_aligned is not None:
+            valid_mask = valid_mask & temp_aligned.notna()
+            
+        X_clean = X.loc[valid_mask]
+        y_clean = y_aligned.loc[valid_mask]
+        temp_clean = temp_aligned.loc[valid_mask] if temp_aligned is not None else None
+        
+        # Remove features with too many missing values or no variance
+        feature_valid_pct = X_clean.notna().mean()
+        good_features = feature_valid_pct[feature_valid_pct >= 0.7].index  # Keep features with ≥70% valid data
+        X_final = X_clean[good_features]
+        
+        # Impute remaining missing values with median
+        X_imputed = X_final.fillna(X_final.median())
+        
+        # Remove zero-variance features
+        X_var = X_imputed.var()
+        nonzero_var_features = X_var[X_var > 1e-12].index
+        X_processed = X_imputed[nonzero_var_features]
+        
+        if len(X_processed.columns) < 2:
+            logger.warning(f"Insufficient valid features ({len(X_processed.columns)}) after preprocessing")
+            return
+            
+        logger.info(f"Using {len(X_processed.columns)} neural features for {len(X_processed)} trials")
+        
+        # Standardize features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_processed)
+        
+        # Apply dimensionality reduction
+        if method.lower() == 'pca':
+            reducer = PCA(n_components=n_components, random_state=42)
+            X_reduced = reducer.fit_transform(X_scaled)
+            explained_var = reducer.explained_variance_ratio_
+            component_names = [f'PC{i+1}' for i in range(n_components)]
+        else:
+            logger.warning(f"Method '{method}' not implemented, falling back to PCA")
+            reducer = PCA(n_components=n_components, random_state=42)
+            X_reduced = reducer.fit_transform(X_scaled)
+            explained_var = reducer.explained_variance_ratio_
+            component_names = [f'PC{i+1}' for i in range(n_components)]
+        
+        # Create visualization
+        if n_components == 2:
+            fig = plt.figure(figsize=(14, 10))
+            
+            # Main scatter plot (top-left)
+            ax_main = plt.subplot2grid((3, 3), (0, 0), colspan=2, rowspan=2)
+            
+            # Marginal histograms
+            ax_marg_x = plt.subplot2grid((3, 3), (2, 0), colspan=2, sharex=ax_main)
+            ax_marg_y = plt.subplot2grid((3, 3), (0, 2), rowspan=2, sharey=ax_main)
+            
+            # Feature importance plot
+            ax_features = plt.subplot2grid((3, 3), (2, 2))
+            
+            # Main scatter plot colored by behavioral ratings
+            scatter = ax_main.scatter(
+                X_reduced[:, 0], X_reduced[:, 1], 
+                c=y_clean, cmap='RdYlBu_r', 
+                s=60 if temp_clean is None else temp_clean * 3,  # Size by temperature if available
+                alpha=0.7, edgecolors='white', linewidth=0.5
+            )
+            
+            # Add trajectory lines connecting consecutive trials
+            if len(X_reduced) > 1:
+                ax_main.plot(X_reduced[:, 0], X_reduced[:, 1], 
+                           color='gray', alpha=0.3, linewidth=1, zorder=0)
+                # Mark start and end
+                ax_main.scatter(X_reduced[0, 0], X_reduced[0, 1], 
+                              marker='s', s=100, color='green', alpha=0.8, 
+                              edgecolors='white', linewidth=2, zorder=10, label='Start')
+                ax_main.scatter(X_reduced[-1, 0], X_reduced[-1, 1], 
+                              marker='X', s=100, color='red', alpha=0.8, 
+                              edgecolors='white', linewidth=2, zorder=10, label='End')
+            
+            # Colorbar for behavioral ratings
+            cbar = plt.colorbar(scatter, ax=ax_main)
+            cbar.set_label('Pain Rating', fontsize=12, fontweight='bold')
+            
+            # Main plot labels
+            ax_main.set_xlabel(f'{component_names[0]} ({explained_var[0]:.1%} variance)', 
+                             fontsize=12, fontweight='bold')
+            ax_main.set_ylabel(f'{component_names[1]} ({explained_var[1]:.1%} variance)', 
+                             fontsize=12, fontweight='bold')
+            ax_main.set_title(f'Neural-Behavioral State Space: sub-{subject}', 
+                            fontsize=14, fontweight='bold')
+            ax_main.legend(loc='upper right')
+            ax_main.grid(True, alpha=0.3)
+            
+            # Marginal distributions
+            ax_marg_x.hist(X_reduced[:, 0], bins=20, alpha=0.7, color='steelblue', edgecolor='white')
+            ax_marg_x.set_ylabel('Count', fontweight='bold')
+            ax_marg_x.grid(True, alpha=0.3)
+            
+            ax_marg_y.hist(X_reduced[:, 1], bins=20, orientation='horizontal', 
+                          alpha=0.7, color='steelblue', edgecolor='white')
+            ax_marg_y.set_xlabel('Count', fontweight='bold')
+            ax_marg_y.grid(True, alpha=0.3)
+            
+            # Feature importance (top contributing features to each PC)
+            if hasattr(reducer, 'components_'):
+                # Get top features for PC1 and PC2
+                pc1_importance = np.abs(reducer.components_[0])
+                pc2_importance = np.abs(reducer.components_[1])
+                
+                # Get top 5 features for each PC
+                top_features_pc1 = np.argsort(pc1_importance)[-5:][::-1]
+                top_features_pc2 = np.argsort(pc2_importance)[-5:][::-1]
+                
+                # Combine and get unique features
+                top_features = np.unique(np.concatenate([top_features_pc1, top_features_pc2]))
+                
+                if len(top_features) > 0:
+                    feature_names = [X_processed.columns[i] for i in top_features]
+                    importances = np.sqrt(pc1_importance[top_features]**2 + pc2_importance[top_features]**2)
+                    
+                    # Clean feature names for display
+                    display_names = []
+                    for fname in feature_names:
+                        # Extract band and channel from feature name like 'pow_alpha_Cz'
+                        parts = fname.split('_')
+                        if len(parts) >= 3:
+                            band = parts[1]
+                            channel = parts[2]
+                            display_names.append(f'{band}\n{channel}')
+                        else:
+                            display_names.append(fname.replace('_', '\n'))
+                    
+                    # Plot feature importance
+                    bars = ax_features.barh(range(len(importances)), importances, 
+                                          color='coral', alpha=0.7)
+                    ax_features.set_yticks(range(len(importances)))
+                    ax_features.set_yticklabels(display_names, fontsize=8)
+                    ax_features.set_xlabel('Importance', fontsize=10, fontweight='bold')
+                    ax_features.set_title('Top Features', fontsize=10, fontweight='bold')
+                    ax_features.grid(True, alpha=0.3, axis='x')
+            
+            plt.tight_layout()
+            
+        elif n_components == 3:
+            # 3D visualization
+            fig = plt.figure(figsize=(12, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            scatter = ax.scatter(
+                X_reduced[:, 0], X_reduced[:, 1], X_reduced[:, 2],
+                c=y_clean, cmap='RdYlBu_r',
+                s=60 if temp_clean is None else temp_clean * 3,
+                alpha=0.7
+            )
+            
+            # Trajectory
+            if len(X_reduced) > 1:
+                ax.plot(X_reduced[:, 0], X_reduced[:, 1], X_reduced[:, 2],
+                       color='gray', alpha=0.3, linewidth=1)
+            
+            ax.set_xlabel(f'{component_names[0]} ({explained_var[0]:.1%})', fontweight='bold')
+            ax.set_ylabel(f'{component_names[1]} ({explained_var[1]:.1%})', fontweight='bold')
+            ax.set_zlabel(f'{component_names[2]} ({explained_var[2]:.1%})', fontweight='bold')
+            ax.set_title(f'Neural-Behavioral State Space (3D): sub-{subject}', fontweight='bold')
+            
+            cbar = plt.colorbar(scatter, ax=ax, shrink=0.5)
+            cbar.set_label('Pain Rating', fontweight='bold')
+        
+        # Save figure
+        save_path = plots_dir / f'sub-{subject}_neural_behavioral_state_space_{method}_{n_components}d'
+        _save_fig(fig, save_path)
+        
+        # Export numerical results
+        results_df = pd.DataFrame({
+            'trial': range(len(X_reduced)),
+            f'{component_names[0]}': X_reduced[:, 0],
+            f'{component_names[1]}': X_reduced[:, 1],
+            'pain_rating': y_clean.values,
+        })
+        
+        if n_components >= 3:
+            results_df[f'{component_names[2]}'] = X_reduced[:, 2]
+            
+        if temp_clean is not None:
+            results_df['temperature'] = temp_clean.values
+            
+        results_df.to_csv(stats_dir / f'neural_state_space_{method}_{n_components}d.tsv', 
+                         sep='\t', index=False)
+        
+        # Export variance explained and feature contributions
+        variance_df = pd.DataFrame({
+            'component': component_names,
+            'variance_explained': explained_var,
+            'cumulative_variance': np.cumsum(explained_var)
+        })
+        variance_df.to_csv(stats_dir / f'neural_state_space_variance_{method}_{n_components}d.tsv', 
+                          sep='\t', index=False)
+        
+        # Correlate neural components with behavior
+        corr_results = []
+        for i, comp_name in enumerate(component_names):
+            r, p = stats.spearmanr(X_reduced[:, i], y_clean)
+            corr_results.append({
+                'component': comp_name,
+                'r_vs_rating': float(r),
+                'p_vs_rating': float(p),
+                'variance_explained': float(explained_var[i])
+            })
+            
+            if temp_clean is not None:
+                r_temp, p_temp = stats.spearmanr(X_reduced[:, i], temp_clean)
+                corr_results[-1]['r_vs_temperature'] = float(r_temp)
+                corr_results[-1]['p_vs_temperature'] = float(p_temp)
+        
+        corr_df = pd.DataFrame(corr_results)
+        corr_df.to_csv(stats_dir / f'neural_state_space_correlations_{method}_{n_components}d.tsv', 
+                      sep='\t', index=False)
+        
+        logger.info(f"Neural state space analysis complete. Explained variance: {explained_var.sum():.1%}")
+        logger.info(f"Strongest component-behavior correlation: r={corr_df['r_vs_rating'].abs().max():.3f}")
+        
+    except Exception as e:
+        logger.error(f"Failed to create neural state space visualization: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        if 'fig' in locals():
+            plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
 # Global FDR across all tests (subject-level)
 # -----------------------------------------------------------------------------
 
@@ -3115,11 +3373,12 @@ def process_subject(
         # 1. Power-behavior correlation matrix
         plot_power_behavior_correlation_matrix(pow_df, y, POWER_BANDS_TO_USE, subject, plots_dir, logger)
         
+        # 1.5. Topographical maps of significant correlations  
+        plot_significant_correlations_topomap(pow_df, y, POWER_BANDS_TO_USE, info, subject, plots_dir, logger)
+        
         # 2. Behavioral response patterns
         plot_behavioral_response_patterns(y, aligned_events, subject, plots_dir, logger)
         
-        # 4. Behavioral predictor importance ranking
-        plot_behavioral_predictor_importance(pow_df, y, POWER_BANDS_TO_USE, subject, plots_dir, logger)
         
         # 5. Publication-quality EEG power spectrogram with behavior overlay
         plot_power_spectrogram_with_behavior(pow_df, y, POWER_BANDS_TO_USE, subject, plots_dir, logger)
@@ -3130,14 +3389,13 @@ def process_subject(
         # 6. Topographic correlation maps (removed - MNE compatibility issues)
         # plot_topographic_correlation_maps(pow_df, y, POWER_BANDS_TO_USE, subject, plots_dir, logger)
         
-        # 7. Neural state space analysis (PCA)
-        plot_neural_state_pca(pow_df, y, subject, plots_dir, logger)
         
         # 8. Band power summary
         plot_band_power_summary(pow_df, POWER_BANDS_TO_USE, subject, plots_dir, logger)
         
-        # 9. Statistical effect size summary (4 separate figures)
-        plot_statistical_effect_size_summary(pow_df, y, POWER_BANDS_TO_USE, subject, plots_dir, logger)
+        # 9. Neural-behavioral state space visualization
+        plot_neural_behavioral_state_space(subject, task, method='pca', n_components=2, rng=rng)
+        
         
     except Exception as e:
         logger.error(f"Advanced behavior visualization plots failed for sub-{subject}: {e}")
