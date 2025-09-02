@@ -46,6 +46,11 @@ MIN_BASELINE_SAMPLES = 5
 
 LOG_FILE_NAME = config.logging.file_names.feature_engineering  # Name of the log file for this script
 
+# Optional override for TFR spectrogram color limits (positive value)
+TFR_SPECTROGRAM_VLIM = config.get(
+    "analysis.feature_engineering.tfr_spectrogram_vlim", None
+)
+
 
 # -----------------------------------------------------------------------------
 # Helper functions (duplicated from 02_time_frequency_analysis with light tweaks)
@@ -53,6 +58,38 @@ LOG_FILE_NAME = config.logging.file_names.feature_engineering  # Name of the log
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+
+def _robust_sym_vlim(
+    arrs: "np.ndarray | list[np.ndarray]",
+    q_low: float = 0.02,
+    q_high: float = 0.98,
+    cap: float = 0.25,
+    min_v: float = 1e-6,
+) -> float:
+    """Compute robust symmetric vlim (positive scalar) centered at 0.
+
+    Concatenates arrays, removes non-finite values, takes ``[q_low, q_high]``
+    quantiles and returns the maximum absolute quantile capped by ``cap``. The
+    result can be used with ``vmin=-v`` and ``vmax=+v``.
+    """
+
+    try:
+        if isinstance(arrs, (list, tuple)):
+            flat = np.concatenate([np.asarray(a).ravel() for a in arrs if a is not None])
+        else:
+            flat = np.asarray(arrs).ravel()
+        flat = flat[np.isfinite(flat)]
+        if flat.size == 0:
+            return cap
+        lo = np.nanquantile(flat, q_low)
+        hi = np.nanquantile(flat, q_high)
+        v = float(max(abs(lo), abs(hi)))
+        if not np.isfinite(v) or v <= 0:
+            v = min_v
+        return float(min(v, cap))
+    except Exception:
+        return cap
 
 
 def _find_clean_epochs_path(subject: str, task: str) -> Optional[Path]:
@@ -510,7 +547,12 @@ def plot_tfr_spectrograms_roi(tfr, subject: str, save_dir: Path, logger: logging
         for i, ch in enumerate(available_channels):
             # Pick single channel and average across trials
             tfr_ch = tfr.copy().pick_channels([ch]).average()
-            
+
+            # Robust color limits centered at 0, with optional override
+            vabs = _robust_sym_vlim(tfr_ch.data)
+            if TFR_SPECTROGRAM_VLIM is not None:
+                vabs = float(TFR_SPECTROGRAM_VLIM)
+
             # Create spectrogram plot
             tfr_ch.plot(
                 picks=[0],
@@ -518,7 +560,8 @@ def plot_tfr_spectrograms_roi(tfr, subject: str, save_dir: Path, logger: logging
                 show=False,
                 colorbar=True,
                 title=f'{ch} - 10·log10(power/baseline) (dB)',
-                vlim=(-0.5, 0.5),
+                vmin=-vabs,
+                vmax=+vabs,
                 cmap='RdBu_r',
             )  # Symmetric around 0 for logratio
             
