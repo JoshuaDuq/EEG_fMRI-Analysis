@@ -6,9 +6,11 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Optional
 
-# Limit native BLAS thread pools to avoid oversubscription when using joblib/outer CV
-for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-    os.environ.setdefault(_var, "1")
+# Load configuration and apply thread limits early
+from config_loader import load_config
+
+config = load_config()
+config.apply_thread_limits()
 
 import numpy as np
 import pandas as pd
@@ -43,19 +45,6 @@ from joblib import Parallel, delayed
 # -----------------------------------------------------------------------------
 # Project config and helpers
 # -----------------------------------------------------------------------------
-try:
-    from eeg_pipeline.config import (
-        deriv_root as DERIV_ROOT,
-        subjects as SUBJECTS,
-        task as TASK,
-        random_state as RANDOM_STATE,
-    )
-except Exception:
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    DERIV_ROOT = PROJECT_ROOT / "eeg_pipeline" / "bids_output" / "derivatives"
-    SUBJECTS = ["001"]
-    TASK = "thermalactive"
-    RANDOM_STATE = 42
 
 # Reuse helpers from feature engineering if available; otherwise load via importlib
 _HAVE_FE_HELPERS = False
@@ -104,112 +93,11 @@ _BEST_PARAMS_LOGGED: set = set()
 
 
 # -----------------------------------------------------------------------------
-# Top-level configuration (centralized parameters, grids, and output paths)
+# Configuration (now loaded from external YAML file)
 # -----------------------------------------------------------------------------
-CONFIG = {
-    "paths": {
-        "results_subdir": "decoding",
-        "plots_subdir": "plots",
-        "indices": {
-            "elasticnet_loso": "elasticnet_loso_indices.tsv",
-            "elasticnet_within": "elasticnet_within_kfold_indices.tsv",
-            "rf_loso": "rf_loso_indices.tsv",
-            "rf_within": "rf_within_kfold_indices.tsv",
-            "riemann_loso": "riemann_loso_indices.tsv",
-            "riemann_band_template": "riemann_loso_indices_{label}.tsv",
-            "temperature_only": "temperature_only_loso_indices.tsv",
-            "baseline_global": "baseline_global_loso_indices.tsv",
-            "diagnostic_subject_test_mean": "diagnostic_subject_test_mean_loso_indices.tsv",
-        },
-        "best_params": {
-            "elasticnet_loso": "best_params_elasticnet.jsonl",
-            "elasticnet_within": "best_params_elasticnet_within.jsonl",
-            "rf_loso": "best_params_rf.jsonl",
-            "rf_within": "best_params_rf_within.jsonl",
-            "temperature_only": "best_params_temperature_only.jsonl",
-            "riemann_loso": "best_params_riemann.jsonl",
-            "riemann_band_template": "best_params_riemann_{label}.jsonl",
-        },
-        "predictions": {
-            "elasticnet_loso": "elasticnet_loso_predictions.tsv",
-            "elasticnet_within": "elasticnet_within_kfold_predictions.tsv",
-            "rf_loso": "rf_loso_predictions.tsv",
-            "rf_within": "rf_within_kfold_predictions.tsv",
-            "baseline_global": "baseline_global_loso_predictions.tsv",
-            "diagnostic_subject_test_mean": "diagnostic_subject_test_mean_loso_predictions.tsv",
-            "temperature_only": "temperature_only_loso_predictions.tsv",
-            "riemann_loso": "riemann_loso_predictions.tsv",
-            "riemann_band_template": "riemann_loso_predictions_{label}.tsv",
-        },
-        "per_subject_metrics": {
-            "elasticnet_loso": "elasticnet_per_subject_metrics.tsv",
-            "elasticnet_within": "elasticnet_within_kfold_per_subject_metrics.tsv",
-            "rf_loso": "rf_per_subject_metrics.tsv",
-            "rf_within": "rf_within_kfold_per_subject_metrics.tsv",
-            "baseline_global": "baseline_global_per_subject_metrics.tsv",
-            "diagnostic_subject_test_mean": "diagnostic_subject_test_per_subject_metrics.tsv",
-            "riemann_loso": "riemann_per_subject_metrics.tsv",
-            "temperature_only": "temperature_only_per_subject_metrics.tsv",
-        },
-        "summaries": {
-            "bootstrap": "summary_bootstrap.json",
-            "incremental": "summary_incremental.json",
-            "permutation_refit_null_rs": "permutation_refit_null_rs.txt",
-            "permutation_refit_summary": "permutation_refit_summary.json",
-            "summary": "summary.json",
-            "all_metrics_wide": "all_metrics_wide.tsv",
-            "riemann_bands": "summary_riemann_bands.json",
-            "riemann_sliding_window": "riemann_sliding_window.json",
-        },
-    },
-    "cv": {
-        "inner_splits": 5,
-    },
-    "models": {
-        "elasticnet": {
-            "max_iter": 200000,
-            "tol": 1e-3,
-            "selection": "random",
-            "grid": {
-                "alpha": [1e-3, 1e-2, 1e-1, 1, 10, 100],
-                "l1_ratio": [0.2, 0.5, 0.8],
-            },
-        },
-        "random_forest": {
-            "n_estimators": 500,
-            "estimator_n_jobs": -1,
-            "bootstrap": True,
-            "grid": {
-                "max_depth": [None, 8, 16, 32],
-                "max_features": ["sqrt", 0.2, 0.5, 1.0],
-                "min_samples_leaf": [1, 5, 10],
-            },
-        },
-        "temperature_only": {
-            "ridge_alpha_grid": [0.0, 1e-3, 1e-2, 1e-1, 1, 10],
-        },
-    },
-    "analysis": {
-        "n_perm_quick": 1000,
-        "n_perm_refit": 500,
-        "rf_perm_importance_repeats": 20,
-        "bootstrap_n": 1000,
-        "riemann": {
-            "plateau_window": (3.0, 10.5),
-            "bands": [(1.0, 4.0), (4.0, 8.0), (8.0, 13.0), (13.0, 30.0), (30.0, 45.0)],
-            "sliding_window": {"window_len": 0.75, "step": 0.25},
-        },
-    },
-    "flags": {
-        "run_within_subject_kfold": True,
-        "run_riemann": True,
-        "run_shap": True,
-    },
-    "viz": {
-        "montage": "standard_1005",  # can be a standard montage name, "bids_auto", or "bids:<path-to-electrodes.tsv>"
-        "coef_agg": "abs",           # one of: "abs" (mean |coef|) or "signed" (mean signed coef)
-    },
-}
+
+# Load externalized configuration
+CONFIG = config.to_legacy_dict()
 
 
 # -----------------------------------------------------------------------------
@@ -4493,7 +4381,7 @@ def run_riemann_sliding_window(
 def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -1, seed: int = RANDOM_STATE, outer_n_jobs: int = 1) -> None:
     deriv_root = Path(DERIV_ROOT)
     results_dir = deriv_root / CONFIG["paths"]["results_subdir"]
-    plots_dir = results_dir / CONFIG["paths"]["plots_subdir"]
+    plots_dir = results_dir / CONFIG["paths"]["plots_subdir"] / "05_decode_pain_experience"
     _ensure_dir(plots_dir)
 
     # Initialize per-run file logging under results_dir/logs
@@ -5509,42 +5397,17 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Decode subjective pain from EEG features with LOSO cross-validation.")
-    parser.add_argument("--subjects", nargs="*", default=None, help="Subject IDs (e.g., 001 002) or 'all'")
+    parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG feature correlations")
+    parser.add_argument("--subjects", nargs="*", default=None, help="Subject IDs to process (e.g., 001 002) or 'all' for all configured subjects")
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
-    parser.add_argument("--n_jobs", type=int, default=-1, help="Parallel jobs for inner CV (GridSearchCV)")
-    parser.add_argument("--outer_n_jobs", type=int, default=1, help="Parallel jobs for outer LOSO folds (processes)")
-    parser.add_argument("--seed", type=int, default=RANDOM_STATE, help="Random seed")
-    # Best-params JSONL handling
-    parser.add_argument("--best_params_mode", choices=["append", "truncate", "run_scoped"], default="truncate",
-                        help="How to handle best-params JSONL: append to existing, truncate on run start, or write to run-scoped file.")
-    parser.add_argument("--run_id", type=str, default=None, help="Optional run identifier used when best_params_mode=run_scoped.")
-    # Heavy computation controls
-    parser.add_argument("--n_perm_quick", type=int, default=int(CONFIG["analysis"]["n_perm_quick"]), help="Quick (no-refit) permutation draws")
-    parser.add_argument("--n_perm_refit", type=int, default=int(CONFIG["analysis"]["n_perm_refit"]), help="Refit-based permutation draws")
-    parser.add_argument("--perm_refit_n_jobs", type=int, default=1, help="Parallel jobs for refit-based permutation loop")
-    parser.add_argument("--rf_perm_repeats", type=int, default=int(CONFIG["analysis"]["rf_perm_importance_repeats"]), help="Repeats for RF permutation importance")
-    parser.add_argument("--bootstrap_n", type=int, default=int(CONFIG["analysis"]["bootstrap_n"]), help="Bootstrap resamples for pooled metrics")
-    parser.add_argument("--inner_splits", type=int, default=int(CONFIG["cv"]["inner_splits"]), help="Inner CV splits for nested LOSO/GridSearchCV")
-    # Feature toggles
-    parser.add_argument("--no-within", action="store_true", help="Disable within-subject KFold analyses")
-    parser.add_argument("--no-riemann", action="store_true", help="Disable Riemann analyses")
-    parser.add_argument("--no-shap", action="store_true", help="Disable SHAP analysis")
-    parser.add_argument("--montage", type=str, default=CONFIG["viz"]["montage"],
-                        help="Montage selection: standard montage name (e.g., 'standard_1020'), 'bids_auto', or 'bids:<path-to-electrodes.tsv>'")
-    parser.add_argument("--coef_agg", choices=["abs", "signed"], default=CONFIG["viz"]["coef_agg"],
-                        help="Aggregation for ElasticNet coefficient topomaps: 'abs' (mean |coef|) or 'signed' (mean signed coef)")
-
     args = parser.parse_args()
 
     # seeds
-    RANDOM_STATE = int(args.seed)
     np.random.seed(RANDOM_STATE)
     pyrandom.seed(RANDOM_STATE)
 
     # Apply CLI configs
-    BEST_PARAMS_MODE = args.best_params_mode
-    RUN_ID = args.run_id
+    RUN_ID = None
     CONFIG["analysis"]["n_perm_quick"] = int(args.n_perm_quick)
     CONFIG["analysis"]["n_perm_refit"] = int(args.n_perm_refit)
     CONFIG["analysis"]["rf_perm_importance_repeats"] = int(args.rf_perm_repeats)
