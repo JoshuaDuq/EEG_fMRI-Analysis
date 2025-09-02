@@ -1,0 +1,369 @@
+# EEG Pipeline Configuration
+# Centralized configuration for the entire EEG analysis pipeline
+# Edit this file to modify parameters without changing source code
+
+# Core project settings
+project:
+  root: "."  # Project root directory (will be resolved to absolute path)
+  task: "thermalactive"
+  subjects: ["0000"]  # List of subject IDs to process by default
+  bids_root: "eeg_pipeline/bids_output"
+  source_root: "eeg_pipeline/source_data"
+  
+# Paths (relative to project root)
+paths:
+  project_root: "."  # Will be resolved dynamically
+  bids_root: "eeg_pipeline/bids_output"
+  deriv_root: "eeg_pipeline/bids_output/derivatives"
+  source_data: "eeg_pipeline/source_data"
+  
+# Frequency bands for analysis
+frequency_bands:
+  theta: [4.0, 7.9]    # 4.0 to 8.0-0.1
+  alpha: [8.0, 12.9]   # 8.0 to 13.0-0.1  
+  beta: [13.0, 30.0]
+  gamma: [30.1, 80.0]  # 30.0+0.1 to 80.0
+  
+# Power analysis settings
+power:
+  bands_to_use: ["theta", "alpha", "beta", "gamma"]  # Subset of frequency_bands for power features
+  plateau_window: [0.0, 10.0]  # Time window for plateau analysis (seconds)
+  baseline_window: [-5.0, 0.0]  # Baseline window (seconds)
+  
+# Event column mappings for behavioral data
+event_columns:
+  temperature: ["stimulus_temp", "stimulus_temperature", "temp", "temperature"]
+  rating: ["vas_final_coded_rating", "vas_final_rating", "vas_rating", "pain_intensity", "pain_rating", "rating"]
+  pain_binary: ["pain_binary_coded", "pain_binary", "pain"]
+  
+# Time-frequency analysis settings  
+tfr:
+  custom_freqs: [1, 101, 1]  # [start, stop, step] for np.arange
+  n_cycles_factor: 3.0  # Divide frequencies by this for n_cycles
+  decim: 4
+  crop_time: false
+  return_itc: false
+  interpolate_bads: true
+  average_epochs: false
+  return_average: false
+
+# Preprocessing pipeline settings
+preprocessing:
+  # General
+  n_jobs: -1
+  task_is_rest: false
+  ch_types: ["eeg"]
+  eog_channels: ["Fp1", "Fp2"]
+  eeg_reference: "average"
+  eeg_template_montage: "easycap-M1"
+  random_state: 42
+  
+  # Filtering
+  l_freq: 1.0
+  h_freq: 100
+  zapline_fline: 60.0
+  notch_freq: null  # Set to 60.0 to enable notch filtering
+  
+  # Resampling
+  raw_resample_sfreq: 500
+  
+  # Epoching
+  conditions: ["Stim_on/S  1"]
+  epochs_tmin: -5
+  epochs_tmax: 10
+  baseline: null  # null means no baseline correction
+  find_breaks: false
+  
+  # Artifact rejection
+  spatial_filter: "ica"
+  ica_reject:
+    eeg: 500e-6
+  ica_algorithm: "extended_infomax"
+  ica_l_freq: 1.0
+  reject: "autoreject_local"
+  
+  # PyPrep bad channel detection
+  pyprep:
+    enabled: true
+    ransac: false
+    repeats: 3
+    average_reref: false
+    file_extension: ".vhdr"
+    l_pass: 100
+    notch: 60.0
+    delete_breaks: false
+    breaks_min_length: 20
+    t_start_after_previous: 10
+    t_stop_before_next: 2
+    consider_previous_bads: false
+    rename_anot_dict: null
+    overwrite_chans_tsv: true
+    n_jobs: -1
+    
+  # ICALabel
+  icalabel:
+    enabled: true
+    prob_threshold: 0.7
+    labels_to_keep: ["brain", "other"]
+    n_jobs: -1
+
+# Feature extraction settings
+features:
+  enabled: true
+  freq_res: 0.1  # Hz
+  psd_freqmax: 100
+  psd_freqmin: 1
+  somato_chans: ["C3", "C4", "Cz"]
+  compute_sourcespace_features: true
+  n_jobs: -1
+  
+  # Source space
+  sourcecoords_file: "eeg_pipeline/source_data/Schaefer2018/Schaefer2018_100Parcels_7Networks_order_FSLMNI152_2mm.Centroid_RAS.csv"
+
+# Machine learning / decoding settings
+decoding:
+  # Cross-validation
+  cv:
+    inner_splits: 5
+    
+  # Model configurations
+  models:
+    elasticnet:
+      max_iter: 200000
+      tol: 1e-3
+      selection: "random"
+      grid:
+        alpha: [1e-3, 1e-2, 1e-1, 1, 10, 100]
+        l1_ratio: [0.2, 0.5, 0.8]
+        
+    random_forest:
+      n_estimators: 500
+      estimator_n_jobs: -1  # Set to 1 to avoid nested parallelism
+      bootstrap: true
+      grid:
+        max_depth: [null, 8, 16, 32]
+        max_features: ["sqrt", 0.2, 0.5, 1.0]
+        min_samples_leaf: [1, 5, 10]
+        
+    temperature_only:
+      ridge_alpha_grid: [0.0, 1e-3, 1e-2, 1e-1, 1, 10]
+      
+  # Analysis parameters
+  analysis:
+    n_perm_quick: 1000
+    n_perm_refit: 500
+    rf_perm_importance_repeats: 20
+    bootstrap_n: 1000
+    
+    # Riemannian geometry settings
+    riemann:
+      plateau_window: [0.0, 10.0]
+      bands: [[1.0, 4.0], [4.0, 8.0], [8.0, 13.0], [13.0, 30.0], [30.0, 45.0]]
+      sliding_window:
+        window_len: 0.75
+        step: 0.25
+        
+  # Feature flags
+  flags:
+    run_within_subject_kfold: true
+    run_riemann: true
+    run_shap: true
+    
+  # Output file naming patterns
+  paths:
+    results_subdir: "decoding"
+    plots_subdir: "plots"
+    indices:
+      elasticnet_loso: "elasticnet_loso_indices.tsv"
+      elasticnet_within: "elasticnet_within_kfold_indices.tsv"
+      rf_loso: "rf_loso_indices.tsv"
+      rf_within: "rf_within_kfold_indices.tsv"
+      riemann_loso: "riemann_loso_indices.tsv"
+      riemann_band_template: "riemann_loso_indices_{label}.tsv"
+      temperature_only: "temperature_only_loso_indices.tsv"
+      baseline_global: "baseline_global_loso_indices.tsv"
+      diagnostic_subject_test_mean: "diagnostic_subject_test_mean_loso_indices.tsv"
+    best_params:
+      elasticnet_loso: "best_params_elasticnet.jsonl"
+      elasticnet_within: "best_params_elasticnet_within.jsonl"
+      rf_loso: "best_params_rf.jsonl"
+      rf_within: "best_params_rf_within.jsonl"
+      temperature_only: "best_params_temperature_only.jsonl"
+      riemann_loso: "best_params_riemann.jsonl"
+      riemann_band_template: "best_params_riemann_{label}.jsonl"
+    predictions:
+      elasticnet_loso: "elasticnet_loso_predictions.tsv"
+      elasticnet_within: "elasticnet_within_kfold_predictions.tsv"
+      rf_loso: "rf_loso_predictions.tsv"
+      rf_within: "rf_within_kfold_predictions.tsv"
+      baseline_global: "baseline_global_loso_predictions.tsv"
+      diagnostic_subject_test_mean: "diagnostic_subject_test_mean_loso_predictions.tsv"
+      temperature_only: "temperature_only_loso_predictions.tsv"
+      riemann_loso: "riemann_loso_predictions.tsv"
+      riemann_band_template: "riemann_loso_predictions_{label}.tsv"
+    per_subject_metrics:
+      elasticnet_loso: "elasticnet_per_subject_metrics.tsv"
+      elasticnet_within: "elasticnet_within_kfold_per_subject_metrics.tsv"
+      rf_loso: "rf_per_subject_metrics.tsv"
+      rf_within: "rf_within_kfold_per_subject_metrics.tsv"
+      baseline_global: "baseline_global_per_subject_metrics.tsv"
+      diagnostic_subject_test_mean: "diagnostic_subject_test_per_subject_metrics.tsv"
+      riemann_loso: "riemann_per_subject_metrics.tsv"
+      temperature_only: "temperature_only_per_subject_metrics.tsv"
+    summaries:
+      bootstrap: "summary_bootstrap.json"
+      incremental: "summary_incremental.json"
+      permutation_refit_null_rs: "permutation_refit_null_rs.txt"
+      permutation_refit_summary: "permutation_refit_summary.json"
+      summary: "summary.json"
+      all_metrics_wide: "all_metrics_wide.tsv"
+      riemann_bands: "summary_riemann_bands.json"
+      riemann_sliding_window: "riemann_sliding_window.json"
+
+# Visualization settings
+visualization:
+  # Figure settings
+  dpi: 300
+  save_formats: ["png"]
+  # Save parameters
+  pad_inches: 0.02
+  bbox_inches: "tight"
+  
+  # Plot styling
+  montage: "standard_1005"  # EEG montage for topoplots
+  coef_agg: "abs"
+  band_colors:
+    theta: "#4C72B0"
+    alpha: "#1f77b4"
+    beta: "#ff7f0e"
+    gamma: "#d62728"
+  
+  # Advanced plotting parameters for specialized functions
+  advanced:
+    # TFR spectrogram plotting defaults
+    tfr_spectro:
+      fontsize: 8
+      dpi: 1200
+      extension: "svg"
+      bbox_inches: "tight"
+      transparent: true
+      default_figsize: [2, 1]
+    
+    # TFR topomap plotting defaults  
+    tfr_topomap:
+      fontsize: 10
+      dpi: 800
+      extension: "png"
+      bbox_inches: "tight"
+      transparent: true
+      default_figsize: [1.5, 1.5]
+    
+    # General plotting figure sizes
+    connectivity_matrix_figsize: [20, 20]
+    alpha_peak_figsize: [10, 5]
+    scatter_plot_figsize: [6, 6]
+    coef_topomap_figsize: [4.2, 4.0]
+    paired_metric_figsize: [10, 4]
+    histogram_figsize: [6, 4]
+    bar_plot_figsize: [8, 5]
+    subject_id_decode_figsize: [3, 4]
+    correlation_matrix_figsize: [5, 5]
+    ranking_heatmap_figsize: [10, 6]
+    shap_summary_figsize: [8, 6]
+    shap_dependence_figsize: [6, 4]
+    behavior_scatter_figsize: [4.5, 3.5]
+    roi_scatter_figsize: [6, 3.2]
+
+# Statistics and correlation settings
+statistics:
+  use_spearman_default: true
+  partial_covars_default: null
+  n_perm_default: 0
+  do_group_default: false
+  group_only_default: false
+  build_reports_default: true
+
+# Random seed and reproducibility settings
+random:
+  seed: 42  # Global random seed for reproducibility
+  bootstrap_default: 0
+
+# Logging configuration
+logging:
+  type: "file"  # "file" or "console"
+  level: "INFO"
+  file_names:
+    foundational: "01_foundational_analysis.log"
+    time_frequency: "02_time_frequency_analysis.log"
+    feature_engineering: "03_feature_engineering.log"
+    behavior_analysis: "04_behavior_feature_analysis.log"
+    decoding: "05_decode_pain_experience.log"
+
+# Analysis-specific settings
+analysis:
+  # ERP analysis settings
+  erp:
+    picks: "eeg"  # Channel types for ERP averaging
+    combine: "gfp"  # Method to combine channels ("gfp" or null for butterfly)
+    include_tmax_in_crop: false
+    default_crop_tmin: null
+    default_crop_tmax: null
+    pain_color: "crimson"
+    nonpain_color: "navy"
+    plots_subdir: "01_foundational_analysis"
+    counts_file_name: "counts_pain.tsv"
+    output_files:
+      pain_gfp: "erp_pain_binary_gfp.png"
+      pain_butterfly: "erp_pain_binary_butterfly.png"
+      temp_gfp: "erp_by_temperature_gfp.png"
+      temp_butterfly: "erp_by_temperature_butterfly.png"
+      temp_butterfly_template: "erp_by_temperature_butterfly_{label}.png"
+    
+  # Time-frequency analysis
+  time_frequency:
+    default_temperature_strategy: "pooled"  # "pooled", "per", "both"
+    baseline_window: [-5.0, 0.0]  # TFR baseline window
+    default_plateau_tmin: 0.0
+    default_plateau_tmax: 10.0
+    # TFR computation
+    freq_min: 4.0
+    freq_max: 100.0
+    n_freqs: 40
+    n_cycles_factor: 0.5  # n_cycles = freqs * factor
+    tfr_decim: 2
+    tfr_picks: "eeg"
+    # Band bounds
+    band_bounds:
+      alpha: [8.0, 13.0]
+      beta: [13.0, 30.0]
+      gamma: [30.0, null]  # null means capped at data max freq
+    # Topomap styling
+    topo_contours: 6
+    topo_cmap: "RdBu_r"
+    colorbar_fraction: 0.03
+    colorbar_pad: 0.02
+    roi_mask_params:
+      marker: 'o'
+      markerfacecolor: 'w'
+      markeredgecolor: 'k'
+      linewidth: 0.5
+      markersize: 4
+    # Default CLI parameters
+    n_perm_default: 0
+    do_group_default: false
+    group_only_default: false
+    build_reports_default: false
+    
+  # Raw-to-BIDS conversion
+  raw_to_bids:
+    default_montage: "easycap-M1"
+    default_line_freq: 60.0
+
+# Environment settings
+environment:
+  # Thread limits to avoid oversubscription
+  thread_limits:
+    OMP_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1" 
+    OPENBLAS_NUM_THREADS: "1"
+    NUMEXPR_NUM_THREADS: "1"
