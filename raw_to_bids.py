@@ -20,26 +20,14 @@ if hasattr(sys.stderr, "reconfigure"):
 # Load centralized configuration
 from config_loader import load_config, get_legacy_constants
 
-try:
-    config = load_config()
-    _constants = get_legacy_constants(config)
-    
-    PROJECT_ROOT = _constants["PROJECT_ROOT"]
-    BIDS_ROOT = _constants["BIDS_ROOT"]
-    TASK = _constants["TASK"]
-    MONTAGE_NAME = _constants["DEFAULT_MONTAGE"]
-    LINE_FREQ = _constants["DEFAULT_LINE_FREQ"]
-    
-except ImportError as e:
-    # Fallback to hardcoded values
-    import warnings
-    warnings.warn(f"Failed to load externalized config ({e}), using fallback values", UserWarning)
-    
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    BIDS_ROOT = PROJECT_ROOT / "eeg_pipeline" / "bids_output"
-    TASK = "thermalactive"
-    MONTAGE_NAME = "easycap-M1"
-    LINE_FREQ = 60.0
+config = load_config()
+_constants = get_legacy_constants(config)
+
+PROJECT_ROOT = _constants["PROJECT_ROOT"]
+BIDS_ROOT = _constants["BIDS_ROOT"]
+TASK = _constants["TASK"]
+MONTAGE_NAME = _constants["DEFAULT_MONTAGE"]
+LINE_FREQ = _constants["DEFAULT_LINE_FREQ"]
 
 
 def find_brainvision_vhdrs(source_root: Path) -> List[Path]:

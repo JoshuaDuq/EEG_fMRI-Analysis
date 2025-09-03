@@ -11,11 +11,7 @@ from typing import Any, Dict, Optional, Union
 import logging
 
 import numpy as np
-
-try:
-    import yaml
-except ImportError:
-    yaml = None
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -88,21 +84,16 @@ class EEGConfig:
         
     def load(self) -> None:
         """Load configuration from YAML file."""
-        if yaml is None:
-            raise ConfigError(
-                "PyYAML not installed. Install with: pip install pyyaml"
-            )
-            
         if not self.config_path.exists():
             raise ConfigError(f"Configuration file not found: {self.config_path}")
-            
+
         try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
+            with open(self.config_path, "r", encoding="utf-8") as f:
                 self._data = yaml.safe_load(f) or {}
         except yaml.YAMLError as e:
-            raise ConfigError(f"Failed to parse YAML config: {e}")
-        except Exception as e:
-            raise ConfigError(f"Failed to load config file: {e}")
+            raise ConfigError(f"Failed to parse YAML config: {e}") from e
+        except OSError as e:
+            raise ConfigError(f"Failed to load config file: {e}") from e
             
         # Resolve project root and update paths
         self._resolve_paths()

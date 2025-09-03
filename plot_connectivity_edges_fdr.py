@@ -14,29 +14,18 @@ from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 from nilearn import plotting as niplot
 
-
 # Load centralized configuration
 from config_loader import load_config
 
-try:
-    config = load_config()
-    PROJECT_ROOT = config.project_root
-    SCHEAFER_CENTROIDS = (
-        PROJECT_ROOT
-        / "eeg_pipeline"
-        / "source_data"
-        / "Schaefer2018"
-        / "Schaefer2018_100Parcels_7Networks_order_FSLMNI152_2mm.Centroid_RAS.csv"
-    )
-except ImportError:
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    SCHEAFER_CENTROIDS = (
-        PROJECT_ROOT
-        / "eeg_pipeline"
-        / "source_data"
-        / "Schaefer2018"
-        / "Schaefer2018_100Parcels_7Networks_order_FSLMNI152_2mm.Centroid_RAS.csv"
-    )
+config = load_config()
+PROJECT_ROOT = config.project_root
+SCHEAFER_CENTROIDS = (
+    PROJECT_ROOT
+    / "eeg_pipeline"
+    / "source_data"
+    / "Schaefer2018"
+    / "Schaefer2018_100Parcels_7Networks_order_FSLMNI152_2mm.Centroid_RAS.csv"
+)
 
 NETWORK_COLORS: Dict[str, str] = {
     "Vis": "#1f77b4",         # blue
