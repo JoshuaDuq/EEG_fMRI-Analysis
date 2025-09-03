@@ -349,6 +349,18 @@ analysis:
       markeredgecolor: 'k'
       linewidth: 0.5
       markersize: 4
+    # Sensor-space ROI definitions and baseline requirements
+    min_baseline_samples: 5  # Minimum samples required in baseline window
+    rois:
+      Frontal: ["^(Fpz|Fp[12]|AFz|AF[3-8]|Fz|F[1-8])$"]
+      Central: ["^(Cz|C[1-6])$"]
+      Parietal: ["^(Pz|P[1-8])$"]
+      Occipital: ["^(Oz|O[12]|POz|PO[3-8])$"]
+      Temporal: ["^(T7|T8|TP7|TP8|FT7|FT8)$"]
+      Sensorimotor:
+        - "^(FC[234]|FCz)$"
+        - "^(C[234]|Cz)$"
+        - "^(CP[234]|CPz)$"
     # Default CLI parameters
     n_perm_default: 0
     do_group_default: false
@@ -359,6 +371,11 @@ analysis:
   raw_to_bids:
     default_montage: "easycap-M1"
     default_line_freq: 60.0
+
+  # Feature engineering analysis settings
+  feature_engineering:
+    min_baseline_samples: 5  # Minimum samples required in baseline window
+    tfr_spectrogram_vlim: null  # Optional override for TFR spectrogram limits
 
   # Behavior analysis settings (04_behavior_feature_analysis.py)
   behavior_analysis:

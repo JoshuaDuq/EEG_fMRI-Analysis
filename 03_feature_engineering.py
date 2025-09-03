@@ -42,7 +42,7 @@ PLATEAU_END = _constants["PLATEAU_END"]
 TARGET_COLUMNS = _constants["TARGET_COLUMNS"]
 
 # Minimum number of samples required in the baseline window
-MIN_BASELINE_SAMPLES = 5
+MIN_BASELINE_SAMPLES = config.analysis.feature_engineering.min_baseline_samples
 # Baseline window for TFR computations (start, end) in seconds
 TFR_BASELINE = tuple(config.analysis.time_frequency.baseline_window)
 
