@@ -453,7 +453,7 @@ def _average_tfr_band(
         freqs = np.asarray(tfr_avg.freqs)
         times = np.asarray(tfr_avg.times)
         f_mask = (freqs >= fmin) & (freqs <= fmax)
-        t_mask = (times >= tmin) & (times <= tmax)
+        t_mask = (times >= tmin) & (times < tmax)
         if f_mask.sum() == 0 or t_mask.sum() == 0:
             return None
         # data shape: (n_channels, n_freqs, n_times)
@@ -487,8 +487,7 @@ def _plot_topomap_on_ax(
             sensors=True,
             contours=TOPO_CONTOURS,
             cmap=TOPO_CMAP,
-            vmin=vmin,
-            vmax=vmax,
+            vlim=(vmin, vmax) if vmin is not None and vmax is not None else None,
         )
     except Exception:
         # Fallback: pick EEG channels explicitly
@@ -504,8 +503,7 @@ def _plot_topomap_on_ax(
             sensors=True,
             contours=TOPO_CONTOURS,
             cmap=TOPO_CMAP,
-            vmin=vmin,
-            vmax=vmax,
+            vlim=(vmin, vmax) if vmin is not None and vmax is not None else None,
         )
 
 
@@ -592,12 +590,12 @@ def plot_cz_all_trials(
         # Plateau mean annotation
         times = np.asarray(tfr_avg.times)
         tmin_req, tmax_req = plateau_window
-        tmask = (times >= float(tmin_req)) & (times <= float(tmax_req))
+        tmask = (times >= float(tmin_req)) & (times < float(tmax_req))
         if not np.any(tmask):
             tmask = np.ones_like(times, dtype=bool)
         mu = float(np.nanmean(arr[:, tmask]))
-        pct = (10.0 ** (mu / 10.0) - 1.0) * 100.0
-        fig = tfr_avg.plot(picks=cz, vmin=-vabs, vmax=+vabs, show=False)
+        pct = (10.0 ** (mu) - 1.0) * 100.0
+        fig = tfr_avg.plot(picks=cz, vlim=(-vabs, +vabs), show=False)
         try:
             fig.suptitle(
                 f"Cz TFR — all trials (baseline logratio)\nvlim ±{vabs:.2f}; \u03bc_plateau={mu:.3f} ({pct:+.0f}%)",
@@ -655,7 +653,7 @@ def qc_baseline_plateau_power(
                 print(msg)
             return
 
-        tmask_plat = (times >= plateau_window[0]) & (times <= plateau_window[1])
+        tmask_plat = (times >= plateau_window[0]) & (times < plateau_window[1])
 
         if not np.any(tmask_plat):
             msg = f"QC skipped: plateau samples={int(tmask_plat.sum())}"
@@ -895,14 +893,14 @@ def contrast_pain_nonpain(
         # Plateau mean annotations
         times = np.asarray(tfr_pain.times)
         tmin_req, tmax_req = plateau_window
-        tmask = (times >= float(tmin_req)) & (times <= float(tmax_req))
+        tmask = (times >= float(tmin_req)) & (times < float(tmax_req))
         if not np.any(tmask):
             tmask = np.ones_like(times, dtype=bool)
         mu_pain = float(np.nanmean(arr_pain[:, tmask]))
-        pct_pain = (10.0 ** (mu_pain / 10.0) - 1.0) * 100.0
+        pct_pain = (10.0 ** (mu_pain) - 1.0) * 100.0
         mu_non = float(np.nanmean(arr_non[:, tmask]))
-        pct_non = (10.0 ** (mu_non / 10.0) - 1.0) * 100.0
-        fig = tfr_pain.plot(picks=cz, vmin=-vabs_pn, vmax=+vabs_pn, show=False)
+        pct_non = (10.0 ** (mu_non) - 1.0) * 100.0
+        fig = tfr_pain.plot(picks=cz, vlim=(-vabs_pn, +vabs_pn), show=False)
         try:
             fig.suptitle(
                 f"Cz — Pain (baseline logratio)\nvlim ±{vabs_pn:.2f}; \u03bc_plateau={mu_pain:.3f} ({pct_pain:+.0f}%)",
@@ -918,7 +916,7 @@ def contrast_pain_nonpain(
         else:
             print(msg)
     try:
-        fig = tfr_non.plot(picks=cz, vmin=-vabs_pn, vmax=+vabs_pn, show=False)
+        fig = tfr_non.plot(picks=cz, vlim=(-vabs_pn, +vabs_pn), show=False)
         try:
             fig.suptitle(
                 f"Cz — Non-pain (baseline logratio)\nvlim ±{vabs_pn:.2f}; \u03bc_plateau={mu_non:.3f} ({pct_non:+.0f}%)",
@@ -943,8 +941,8 @@ def contrast_pain_nonpain(
         arr_diff = np.asarray(arr_pain) - np.asarray(arr_non)
         vabs_diff = _robust_sym_vlim(arr_diff)
         mu_diff = float(np.nanmean(arr_diff[:, tmask]))
-        pct_diff = (10.0 ** (mu_diff / 10.0) - 1.0) * 100.0
-        fig = tfr_diff.plot(picks=cz, vmin=-vabs_diff, vmax=+vabs_diff, show=False)
+        pct_diff = (10.0 ** (mu_diff) - 1.0) * 100.0
+        fig = tfr_diff.plot(picks=cz, vlim=(-vabs_diff, +vabs_diff), show=False)
         try:
             fig.suptitle(
                 f"Cz — Pain minus Non (baseline logratio)\nvlim ±{vabs_diff:.2f}; \u0394\u03bc_plateau={mu_diff:.3f} ({pct_diff:+.0f}%)",
@@ -1017,14 +1015,13 @@ def contrast_pain_nonpain(
                 tfr_pain.info,
                 axes=ax,
                 show=False,
-                vmin=-vabs_pn,
-                vmax=+vabs_pn,
+                vlim=(-vabs_pn, +vabs_pn),
                 cmap=TOPO_CMAP,
             )
         except Exception:
             _plot_topomap_on_ax(ax, pain_data, tfr_pain.info, vmin=-vabs_pn, vmax=+vabs_pn)
         # Annotate mean value
-        ax.text(0.5, 1.02, f"\u03bc={pain_mu:.3f} ({(10**(pain_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"\u03bc={pain_mu:.3f} ({(10**pain_mu - 1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
         # Non-pain
         ax = axes[r, 1]
         try:
@@ -1033,14 +1030,13 @@ def contrast_pain_nonpain(
                 tfr_pain.info,
                 axes=ax,
                 show=False,
-                vmin=-vabs_pn,
-                vmax=+vabs_pn,
+                vlim=(-vabs_pn, +vabs_pn),
                 cmap=TOPO_CMAP,
             )
         except Exception:
             _plot_topomap_on_ax(ax, non_data, tfr_pain.info, vmin=-vabs_pn, vmax=+vabs_pn)
         # Annotate mean value
-        ax.text(0.5, 1.02, f"\u03bc={non_mu:.3f} ({(10**(non_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"\u03bc={non_mu:.3f} ({(10**non_mu - 1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
         # Spacer column (col 2)
         axes[r, 2].axis('off')
         # Diff
@@ -1051,8 +1047,7 @@ def contrast_pain_nonpain(
                 tfr_pain.info,
                 axes=ax,
                 show=False,
-                vmin=(-diff_abs if diff_abs > 0 else None),
-                vmax=(+diff_abs if diff_abs > 0 else None),
+                vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else None),
                 cmap=TOPO_CMAP,
             )
         except Exception:
@@ -1064,7 +1059,7 @@ def contrast_pain_nonpain(
                 vmax=(+diff_abs if diff_abs > 0 else None),
             )
         # Annotate mean difference value
-        pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
+        pct_mu = (10**(diff_mu) - 1.0) * 100.0
         ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
         if r == 0:
             for c_title in (0, 1, 3):
@@ -1078,7 +1073,7 @@ def contrast_pain_nonpain(
                 sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
             )
             try:
-                cbar_pn.set_label("10·log10(power/baseline) (dB)")
+                cbar_pn.set_label("log10(power/baseline)")
             except Exception:
                 pass
             if diff_abs > 0:
@@ -1088,7 +1083,7 @@ def contrast_pain_nonpain(
                     sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
                 )
                 try:
-                    cbar_diff.set_label("10·log10(power/baseline) (dB)")
+                    cbar_diff.set_label("log10(power/baseline)")
                 except Exception:
                     pass
         except Exception:
@@ -1109,7 +1104,7 @@ def contrast_maxmin_temperature(
     baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
     plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
 ) -> None:
-    """Topomap grid comparing highest vs lowest temperature (Δ=10·log10(power/baseline) (dB)).
+    """Topomap grid comparing highest vs lowest temperature (Δ=log10(power/baseline)).
 
     Layout mirrors pain/non-pain grid: [Max temp, Min temp, spacer, Max - Min] across alpha/beta/gamma.
     """
@@ -1233,13 +1228,12 @@ def contrast_maxmin_temperature(
                 tfr_max.info,
                 axes=ax,
                 show=False,
-                vmin=-vabs_pn,
-                vmax=+vabs_pn,
+                vlim=(-vabs_pn, +vabs_pn),
                 cmap=TOPO_CMAP,
             )
         except Exception:
             _plot_topomap_on_ax(ax, max_data, tfr_max.info, vmin=-vabs_pn, vmax=+vabs_pn)
-        ax.text(0.5, 1.02, f"\u03bc={max_mu:.3f} ({(10**(max_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"\u03bc={max_mu:.3f} ({(10**max_mu - 1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         # Min temp (col 1)
         ax = axes[r, 1]
@@ -1249,13 +1243,12 @@ def contrast_maxmin_temperature(
                 tfr_min.info,
                 axes=ax,
                 show=False,
-                vmin=-vabs_pn,
-                vmax=+vabs_pn,
+                vlim=(-vabs_pn, +vabs_pn),
                 cmap=TOPO_CMAP,
             )
         except Exception:
             _plot_topomap_on_ax(ax, min_data, tfr_min.info, vmin=-vabs_pn, vmax=+vabs_pn)
-        ax.text(0.5, 1.02, f"\u03bc={min_mu:.3f} ({(10**(min_mu/10)-1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"\u03bc={min_mu:.3f} ({(10**min_mu - 1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         # Spacer (col 2)
         axes[r, 2].axis("off")
@@ -1268,8 +1261,7 @@ def contrast_maxmin_temperature(
                 tfr_max.info,
                 axes=ax,
                 show=False,
-                vmin=(-diff_abs if diff_abs > 0 else None),
-                vmax=(+diff_abs if diff_abs > 0 else None),
+                vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else None),
                 cmap=TOPO_CMAP,
             )
         except Exception:
@@ -1280,7 +1272,7 @@ def contrast_maxmin_temperature(
                 vmin=(-diff_abs if diff_abs > 0 else None),
                 vmax=(+diff_abs if diff_abs > 0 else None),
             )
-        pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
+        pct_mu = (10**(diff_mu) - 1.0) * 100.0
         ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         if r == 0:
@@ -1291,13 +1283,13 @@ def contrast_maxmin_temperature(
 
         # Colorbars per row
         try:
-            sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=TOPO_CMAP)
+            sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs_pn, vmax=+vabs_pn), cmap=TOPO_CMAP)
             sm_pn.set_array([])
             cbar_pn = fig.colorbar(
                 sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
             )
             try:
-                cbar_pn.set_label("10·log10(power/baseline) (dB)")
+                cbar_pn.set_label("log10(power/baseline)")
             except Exception:
                 pass
             if diff_abs > 0:
@@ -1307,7 +1299,7 @@ def contrast_maxmin_temperature(
                     sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
                 )
                 try:
-                    cbar_diff.set_label("10·log10(power/baseline) (dB)")
+                    cbar_diff.set_label("log10(power/baseline)")
                 except Exception:
                     pass
         except Exception:
@@ -1443,8 +1435,7 @@ def contrast_pain_nonpain_topomaps_rois(
                     tfr_pain.info,
                     axes=ax,
                     show=False,
-                    vmin=vmin,
-                    vmax=vmax,
+                    vlim=(vmin, vmax) if vmin is not None and vmax is not None else None,
                     mask=mask_vec,
                     mask_params=mask_params,
                     cmap=TOPO_CMAP,
@@ -1469,8 +1460,7 @@ def contrast_pain_nonpain_topomaps_rois(
                     tfr_pain.info,
                     axes=ax,
                     show=False,
-                    vmin=vmin,
-                    vmax=vmax,
+                    vlim=(vmin, vmax) if vmin is not None and vmax is not None else None,
                     mask=mask_vec,
                     mask_params=mask_params,
                     cmap=TOPO_CMAP,
@@ -1497,8 +1487,7 @@ def contrast_pain_nonpain_topomaps_rois(
                     tfr_pain.info,
                     axes=ax,
                     show=False,
-                    vmin=(-diff_abs if diff_abs > 0 else None),
-                    vmax=(+diff_abs if diff_abs > 0 else None),
+                    vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else None),
                     mask=mask_vec,
                     mask_params=mask_params,
                     cmap=TOPO_CMAP,
@@ -1514,7 +1503,7 @@ def contrast_pain_nonpain_topomaps_rois(
                     vmax=(+diff_abs if diff_abs > 0 else None),
                 )
             # Annotate ROI-mean difference
-            pct_mu = (10**(diff_mu/10) - 1.0) * 100.0
+            pct_mu = (10**(diff_mu) - 1.0) * 100.0
             ax.text(0.5, 1.02, f"\u0394\u03bc_ROI={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=8)
             if r == 0:
                 for c_title in (0, 1, 3):
@@ -1522,13 +1511,13 @@ def contrast_pain_nonpain_topomaps_rois(
             axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
             # Add compact colorbars per row
             try:
-                sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=TOPO_CMAP)
+                sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs_pn, vmax=+vabs_pn), cmap=TOPO_CMAP)
                 sm_pn.set_array([])
                 cbar_pn = fig.colorbar(
                     sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
                 )
                 try:
-                    cbar_pn.set_label("10·log10(power/baseline) (dB)")
+                    cbar_pn.set_label("log10(power/baseline)")
                 except Exception:
                     pass
                 if diff_abs > 0:
@@ -1538,7 +1527,7 @@ def contrast_pain_nonpain_topomaps_rois(
                         sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
                     )
                     try:
-                        cbar_diff.set_label("10·log10(power/baseline) (dB)")
+                        cbar_diff.set_label("log10(power/baseline)")
                     except Exception:
                         pass
             except Exception:
@@ -1716,8 +1705,7 @@ def plot_topomaps_rois_all_trials(
                 tfr_avg.info,
                 axes=axes[r, 0],
                 show=False,
-                vmin=vmin,
-                vmax=vmax,
+                vlim=(vmin, vmax),
                 cmap=TOPO_CMAP,
             )
         except Exception:
@@ -1728,7 +1716,7 @@ def plot_topomaps_rois_all_trials(
             sm.set_array([])
             cbar = fig.colorbar(sm, ax=axes[r, 0], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
             try:
-                cbar.set_label("10·log10(power/baseline) (dB)")
+                cbar.set_label("log10(power/baseline)")
             except Exception:
                 pass
         except Exception:
@@ -1749,7 +1737,7 @@ def plot_topomap_grid_baseline_temps(
     baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
     plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
 ) -> None:
-    """Topomap grid of Δ=10·log10(power/baseline) (dB) by temperature (no baseline column).
+    """Topomap grid of Δ=log10(power/baseline) by temperature (no baseline column).
 
     - Columns: All trials (Δ) followed by each temperature level (Δ), per frequency band.
     - Layout made more compact horizontally by reducing inter-column spacing.
@@ -1865,8 +1853,7 @@ def plot_topomap_grid_baseline_temps(
                     tfr_cond.info,
                     axes=ax,
                     show=False,
-                    vmin=-diff_abs,
-                    vmax=+diff_abs,
+                    vlim=(-diff_abs, +diff_abs),
                     cmap=TOPO_CMAP,
                 )
             except Exception:
@@ -1886,7 +1873,7 @@ def plot_topomap_grid_baseline_temps(
                 sm_diff, ax=axes[r, :].ravel().tolist(), fraction=0.045, pad=0.06, shrink=0.9
             )
             try:
-                cbar_d.set_label("10·log10(power/baseline) (dB)")
+                cbar_d.set_label("log10(power/baseline)")
             except Exception:
                 pass
         except Exception:
@@ -1894,7 +1881,7 @@ def plot_topomap_grid_baseline_temps(
 
     try:
         fig.suptitle(
-            f"Topomaps by temperature: \u0394=10·log10(power/baseline) (dB) over plateau t=[{tmin:.1f}, {tmax:.1f}] s",
+            f"Topomaps by temperature: \u0394=log10(power/baseline) over plateau t=[{tmin:.1f}, {tmax:.1f}] s",
             fontsize=12,
         )
     except Exception:
