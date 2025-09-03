@@ -14,21 +14,15 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 # Load centralized configuration
-try:
-    from config_loader import EEGConfig
-    config = EEGConfig()
-    
-    # Extract parameters from config
-    PROJECT_ROOT = config.project.root
-    BIDS_ROOT = config.project.bids_root
-    SOURCE_ROOT = config.project.source_root
-    TASK = config.project.task
-except Exception:
-    # Fallback if config loading fails
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    BIDS_ROOT = PROJECT_ROOT / "eeg_pipeline" / "bids_output"
-    SOURCE_ROOT = PROJECT_ROOT / "eeg_pipeline" / "source_data"
-    TASK = "thermalactive"
+from config_loader import EEGConfig
+
+config = EEGConfig()
+
+# Extract parameters from config
+PROJECT_ROOT = config.project.root
+BIDS_ROOT = config.project.bids_root
+SOURCE_ROOT = config.project.source_root
+TASK = config.project.task
 
 
 def _norm_trial_type(s: str) -> str:
