@@ -183,31 +183,53 @@ def _align_events_to_epochs(events_df: Optional[pd.DataFrame], epochs: mne.Epoch
     if hasattr(epochs, "selection") and epochs.selection is not None:
         sel = epochs.selection
         try:
-            if len(events_df) > int(np.max(sel)):
-                logger.debug(f"Successfully aligned events using epochs.selection ({len(sel)} epochs)")
-                return events_df.iloc[sel].reset_index(drop=True)
+            aligned = events_df.iloc[sel].reset_index(drop=True)
+            if len(aligned) != len(epochs):
+                raise ValueError(
+                    f"epochs.selection alignment produced {len(aligned)} rows; expected {len(epochs)}"
+                )
+            if "sample" not in aligned.columns or not isinstance(getattr(epochs, "events", None), np.ndarray):
+                raise ValueError("Missing 'sample' column or epochs.events to validate alignment")
+            samples = epochs.events[:, 0]
+            if not np.array_equal(pd.to_numeric(aligned["sample"], errors="coerce"), samples):
+                raise ValueError("Event samples do not match epochs.events after epochs.selection alignment")
+            logger.debug(
+                f"Successfully aligned events using epochs.selection ({len(aligned)} epochs)"
+            )
+            return aligned
         except (IndexError, ValueError, TypeError) as e:
             logger.warning(f"Failed to align events using epochs.selection: {e}")
-            
+
     # 2) Use sample column to reindex to epochs.events
     if "sample" in events_df.columns and isinstance(getattr(epochs, "events", None), np.ndarray):
         try:
             samples = epochs.events[:, 0]
-            out = events_df.set_index("sample").reindex(samples)
-            if len(out) == len(epochs) and not out.isna().all(axis=1).any():
-                logger.debug(f"Successfully aligned events using sample column ({len(out)} epochs)")
-                return out.reset_index()
+            aligned = events_df.set_index("sample").reindex(samples)
+            if aligned.shape[0] != len(epochs):
+                raise ValueError(
+                    f"Sample-based alignment produced {aligned.shape[0]} rows; expected {len(epochs)}"
+                )
+            if aligned.isna().any().any():
+                raise ValueError("Sample-based alignment resulted in missing event data for some epochs")
+            aligned = aligned.reset_index()
+            if not np.array_equal(pd.to_numeric(aligned["sample"], errors="coerce"), samples):
+                raise ValueError("Event samples do not match epochs.events after sample-based alignment")
+            logger.debug(
+                f"Successfully aligned events using sample column ({len(aligned)} epochs)"
+            )
+            return aligned
         except (KeyError, IndexError, ValueError) as e:
             logger.warning(f"Failed to align events using sample column: {e}")
-            
+
     # 3) Critical failure: cannot guarantee alignment
-    logger.critical(f"CRITICAL: Unable to align events to epochs reliably. "
-                   f"Events: {len(events_df)} rows, Epochs: {len(epochs)} epochs. "
-                   f"This could result in completely invalid correlations due to trial misalignment.")
-    raise ValueError(f"Cannot guarantee events-to-epochs alignment for reliable analysis. "
-                    f"Events DataFrame ({len(events_df)} rows) cannot be reliably aligned to "
-                    f"epochs ({len(epochs)} epochs). This is a critical failure that would "
-                    f"invalidate all behavioral correlations.")
+    msg = (
+        "Cannot guarantee events-to-epochs alignment for reliable analysis. "
+        f"Events DataFrame ({len(events_df)} rows) cannot be reliably aligned to "
+        f"epochs ({len(epochs)} epochs). This is a critical failure that would invalidate "
+        "all behavioral correlations."
+    )
+    logger.critical(msg)
+    raise ValueError(msg)
 
 
 def _pick_first_column(df: Optional[pd.DataFrame], candidates: List[str]) -> Optional[str]:
