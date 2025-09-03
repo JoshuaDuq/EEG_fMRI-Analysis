@@ -77,7 +77,7 @@ DEFAULT_PLATEAU_TMIN = config.analysis.time_frequency.default_plateau_tmin
 DEFAULT_PLATEAU_TMAX = config.analysis.time_frequency.default_plateau_tmax
 
 # Minimum baseline coverage
-MIN_BASELINE_SAMPLES = 5
+MIN_BASELINE_SAMPLES = config.analysis.time_frequency.min_baseline_samples
 
 
 def _validate_baseline_indices(
@@ -114,23 +114,13 @@ def _sanitize(name: str) -> str:
 
 
 def _roi_definitions() -> Dict[str, list[str]]:
-    """Scientifically reasonable sensor-space ROIs using 10-10 labels.
+    """Sensor-space ROIs defined in the configuration file.
 
     Patterns are regexes matched case-insensitively against channel names.
     """
     return {
-        # Frontal pole + frontal
-        "Frontal": [r"^(Fpz|Fp[12]|AFz|AF[3-8]|Fz|F[1-8])$"],
-        # Central strip only (C-series)
-        "Central": [r"^(Cz|C[1-6])$"],
-        # Parietal (P-series)
-        "Parietal": [r"^(Pz|P[1-8])$"],
-        # Occipital and parieto-occipital
-        "Occipital": [r"^(Oz|O[12]|POz|PO[3-8])$"],
-        # Lateral temporal regions
-        "Temporal": [r"^(T7|T8|TP7|TP8|FT7|FT8)$"],
-        # Bilateral sensorimotor strip (FC/C/CP around hand knob)
-        "Sensorimotor": [r"^(FC[234]|FCz)$", r"^(C[234]|Cz)$", r"^(CP[234]|CPz)$"],
+        roi: list(patterns)
+        for roi, patterns in config.analysis.time_frequency.rois.items()
     }
 
 
