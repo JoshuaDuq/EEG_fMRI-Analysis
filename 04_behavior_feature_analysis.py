@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy import stats
+from scipy.ndimage import gaussian_filter1d
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import mne
@@ -85,24 +86,23 @@ def _save_fig(fig: matplotlib.figure.Figure, path_base: Path | str, formats: Tup
     plt.close(fig)
 
 
-def _db_to_pct(v):
-    """Transform 10·log10(power/baseline) (dB) to percent change.
+def _logratio_to_pct(v):
+    """Transform logratio log10(power/baseline) to percent change (%).
 
     Accepts scalar or array-like. Returns values in percent.
     """
     v_arr = np.asarray(v, dtype=float)
-    return (np.power(10.0, v_arr / 10.0) - 1.0) * 100.0
+    return (np.power(10.0, v_arr) - 1.0) * 100.0
 
 
-def _pct_to_db(p):
-    """Inverse transform: percent change to 10·log10(power/baseline) (dB).
+def _pct_to_logratio(p):
+    """Inverse transform: percent change (%) to logratio log10(power/baseline).
 
     Accepts scalar or array-like. Clips 1 + p/100 to a small positive
-    minimum (1e-9) to avoid log10 of non-positive values, which previously
-    caused runtime warnings when percent was <= -100.
+    minimum (1e-9) to avoid log10 of non-positive values.
     """
     p_arr = np.asarray(p, dtype=float)
-    return 10.0 * np.log10(np.clip(1.0 + (p_arr / 100.0), 1e-9, None))
+    return np.log10(np.clip(1.0 + (p_arr / 100.0), 1e-9, None))
 
 
 def _find_connectivity_path(subject: str, task: str) -> Path:
@@ -793,7 +793,8 @@ def correlate_power_roi_stats(
     if recs_rating:
         df_r = pd.DataFrame(recs_rating)
         pvec = df_r["p_perm"].to_numpy() if "p_perm" in df_r.columns and np.isfinite(df_r["p_perm"]).any() else df_r["p"].to_numpy()
-        rej, crit = _fdr_bh(pvec, alpha=0.05)
+        fdr_alpha = config.get('analysis', {}).get('behavior_analysis', {}).get('statistics', {}).get('fdr_alpha', 0.05)
+        rej, crit = _fdr_bh(pvec, alpha=fdr_alpha)
         df_r["fdr_reject"] = rej
         df_r["fdr_crit_p"] = crit
         df_r.to_csv(stats_dir / "corr_stats_pow_roi_vs_rating.tsv", sep="\t", index=False)
@@ -801,7 +802,7 @@ def correlate_power_roi_stats(
     if recs_temp:
         df_t = pd.DataFrame(recs_temp)
         pvec_t = df_t["p_perm"].to_numpy() if "p_perm" in df_t.columns and np.isfinite(df_t["p_perm"]).any() else df_t["p"].to_numpy()
-        rej_t, crit_t = _fdr_bh(pvec_t, alpha=0.05)
+        rej_t, crit_t = _fdr_bh(pvec_t, alpha=fdr_alpha)
         df_t["fdr_reject"] = rej_t
         df_t["fdr_crit_p"] = crit_t
         df_t.to_csv(stats_dir / "corr_stats_pow_roi_vs_temp.tsv", sep="\t", index=False)
@@ -1219,13 +1220,13 @@ def plot_power_roi_scatter(
         show_pct_axis = False
         if not is_partial_residuals and "log10(power" in x_label:
             show_pct_axis = True
-        elif is_partial_residuals and method_code == "pearson" and "residuals of 10·log10(power" in x_label:
+        elif is_partial_residuals and method_code == "pearson" and "residuals of log10(power" in x_label:
             show_pct_axis = True
             
         if show_pct_axis:
             try:
                 # Add percentage axis on top histogram
-                ax_pct = ax_histx.secondary_xaxis('top', functions=(_db_to_pct, _pct_to_db))
+                ax_pct = ax_histx.secondary_xaxis('top', functions=(_logratio_to_pct, _pct_to_logratio))
                 ax_pct.set_xlabel("Power Change (%)", fontsize=9)
                 ax_pct.xaxis.set_major_locator(MaxNLocator(nbins=5))
             except (AttributeError, TypeError, ValueError):
@@ -1316,21 +1317,39 @@ def plot_power_roi_scatter(
         method_code = "spearman" if do_spear else "pearson"
         covar_names = list(Z_df_full.columns) if Z_df_full is not None else None
 
+        # Create overall subfolder for overall (non-ROI) plots
+        overall_plots_dir = plots_dir / "overall"
+        _ensure_dir(overall_plots_dir)
+        
         # Rating target scatter (overall)
         _generate_correlation_scatter(
             x_data=overall_vals,
             y_data=y,
-            x_label="10·log10(power/baseline [-5–0 s]) (dB)",
+            x_label="log10(power/baseline [-5–0 s])",
             y_label="Rating",
             title_prefix=f"{band_title} power vs rating — Overall",
             band_color=band_color,
-            output_path=plots_dir / f"scatter_pow_overall_{_sanitize(band)}_vs_rating",
+            output_path=overall_plots_dir / f"scatter_pow_overall_{_sanitize(band)}_vs_rating",
             method_code=method_code,
             Z_covars=Z_df_full,
             covar_names=covar_names,
             bootstrap_ci=bootstrap_ci,
             rng=rng,
         )
+        
+        # Generate residual diagnostics for overall rating correlation
+        try:
+            plot_regression_residual_diagnostics(
+                x_data=overall_vals,
+                y_data=y,
+                title_prefix=f"{band_title} power vs rating — Overall",
+                output_path=overall_plots_dir / f"residual_diagnostics_pow_overall_{_sanitize(band)}_vs_rating",
+                band_color=band_color,
+                logger=logger,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create residual diagnostics for overall {band} vs rating: {e}")
+        
         
         # Separate partial-residuals figure if covariates available
         if Z_df_full is not None and len(Z_df_full) > 0:
@@ -1341,9 +1360,9 @@ def plot_power_roi_scatter(
             x_res_sr, y_res_sr, n_res = _partial_residuals_xy_given_Z(x_part, y_part, Z_part, method_code)
             if n_res >= 5:
                 residual_xlabel = (
-                    "Partial residuals (ranked) of 10·log10(power/baseline) (dB)"
+                    "Partial residuals (ranked) of log10(power/baseline)"
                     if method_code == "spearman"
-                    else "Partial residuals of 10·log10(power/baseline) (dB)"
+                    else "Partial residuals of log10(power/baseline)"
                 )
                 residual_ylabel = "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
                 
@@ -1354,7 +1373,7 @@ def plot_power_roi_scatter(
                     y_label=residual_ylabel,
                     title_prefix=f"Partial residuals — {band_title} vs rating — Overall",
                     band_color=band_color,
-                    output_path=plots_dir / f"scatter_pow_overall_{_sanitize(band)}_vs_rating_partial",
+                    output_path=overall_plots_dir / f"scatter_pow_overall_{_sanitize(band)}_vs_rating_partial",
                     method_code=method_code,
                     bootstrap_ci=bootstrap_ci,
                     rng=rng,
@@ -1371,11 +1390,11 @@ def plot_power_roi_scatter(
             _generate_correlation_scatter(
                 x_data=overall_vals,
                 y_data=temp_series,
-                x_label="10·log10(power/baseline [-5–0 s]) (dB)",
+                x_label="log10(power/baseline [-5–0 s])",
                 y_label="Temperature (°C)",
                 title_prefix=f"{band_title} power vs temperature — Overall",
                 band_color=band_color,
-                output_path=plots_dir / f"scatter_pow_overall_{_sanitize(band)}_vs_temp",
+                output_path=overall_plots_dir / f"scatter_pow_overall_{_sanitize(band)}_vs_temp",
                 method_code=method2_code,
                 Z_covars=Z_df_temp,
                 covar_names=covar_names_temp,
@@ -1383,7 +1402,20 @@ def plot_power_roi_scatter(
                 rng=rng,
             )
             
-            # Separate partial-residuals figure if covariates available
+            # Generate residual diagnostics for overall temperature correlation
+            try:
+                plot_regression_residual_diagnostics(
+                    x_data=overall_vals,
+                    y_data=temp_series,
+                    title_prefix=f"{band_title} power vs temperature — Overall",
+                    output_path=overall_plots_dir / f"residual_diagnostics_pow_overall_{_sanitize(band)}_vs_temp",
+                    band_color=band_color,
+                    logger=logger,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create residual diagnostics for overall {band} vs temperature: {e}")
+            
+            # Overall temperature partial-residuals figure if covariates available
             if Z_df_temp is not None and len(Z_df_temp) > 0:
                 n_len_pt2 = min(len(overall_vals), len(temp_series), len(Z_df_temp))
                 x_part2 = overall_vals.iloc[:n_len_pt2]
@@ -1392,9 +1424,9 @@ def plot_power_roi_scatter(
                 x2_res_sr, y2_res_sr, n2_res = _partial_residuals_xy_given_Z(x_part2, y_part2, Z_part2, method2_code)
                 if n2_res >= 5:
                     residual_xlabel = (
-                        "Partial residuals (ranked) of 10·log10(power/baseline) (dB)"
+                        "Partial residuals (ranked) of log10(power/baseline)"
                         if method2_code == "spearman"
-                        else "Partial residuals of 10·log10(power/baseline) (dB)"
+                        else "Partial residuals of log10(power/baseline)"
                     )
                     residual_ylabel = "Partial residuals (ranked) of temperature (°C)" if method2_code == "spearman" else "Partial residuals of temperature (°C)"
                     
@@ -1405,7 +1437,7 @@ def plot_power_roi_scatter(
                         y_label=residual_ylabel,
                         title_prefix=f"Partial residuals — {band_title} vs temperature — Overall",
                         band_color=band_color,
-                        output_path=plots_dir / f"scatter_pow_overall_{_sanitize(band)}_vs_temp_partial",
+                        output_path=overall_plots_dir / f"scatter_pow_overall_{_sanitize(band)}_vs_temp_partial",
                         method_code=method2_code,
                         bootstrap_ci=bootstrap_ci,
                         rng=rng,
@@ -1418,15 +1450,19 @@ def plot_power_roi_scatter(
                 continue
             roi_vals = pow_df[roi_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
 
+            # Create ROI-specific subfolder
+            roi_plots_dir = plots_dir / "roi_scatters" / _sanitize(roi)
+            _ensure_dir(roi_plots_dir)
+
             # ROI-specific rating scatter
             _generate_correlation_scatter(
                 x_data=roi_vals,
                 y_data=y,
-                x_label="10·log10(power/baseline [-5–0 s]) (dB)",
+                x_label="log10(power/baseline [-5–0 s])",
                 y_label="Rating",
                 title_prefix=f"{band_title} power vs rating — {roi}",
                 band_color=band_color,
-                output_path=plots_dir / f"scatter_pow_roi_{_sanitize(roi)}_{_sanitize(band)}_vs_rating",
+                output_path=roi_plots_dir / f"scatter_pow_{_sanitize(band)}_vs_rating",
                 method_code=method_code,
                 Z_covars=Z_df_full,
                 covar_names=covar_names,
@@ -1434,6 +1470,20 @@ def plot_power_roi_scatter(
                 rng=rng,
                 roi_channels=chs,
             )
+            
+            # Generate residual diagnostics for ROI rating correlation
+            try:
+                plot_regression_residual_diagnostics(
+                    x_data=roi_vals,
+                    y_data=y,
+                    title_prefix=f"{band_title} power vs rating — {roi}",
+                    output_path=roi_plots_dir / f"residual_diagnostics_pow_{_sanitize(band)}_vs_rating",
+                    band_color=band_color,
+                    logger=logger,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create residual diagnostics for {roi} {band} vs rating: {e}")
+            
             
             # ROI partial-residuals figure if covariates available
             if Z_df_full is not None and len(Z_df_full) > 0:
@@ -1444,26 +1494,26 @@ def plot_power_roi_scatter(
                 x_res_sr, y_res_sr, n_res = _partial_residuals_xy_given_Z(x_part, y_part, Z_part, method_code)
                 if n_res >= 5:
                     residual_xlabel = (
-                        "Partial residuals (ranked) of 10·log10(power/baseline) (dB)"
+                        "Partial residuals (ranked) of log10(power/baseline)"
                         if method_code == "spearman"
-                        else "Partial residuals of 10·log10(power/baseline) (dB)"
+                        else "Partial residuals of log10(power/baseline)"
                     )
                     residual_ylabel = "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
                     
                     _generate_correlation_scatter(
-                        x_data=x_res_sr,
-                        y_data=y_res_sr,
-                        x_label=residual_xlabel,
-                        y_label=residual_ylabel,
-                        title_prefix=f"Partial residuals — {band_title} vs rating — {roi}",
-                        band_color=band_color,
-                        output_path=plots_dir / f"scatter_pow_roi_{_sanitize(roi)}_{_sanitize(band)}_vs_rating_partial",
-                        method_code=method_code,
-                        bootstrap_ci=bootstrap_ci,
-                        rng=rng,
-                        is_partial_residuals=True,
-                        roi_channels=chs,
-                    )
+                    x_data=x_res_sr,
+                    y_data=y_res_sr,
+                    x_label=residual_xlabel,
+                    y_label=residual_ylabel,
+                    title_prefix=f"Partial residuals — {band_title} vs rating — {roi}",
+                    band_color=band_color,
+                    output_path=roi_plots_dir / f"scatter_pow_{_sanitize(band)}_vs_rating_partial",
+                    method_code=method_code,
+                    bootstrap_ci=bootstrap_ci,
+                    rng=rng,
+                    is_partial_residuals=True,
+                    roi_channels=chs,
+                )
 
             # ROI-specific temperature scatter (optional)
             if do_temp and temp_series is not None and len(temp_series) > 0:
@@ -1475,11 +1525,11 @@ def plot_power_roi_scatter(
                 _generate_correlation_scatter(
                     x_data=roi_vals,
                     y_data=temp_series,
-                    x_label="10·log10(power/baseline [-5–0 s]) (dB)",
+                    x_label="log10(power/baseline [-5–0 s])",
                     y_label="Temperature (°C)",
                     title_prefix=f"{band_title} power vs temperature — {roi}",
                     band_color=band_color,
-                    output_path=plots_dir / f"scatter_pow_roi_{_sanitize(roi)}_{_sanitize(band)}_vs_temp",
+                    output_path=roi_plots_dir / f"scatter_pow_{_sanitize(band)}_vs_temp",
                     method_code=method2_code,
                     Z_covars=Z_df_temp,
                     covar_names=covar_names_temp,
@@ -1487,6 +1537,19 @@ def plot_power_roi_scatter(
                     rng=rng,
                     roi_channels=chs,
                 )
+                
+                # Generate residual diagnostics for ROI temperature correlation
+                try:
+                    plot_regression_residual_diagnostics(
+                        x_data=roi_vals,
+                        y_data=temp_series,
+                        title_prefix=f"{band_title} power vs temperature — {roi}",
+                        output_path=roi_plots_dir / f"residual_diagnostics_pow_{_sanitize(band)}_vs_temp",
+                        band_color=band_color,
+                        logger=logger,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to create residual diagnostics for {roi} {band} vs temperature: {e}")
                 
                 # ROI temperature partial-residuals figure if covariates available
                 if Z_df_temp is not None and len(Z_df_temp) > 0:
@@ -1497,9 +1560,9 @@ def plot_power_roi_scatter(
                     x2_res_sr, y2_res_sr, n2_res = _partial_residuals_xy_given_Z(x_part2, y_part2, Z_part2, method2_code)
                     if n2_res >= 5:
                         residual_xlabel = (
-                            "Partial residuals (ranked) of 10·log10(power/baseline) (dB)"
+                            "Partial residuals (ranked) of log10(power/baseline)"
                             if method2_code == "spearman"
-                            else "Partial residuals of 10·log10(power/baseline) (dB)"
+                            else "Partial residuals of log10(power/baseline)"
                         )
                         residual_ylabel = "Partial residuals (ranked) of temperature (°C)" if method2_code == "spearman" else "Partial residuals of temperature (°C)"
                         
@@ -1510,13 +1573,238 @@ def plot_power_roi_scatter(
                             y_label=residual_ylabel,
                             title_prefix=f"Partial residuals — {band_title} vs temperature — {roi}",
                             band_color=band_color,
-                            output_path=plots_dir / f"scatter_pow_roi_{_sanitize(roi)}_{_sanitize(band)}_vs_temp_partial",
+                            output_path=roi_plots_dir / f"scatter_pow_{_sanitize(band)}_vs_temp_partial",
                             method_code=method2_code,
                             bootstrap_ci=bootstrap_ci,
                             rng=rng,
                             is_partial_residuals=True,
                             roi_channels=chs,
                         )
+
+# Residual Diagnostic Visualization for Regression Analysis
+# -----------------------------------------------------------------------------
+
+def plot_regression_residual_diagnostics(
+    x_data: pd.Series,
+    y_data: pd.Series,
+    title_prefix: str,
+    output_path: Path,
+    band_color: str = "#4C72B0",
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Create comprehensive residual diagnostic plots for regression analysis.
+    
+    Generates a 4-panel diagnostic figure with:
+    1. Residuals vs Fitted Values (heteroscedasticity check)
+    2. Q-Q Plot for normality assessment
+    3. Scale-Location plot (sqrt of standardized residuals vs fitted)
+    4. Residuals vs Leverage (Cook's distance contours)
+    
+    Args:
+        x_data: Independent variable (power values)
+        y_data: Dependent variable (ratings/temperature)
+        title_prefix: Base title for the diagnostic plots
+        output_path: Output file path (without extension)
+        band_color: Color for plot elements
+        logger: Optional logger for warnings
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+        
+    # Clean and align data
+    df = pd.concat([x_data.rename("x"), y_data.rename("y")], axis=1).dropna()
+    if len(df) < 10:
+        logger.warning(f"Too few valid points ({len(df)}) for meaningful residual diagnostics")
+        return
+        
+    x_clean = df["x"].to_numpy()
+    y_clean = df["y"].to_numpy()
+    
+    # Fit linear regression
+    from sklearn.linear_model import LinearRegression
+    from sklearn.preprocessing import StandardScaler
+    
+    X = x_clean.reshape(-1, 1)
+    reg = LinearRegression()
+    reg.fit(X, y_clean)
+    
+    # Calculate diagnostic metrics
+    y_pred = reg.predict(X)
+    residuals = y_clean - y_pred
+    std_residuals = residuals / np.std(residuals, ddof=1)
+    
+    # Leverage (hat values) - diagonal of hat matrix
+    X_design = np.column_stack([np.ones(len(X)), X.flatten()])
+    try:
+        H = X_design @ np.linalg.inv(X_design.T @ X_design) @ X_design.T
+        leverage = np.diag(H)
+    except np.linalg.LinAlgError:
+        # Fallback if matrix is singular
+        leverage = np.full(len(X), 1.0 / len(X))
+    
+    # Cook's distance
+    n_params = 2  # intercept + slope
+    cooks_d = (std_residuals**2 / n_params) * (leverage / (1 - leverage)**2)
+    
+    # Create figure with 2x2 subplots
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f"Regression Diagnostics — {title_prefix}", fontsize=14, fontweight='bold')
+    
+    # 1. Residuals vs Fitted
+    ax1 = axes[0, 0]
+    ax1.scatter(y_pred, residuals, alpha=0.6, color=band_color, s=25, edgecolors='white', linewidths=0.3)
+    ax1.axhline(y=0, color='red', linestyle='--', alpha=0.8, linewidth=1)
+    
+    # Add LOESS smooth line for trend detection
+    try:
+        from scipy.interpolate import UnivariateSpline
+        if len(np.unique(y_pred)) > 3:
+            sort_idx = np.argsort(y_pred)
+            
+            # Robust spline fitting with configurable parameters
+            smoothing_factor = max(len(y_pred) * 0.1, 1.0)  # Minimum smoothing
+            max_iter = 50
+            tolerance = 1e-3
+            
+            try:
+                spline = UnivariateSpline(
+                    y_pred[sort_idx], 
+                    residuals[sort_idx], 
+                    s=smoothing_factor,
+                    k=3  # Cubic spline
+                )
+                y_pred_smooth = np.linspace(y_pred.min(), y_pred.max(), 100)
+                residuals_smooth = spline(y_pred_smooth)
+                ax1.plot(y_pred_smooth, residuals_smooth, color='darkblue', linewidth=2, alpha=0.8)
+            except Exception as spline_error:
+                # Fallback to simple moving average if spline fails
+                logger.warning(f"Spline smoothing failed, using moving average: {spline_error}")
+                window_size = max(3, len(y_pred) // 10)
+                y_pred_smooth = np.linspace(y_pred.min(), y_pred.max(), min(50, len(y_pred)))
+                residuals_smooth = np.interp(y_pred_smooth, y_pred[sort_idx], residuals[sort_idx])
+                ax1.plot(y_pred_smooth, residuals_smooth, color='darkblue', linewidth=2, alpha=0.8, linestyle='--')
+    except (ImportError, ValueError):
+        pass
+        
+    ax1.set_xlabel("Fitted Values")
+    ax1.set_ylabel("Residuals")
+    ax1.set_title("Residuals vs Fitted")
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Q-Q Plot for normality
+    ax2 = axes[0, 1]
+    from scipy import stats as scipy_stats
+    scipy_stats.probplot(residuals, dist="norm", plot=ax2)
+    ax2.get_lines()[0].set_markerfacecolor(band_color)
+    ax2.get_lines()[0].set_markeredgecolor('white')
+    ax2.get_lines()[0].set_markersize(6)
+    ax2.get_lines()[0].set_alpha(0.7)
+    ax2.get_lines()[1].set_color('red')
+    ax2.get_lines()[1].set_linewidth(2)
+    ax2.set_title("Normal Q-Q Plot")
+    ax2.grid(True, alpha=0.3)
+    
+    # Add Shapiro-Wilk test result
+    if len(residuals) <= 5000:  # Shapiro-Wilk limit
+        shapiro_stat, shapiro_p = scipy_stats.shapiro(residuals)
+        ax2.text(0.05, 0.95, f"Shapiro-Wilk: W={shapiro_stat:.3f}, p={shapiro_p:.3f}", 
+                transform=ax2.transAxes, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # 3. Scale-Location (sqrt of |standardized residuals| vs fitted)
+    ax3 = axes[1, 0]
+    sqrt_abs_std_resid = np.sqrt(np.abs(std_residuals))
+    ax3.scatter(y_pred, sqrt_abs_std_resid, alpha=0.6, color=band_color, s=25, edgecolors='white', linewidths=0.3)
+    
+    # Add smooth trend line
+    try:
+        if len(np.unique(y_pred)) > 3:
+            sort_idx = np.argsort(y_pred)
+            
+            # Robust spline fitting
+            smoothing_factor = max(len(y_pred) * 0.1, 1.0)
+            try:
+                spline = UnivariateSpline(
+                    y_pred[sort_idx], 
+                    sqrt_abs_std_resid[sort_idx], 
+                    s=smoothing_factor,
+                    k=3
+                )
+                y_pred_smooth = np.linspace(y_pred.min(), y_pred.max(), 100)
+                sqrt_smooth = spline(y_pred_smooth)
+                ax3.plot(y_pred_smooth, sqrt_smooth, color='darkblue', linewidth=2, alpha=0.8)
+            except Exception as spline_error:
+                # Fallback to interpolation
+                logger.warning(f"Spline smoothing failed for scale-location plot: {spline_error}")
+                y_pred_smooth = np.linspace(y_pred.min(), y_pred.max(), min(50, len(y_pred)))
+                sqrt_smooth = np.interp(y_pred_smooth, y_pred[sort_idx], sqrt_abs_std_resid[sort_idx])
+                ax3.plot(y_pred_smooth, sqrt_smooth, color='darkblue', linewidth=2, alpha=0.8, linestyle='--')
+    except (ImportError, ValueError, Exception):
+        pass
+        
+    ax3.set_xlabel("Fitted Values")
+    ax3.set_ylabel("√|Standardized Residuals|")
+    ax3.set_title("Scale-Location")
+    ax3.grid(True, alpha=0.3)
+    
+    # 4. Residuals vs Leverage (with Cook's distance contours)
+    ax4 = axes[1, 1]
+    ax4.scatter(leverage, std_residuals, alpha=0.6, color=band_color, s=25, edgecolors='white', linewidths=0.3)
+    
+    # Add Cook's distance contours
+    try:
+        xlim = ax4.get_xlim()
+        ylim = ax4.get_ylim()
+        
+        # Create grid for Cook's distance contours
+        lev_range = np.linspace(0.001, max(leverage) * 1.1, 100)
+        
+        # Cook's distance thresholds to show
+        cook_levels = [0.5, 1.0]
+        for cook_thresh in cook_levels:
+            # Cook's D = (std_resid^2 / p) * (leverage / (1-leverage)^2)
+            # Solve for std_resid: std_resid = ±sqrt(cook_thresh * p * (1-leverage)^2 / leverage)
+            valid_lev = lev_range[lev_range < 0.99]  # Avoid division by zero
+            pos_resid = np.sqrt(cook_thresh * n_params * (1 - valid_lev)**2 / valid_lev)
+            neg_resid = -pos_resid
+            
+            ax4.plot(valid_lev, pos_resid, 'r--', alpha=0.6, linewidth=1, 
+                    label=f"Cook's D = {cook_thresh}" if cook_thresh == cook_levels[0] else "")
+            ax4.plot(valid_lev, neg_resid, 'r--', alpha=0.6, linewidth=1)
+            
+    except (ValueError, ZeroDivisionError, FloatingPointError):
+        pass
+    
+    # Highlight points with high Cook's distance
+    high_cook_mask = cooks_d > 4.0 / len(x_clean)  # Common threshold: 4/n
+    if np.any(high_cook_mask):
+        ax4.scatter(leverage[high_cook_mask], std_residuals[high_cook_mask], 
+                   color='red', s=40, alpha=0.8, edgecolors='darkred', linewidths=1,
+                   label=f'High Cook\'s D (>{4.0/len(x_clean):.3f})')
+    
+    ax4.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+    ax4.set_xlabel("Leverage")
+    ax4.set_ylabel("Standardized Residuals")
+    ax4.set_title("Residuals vs Leverage")
+    ax4.grid(True, alpha=0.3)
+    if ax4.get_legend_handles_labels()[0]:  # Only show legend if there are labeled elements
+        ax4.legend(fontsize=8)
+    
+    # Add summary statistics text box
+    summary_stats = f"""Diagnostic Summary:
+n = {len(residuals)}
+RMSE = {np.sqrt(np.mean(residuals**2)):.3f}
+Max |Cook's D| = {np.max(cooks_d):.3f}
+Max Leverage = {np.max(leverage):.3f}"""
+    
+    fig.text(0.02, 0.98, summary_stats, fontsize=9, verticalalignment='top',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.92, left=0.08)
+    _save_fig(fig, output_path)
+
 
 # Power-Behavior Correlation Visualization (transferred from 03_feature_engineering.py)
 # -----------------------------------------------------------------------------
@@ -1567,7 +1855,7 @@ def plot_power_behavior_correlation(pow_df: pd.DataFrame, y: pd.Series, bands: L
             x_line = np.linspace(x_valid.min(), x_valid.max(), 100)
             axes[i].plot(x_line, p(x_line), 'r--', alpha=0.8)
             
-            axes[i].set_xlabel(f'{band.capitalize()} Power\n(10·log10(power/baseline) (dB))')
+            axes[i].set_xlabel(f'{band.capitalize()} Power\nlog10(power/baseline)')
             axes[i].set_ylabel('Behavioral Rating')
             axes[i].set_title(f'{band.capitalize()} Power vs Behavior')
             axes[i].grid(True, alpha=0.3)
@@ -2184,58 +2472,142 @@ def plot_behavior_modulated_connectivity(subject: str, task: str, y: pd.Series,
             plt.close(fig)
 
 
-
-
-
-
-
-def plot_band_power_summary(pow_df: pd.DataFrame, bands: List[str],
-                           subject: str, save_dir: Path, logger: logging.Logger):
-    """Create band power summary visualization."""
+def plot_top_behavioral_predictors(
+    subject: str,
+    task: str = TASK,
+    alpha: float = 0.05,
+    top_n: int = 20
+) -> None:
+    """Plot top N significant behavioral predictors as horizontal bar chart.
+    
+    Creates a publication-ready horizontal bar chart showing the channel-band combinations
+    with the strongest significant correlations with behavioral ratings, similar to the
+    format shown in your example figure.
+    
+    Parameters
+    ----------
+    subject : str
+        Subject identifier
+    task : str
+        Task name
+    alpha : float
+        Significance threshold (default 0.05)
+    top_n : int
+        Number of top predictors to show (default 20)
+    """
+    logger = _setup_logging(subject)
+    logger.info(f"Creating top {top_n} behavioral predictors plot for sub-{subject}")
+    
+    plots_dir = _plots_dir(subject)
+    stats_dir = _stats_dir(subject)
+    _ensure_dir(plots_dir)
+    
+    # Load combined correlation statistics
+    stats_file = stats_dir / "corr_stats_pow_combined_vs_rating.tsv"
+    if not stats_file.exists():
+        logger.warning(f"Combined correlation stats not found: {stats_file}")
+        return
+    
     try:
-        band_means = []
-        band_stds = []
-        valid_bands = []
+        # Read correlation statistics
+        df = pd.read_csv(stats_file, sep="\t")
         
-        for band in bands:
-            band_cols = [col for col in pow_df.columns if col.startswith(f'pow_{band}_')]
-            if band_cols:
-                band_power = pow_df[band_cols].mean(axis=1)
-                band_means.append(band_power.mean())
-                band_stds.append(band_power.std())
-                valid_bands.append(band)
+        # Filter for significant correlations and valid data
+        df_sig = df[
+            (df['p'] <= alpha) & 
+            df['r'].notna() & 
+            df['p'].notna() &
+            df['channel'].notna() &
+            df['band'].notna()
+        ].copy()
         
-        if not valid_bands:
-            logger.warning("No valid bands for power summary")
+        if len(df_sig) == 0:
+            logger.warning(f"No significant correlations found (p <= {alpha})")
             return
+        
+        # Calculate absolute correlation and sort by it
+        df_sig['abs_r'] = df_sig['r'].abs()
+        df_top = df_sig.nlargest(top_n, 'abs_r')
+        
+        if len(df_top) == 0:
+            logger.warning("No top correlations to plot")
+            return
+        
+        # Create predictor labels (channel + band)
+        df_top['predictor'] = df_top['channel'] + ' (' + df_top['band'] + ')'
+        
+        # Sort by absolute correlation (ascending for horizontal bar plot)
+        df_top = df_top.sort_values('abs_r', ascending=True)
+        
+        # Set up the figure
+        fig, ax = plt.subplots(figsize=(10, max(8, top_n * 0.4)))
+        
+        # Create color mapping for bands
+        band_colors = {}
+        for band in df_top['band'].unique():
+            if band in BAND_COLORS:
+                band_colors[band] = BAND_COLORS[band]
+            else:
+                # Fallback colors if band not in BAND_COLORS
+                fallback_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+                                 '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+                band_idx = list(df_top['band'].unique()).index(band)
+                band_colors[band] = fallback_colors[band_idx % len(fallback_colors)]
+        
+        # Create colors list for each bar
+        colors = [band_colors[band] for band in df_top['band']]
+        
+        # Create horizontal bar plot
+        y_pos = np.arange(len(df_top))
+        bars = ax.barh(y_pos, df_top['abs_r'], color=colors, alpha=0.8, edgecolor='black', linewidth=0.5)
+        
+        # Customize the plot
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(df_top['predictor'], fontsize=11)
+        ax.set_xlabel('|Spearman ρ| with Behavior (p < 0.05)', fontweight='bold', fontsize=12)
+        ax.set_title('Top 20 Significant Behavioral Predictors', fontweight='bold', fontsize=14, pad=20)
+        
+        # Add correlation values and p-values as text annotations
+        for i, (_, row) in enumerate(df_top.iterrows()):
+            r_val = row['r']
+            p_val = row['p']
+            abs_r_val = row['abs_r']
             
-        fig, ax = plt.subplots(figsize=(10, 6))
-        colors = [BAND_COLORS.get(band, '#4C4C4C') for band in valid_bands]
-        bars = ax.bar(range(len(valid_bands)), band_means, yerr=band_stds,
-                     capsize=5, color=colors, alpha=0.7, error_kw={'alpha': 0.8})
-        ax.set_xticks(range(len(valid_bands)))
-        ax.set_xticklabels([b.capitalize() for b in valid_bands])
-        ax.set_ylabel('Mean Log Power', fontweight='bold')
-        ax.set_title(f'EEG Band Power Summary\nSubject {subject}', fontweight='bold', fontsize=14)
-        ax.grid(True, alpha=0.3, axis='y')
+            # Position text slightly to the right of the bar
+            x_pos = abs_r_val + 0.01
+            ax.text(x_pos, i, f'{abs_r_val:.3f} (p={p_val:.3f})', 
+                   va='center', ha='left', fontsize=10, fontweight='normal')
         
-        # Add values on bars
-        for bar, mean, std in zip(bars, band_means, band_stds):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.01,
-                   f'{mean:.2f}', ha='center', va='bottom', fontweight='bold')
+        # Set x-axis limits with some padding
+        max_r = df_top['abs_r'].max()
+        ax.set_xlim(0, max_r * 1.25)
         
+        # Add grid for better readability
+        ax.grid(True, axis='x', alpha=0.3, linestyle='-', linewidth=0.5)
+        ax.set_axisbelow(True)
+        
+        # Adjust layout
         plt.tight_layout()
-        _save_fig(fig, save_dir / f'sub-{subject}_band_power_summary')
+        
+        # Save the figure
+        output_path = plots_dir / f'sub-{subject}_top_{top_n}_behavioral_predictors'
+        _save_fig(fig, output_path)
         plt.close(fig)
         
-        logger.info(f"Saved band power summary visualization")
+        logger.info(f"Saved top {top_n} behavioral predictors plot: {output_path}.png")
+        logger.info(f"Found {len(df_top)} significant predictors (out of {len(df)} total correlations)")
+        
+        # Export the top predictors data for reference
+        top_predictors_file = stats_dir / f"top_{top_n}_behavioral_predictors.tsv"
+        df_top_export = df_top[['predictor', 'channel', 'band', 'r', 'abs_r', 'p', 'n']].copy()
+        df_top_export = df_top_export.sort_values('abs_r', ascending=False)  # Sort descending for export
+        df_top_export.to_csv(top_predictors_file, sep="\t", index=False)
+        logger.info(f"Exported top predictors data: {top_predictors_file}")
         
     except Exception as e:
-        logger.error(f"Failed to create band power summary: {e}")
+        logger.error(f"Failed to create top behavioral predictors plot: {e}")
         if 'fig' in locals():
             plt.close(fig)
-
-
 
 
 # Connectivity ROI summary correlations (within/between ROI averages)
@@ -2819,20 +3191,24 @@ def export_combined_power_corr_stats(subject: str) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Neural Behavioral State Space Visualization
+# REMOVED: plot_neural_behavioral_state_space function
+
+
+# -----------------------------------------------------------------------------
+# Time-Frequency Power-Behavior Correlation Heatmap
 # -----------------------------------------------------------------------------
 
-def plot_neural_behavioral_state_space(
+def plot_time_frequency_correlation_heatmap(
     subject: str,
     task: str = TASK,
-    method: str = 'pca',
-    n_components: int = 2,
-    rng: Optional[np.random.Generator] = None,
+    use_spearman: bool = True,
+    config: Optional[dict] = None
 ) -> None:
-    """Create neural-behavioral state space visualization using dimensionality reduction.
+    """Create time-frequency correlation heatmap showing power-behavior relationships.
     
-    Maps high-dimensional neural feature space to behavioral ratings using PCA/UMAP,
-    showing behavioral trajectories through neural state space.
+    This visualization reveals how correlations between EEG power and behavioral ratings
+    vary across both time and frequency dimensions, providing insights into the temporal
+    dynamics of brain-behavior coupling.
     
     Parameters
     ----------
@@ -2840,287 +3216,454 @@ def plot_neural_behavioral_state_space(
         Subject identifier
     task : str
         Task name
-    method : str
-        Dimensionality reduction method ('pca' or 'umap')
-    n_components : int
-        Number of components for dimensionality reduction (2 or 3)
-    rng : Optional[np.random.Generator]
-        Random number generator for reproducibility
+    use_spearman : bool
+        Use Spearman (True) or Pearson (False) correlation
+    time_resolution : float
+        Time bin size in seconds
+    freq_resolution : float
+        Frequency bin size in Hz
+    time_window : tuple
+        (tmin, tmax) in seconds relative to event onset
+    freq_range : tuple
+        (fmin, fmax) frequency range in Hz
+    alpha : float
+        Significance threshold for FDR correction
+    roi_selection : str or None
+        ROI name to focus on (None for all channels)
     """
     logger = _setup_logging(subject)
-    logger.info(f"Creating neural-behavioral state space visualization for sub-{subject}")
+    logger.info(f"Creating time-frequency correlation heatmap for sub-{subject}")
+    
+    # Load config parameters
+    if config is None:
+        config = _load_config()
+    
+    # Get behavior analysis parameters from config
+    behavior_config = config.get('analysis', {}).get('behavior_analysis', {})
+    heatmap_config = behavior_config.get('time_frequency_heatmap', {})
+    viz_config = behavior_config.get('visualization', {})
+    spline_config = behavior_config.get('spline', {})
+    stats_config = behavior_config.get('statistics', {})
+    
+    # Extract parameters with defaults
+    time_resolution = heatmap_config.get('time_resolution', 0.1)
+    freq_resolution = heatmap_config.get('freq_resolution', 2.0)
+    time_window = tuple(heatmap_config.get('time_window', [-0.5, 2.0]))
+    freq_range = tuple(heatmap_config.get('freq_range', [4.0, 40.0]))
+    alpha = heatmap_config.get('alpha', 0.05)
+    roi_selection = heatmap_config.get('roi_selection')
+    if roi_selection == "null":
+        roi_selection = None
+    n_cycles_factor = heatmap_config.get('n_cycles_factor', 2.0)
+    decim = heatmap_config.get('decim', 3)
+    min_valid_points = heatmap_config.get('min_valid_points', 5)
     
     plots_dir = _plots_dir(subject)
     stats_dir = _stats_dir(subject)
     _ensure_dir(plots_dir)
     _ensure_dir(stats_dir)
     
-    if rng is None:
-        rng = np.random.default_rng(42)
+    # Load epochs and behavioral data
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None:
+        logger.error(f"Could not find epochs for sub-{subject}")
+        return
+        
+    epochs = mne.read_epochs(epo_path, preload=True, verbose=False)
+    events = _load_events_df(subject, task)
+    aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
+    
+    if aligned_events is None:
+        logger.error(f"Could not align events for sub-{subject}")
+        return
+        
+    # Get behavioral ratings
+    rating_col = _pick_first_column(aligned_events, RATING_COLUMNS)
+    if rating_col is None:
+        logger.error(f"No rating column found for sub-{subject}")
+        return
+        
+    y = pd.to_numeric(aligned_events[rating_col], errors="coerce")
+    if y.isna().all():
+        logger.error(f"All behavioral ratings are NaN for sub-{subject}")
+        return
+    
+    # Select channels based on ROI if specified
+    if roi_selection is not None:
+        roi_map = _build_rois(epochs.info)
+        if roi_selection in roi_map:
+            channels = roi_map[roi_selection]
+            epochs = epochs.pick_channels(channels)
+            logger.info(f"Selected {len(channels)} channels from {roi_selection} ROI")
+        else:
+            logger.warning(f"ROI {roi_selection} not found, using all channels")
+    
+    # Create time-frequency representation
+    freqs = np.arange(freq_range[0], freq_range[1] + freq_resolution, freq_resolution)
+    n_cycles = freqs / n_cycles_factor  # Adaptive number of cycles
+    
+    logger.info(f"Computing time-frequency decomposition: {len(freqs)} frequencies, {len(epochs)} epochs")
+    tfr = mne.time_frequency.tfr_morlet(
+        epochs, 
+        freqs=freqs, 
+        n_cycles=n_cycles,
+        use_fft=True,
+        return_itc=False,
+        decim=decim,
+        n_jobs=1,
+        verbose=False
+    )
+    
+    # Crop to desired time window
+    tfr.crop(tmin=time_window[0], tmax=time_window[1])
+    
+    # Create time bins
+    times = tfr.times
+    time_bins = np.arange(time_window[0], time_window[1] + time_resolution, time_resolution)
+    time_bin_centers = (time_bins[:-1] + time_bins[1:]) / 2
+    
+    # Initialize correlation arrays
+    n_time_bins = len(time_bin_centers)
+    n_freqs = len(freqs)
+    n_channels = len(tfr.ch_names)
+    
+    correlations = np.full((n_freqs, n_time_bins), np.nan)
+    p_values = np.full((n_freqs, n_time_bins), np.nan)
+    n_valid = np.full((n_freqs, n_time_bins), 0)
+    
+    # Compute correlations for each time-frequency bin
+    logger.info("Computing correlations across time-frequency grid...")
+    
+    for t_idx, t_center in enumerate(time_bin_centers):
+        # Find time indices for this bin
+        t_start = t_center - time_resolution / 2
+        t_end = t_center + time_resolution / 2
+        time_mask = (times >= t_start) & (times <= t_end)
+        
+        if not np.any(time_mask):
+            continue
+            
+        for f_idx, freq in enumerate(freqs):
+            # Get power data for this frequency 
+            # TFR data shape varies: could be (epochs, channels, freqs, times) or (epochs, freqs, times)
+            if tfr.data.ndim == 4:
+                # 4D: (epochs, channels, freqs, times)
+                power_freq = tfr.data[:, :, f_idx, :]  # (epochs, channels, times)
+            elif tfr.data.ndim == 3:
+                # 3D: (epochs, freqs, times) - channels already averaged
+                power_freq = tfr.data[:, f_idx, :]  # (epochs, times)
+                # Add channel dimension for consistency
+                power_freq = power_freq[:, np.newaxis, :]  # (epochs, 1, times)
+            else:
+                logger.error(f"Unexpected TFR data dimensionality: {tfr.data.ndim}")
+                continue
+            
+            # Apply time mask to get data for this time bin
+            power_data = power_freq[:, :, time_mask]  # (epochs, channels, time_points_in_bin)
+            
+            # Average across channels and time points
+            if roi_selection is not None or n_channels == 1:
+                # Single ROI or single channel: average across channels and time
+                power_values = np.mean(power_data, axis=(1, 2))  # Average across channels and time
+            else:
+                # Multiple channels: average across all channels and time points  
+                power_values = np.mean(power_data, axis=(1, 2))
+            
+            # Align with behavioral data
+            n_common = min(len(power_values), len(y))
+            power_vals = power_values[:n_common]
+            behavior_vals = y.iloc[:n_common]
+            
+            # Remove NaN values
+            valid_mask = ~(np.isnan(power_vals) | behavior_vals.isna())
+            if np.sum(valid_mask) < min_valid_points:  # Need minimum valid points
+                continue
+                
+            power_clean = power_vals[valid_mask]
+            behavior_clean = behavior_vals[valid_mask]
+            
+            # Compute correlation
+            try:
+                if use_spearman and len(np.unique(behavior_clean)) > 5:
+                    r, p = stats.spearmanr(power_clean, behavior_clean)
+                else:
+                    r, p = stats.pearsonr(power_clean, behavior_clean)
+                    
+                correlations[f_idx, t_idx] = r
+                p_values[f_idx, t_idx] = p
+                n_valid[f_idx, t_idx] = np.sum(valid_mask)
+                
+            except Exception as e:
+                logger.warning(f"Correlation failed for freq={freq:.1f}Hz, time={t_center:.2f}s: {e}")
+                continue
+    
+    # FDR correction across all time-frequency points
+    valid_p_mask = ~np.isnan(p_values)
+    if np.any(valid_p_mask):
+        p_flat = p_values[valid_p_mask]
+        # Use internal BH adjust to get q-values (adjusted p-values)
+        p_corrected_flat = _bh_adjust(p_flat)
+
+        p_corrected = np.full_like(p_values, np.nan)
+        p_corrected[valid_p_mask] = p_corrected_flat
+
+        significant_mask = p_corrected < alpha
+    else:
+        significant_mask = np.zeros_like(p_values, dtype=bool)
+    
+    # Create separate visualizations
+    correlation_vmin = viz_config.get('correlation_vmin', -0.6)
+    correlation_vmax = viz_config.get('correlation_vmax', 0.6)
+    
+    roi_suffix = f"_{roi_selection.lower()}" if roi_selection else ""
+    method_suffix = "_spearman" if use_spearman else "_pearson"
+    
+    # Figure 1: Time-frequency correlation heatmap
+    fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
+    im1 = ax1.imshow(correlations, aspect='auto', origin='lower', 
+                     extent=[time_window[0], time_window[1], freq_range[0], freq_range[1]],
+                     cmap='RdBu_r', vmin=correlation_vmin, vmax=correlation_vmax)
+    ax1.set_xlabel('Time (s)', fontweight='bold')
+    ax1.set_ylabel('Frequency (Hz)', fontweight='bold')
+    ax1.set_title(f'Time-Frequency Power-Behavior Correlations\n'
+                 f'Subject: {subject} | Method: {use_spearman and "Spearman" or "Pearson"} | '
+                 f'ROI: {roi_selection or "All Channels"}', 
+                 fontsize=14, fontweight='bold')
+    ax1.axvline(0, color='black', linestyle='--', alpha=0.5)
+    cbar1 = plt.colorbar(im1, ax=ax1, label='Correlation (r)')
+    cbar1.ax.tick_params(labelsize=12)
+    
+    # Add frequency band horizontal lines
+    for band, (fmin, fmax) in FEATURES_FREQ_BANDS.items():
+        if fmin >= freq_range[0] and fmax <= freq_range[1]:
+            ax1.axhline(fmin, color='white', linestyle='-', alpha=0.3, linewidth=0.5)
+            ax1.axhline(fmax, color='white', linestyle='-', alpha=0.3, linewidth=0.5)
+    
+    plt.tight_layout()
+    fig1_name = f"time_frequency_correlation_heatmap{roi_suffix}{method_suffix}"
+    _save_fig(fig1, plots_dir / fig1_name)
+    
+    # Figure 2: Frequency profile of strongest correlations
+    fig2, ax2 = plt.subplots(1, 1, figsize=(10, 6))
+    max_corr_per_freq = np.nanmax(np.abs(correlations), axis=1)
+    freq_with_data = freqs[~np.isnan(max_corr_per_freq)]
+    max_corr_freq_clean = max_corr_per_freq[~np.isnan(max_corr_per_freq)]
+    
+    if len(freq_with_data) > 0:
+        ax2.plot(freq_with_data, max_corr_freq_clean, 'o-', linewidth=2, markersize=4, color='black')
+        ax2.set_xlabel('Frequency (Hz)', fontweight='bold')
+        ax2.set_ylabel('Max |Correlation|', fontweight='bold')
+        ax2.set_title(f'Frequency Profile of Strongest Power-Behavior Correlations\n'
+                     f'Subject: {subject} | Method: {use_spearman and "Spearman" or "Pearson"} | '
+                     f'ROI: {roi_selection or "All Channels"}', 
+                     fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        
+        # Add frequency band annotations with theta included
+        band_colors = {'theta': 'purple', 'alpha': 'green', 'beta': 'orange', 'gamma': 'red'}
+        for band, (fmin, fmax) in FEATURES_FREQ_BANDS.items():
+            if band in band_colors and fmin >= freq_range[0] and fmax <= freq_range[1]:
+                ax2.axvspan(fmin, fmax, alpha=0.2, color=band_colors[band], 
+                           label=f'{band} ({fmin:g}–{fmax:g}Hz)')
+        ax2.legend(loc='upper right', fontsize=10, framealpha=0.9)
+    
+    plt.tight_layout()
+    fig2_name = f"frequency_profile_correlation{roi_suffix}{method_suffix}"
+    _save_fig(fig2, plots_dir / fig2_name)
+    
+    # Save statistical results
+    results_df = pd.DataFrame({
+        'frequency': np.repeat(freqs, n_time_bins),
+        'time': np.tile(time_bin_centers, n_freqs),
+        'correlation': correlations.flatten(),
+        'p_value': p_values.flatten(),
+        'p_corrected': p_corrected.flatten() if 'p_corrected' in locals() else np.nan,
+        'significant': significant_mask.flatten() if 'significant_mask' in locals() else False,
+        'n_valid': n_valid.flatten()
+    })
+    
+    # Remove rows with all NaN correlations
+    results_df = results_df.dropna(subset=['correlation'])
+    
+    stats_file = stats_dir / f"time_frequency_correlation_stats{roi_suffix}{method_suffix}.tsv"
+    results_df.to_csv(stats_file, sep='\t', index=False)
+    
+    # Log summary statistics
+    if not results_df.empty:
+        n_significant = np.sum(results_df['significant'])
+        max_r = results_df['correlation'].abs().max()
+        best_result = results_df.loc[results_df['correlation'].abs().idxmax()]
+        
+        logger.info(f"Time-frequency correlation analysis completed:")
+        logger.info(f"  - Total time-frequency points: {len(results_df)}")
+        logger.info(f"  - Significant correlations (FDR < {alpha}): {n_significant}")
+        logger.info(f"  - Maximum |correlation|: {max_r:.3f}")
+        logger.info(f"  - Best correlation: r={best_result['correlation']:.3f} at "
+                   f"{best_result['frequency']:.1f}Hz, {best_result['time']:.2f}s")
+        logger.info(f"  - Results saved to: {stats_file}")
+    else:
+        logger.warning("No valid correlations computed")
+
+
+# -----------------------------------------------------------------------------
+# Trial-by-Trial Power Evolution with Behavioral Adaptation
+# -----------------------------------------------------------------------------
+
+def plot_power_behavior_evolution_across_trials(
+    subject: str,
+    task: str = TASK,
+    window_size: int = 20,
+    bands_to_plot: Optional[List[str]] = None
+) -> None:
+    """
+    Plot how power-behavior correlations evolve across trials within the session.
+    
+    Creates a sliding window analysis showing:
+    1. Running correlations between power and behavior across trials
+    2. Behavioral trend line across trials  
+    3. Power trend lines for key ROIs/bands across trials
+    4. Significance bands for correlations
+    
+    Parameters:
+    -----------
+    subject : str
+        Subject identifier
+    task : str
+        Task name
+    window_size : int
+        Number of trials for sliding window correlation (default: 20)
+    bands_to_plot : Optional[List[str]] 
+        Frequency bands to analyze (default: uses first 3 from POWER_BANDS_TO_USE)
+    """
+    logger = _setup_logging(subject)
+    logger.info(f"Creating power-behavior evolution analysis for sub-{subject}")
+    
+    plots_dir = _plots_dir(subject)
+    _ensure_dir(plots_dir)
     
     try:
-        # Load features and targets
-        pow_df, conn_df, y, info = _load_features_and_targets(subject, task)
+        # Load data
+        pow_df, _, y, info = _load_features_and_targets(subject, task)
         y = pd.to_numeric(y, errors="coerce")
         
-        # Load epochs for alignment and events for temperature
-        epo_path = _find_clean_epochs_path(subject, task)
-        if epo_path is None:
-            logger.error(f"Could not find epochs for state space analysis: sub-{subject}")
+        if bands_to_plot is None:
+            bands_to_plot = POWER_BANDS_TO_USE[:3]  # Limit to avoid clutter
+        
+        # Build ROIs
+        roi_map = _build_rois(info)
+        key_rois = ['Frontal', 'Central', 'Parietal', 'Occipital']  # Focus on key regions
+        available_rois = [roi for roi in key_rois if roi in roi_map]
+        
+        if not available_rois:
+            logger.warning(f"No key ROIs available for evolution analysis: sub-{subject}")
+            return
+        
+        n_trials = len(y)
+        if n_trials < window_size * 2:
+            logger.warning(f"Not enough trials ({n_trials}) for evolution analysis (need at least {window_size * 2})")
             return
             
-        epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
-        events = _load_events_df(subject, task)
-        aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
+        trial_numbers = np.arange(1, n_trials + 1)
         
-        # Get temperature data if available
-        temp_series: Optional[pd.Series] = None
-        if aligned_events is not None:
-            temp_col = _pick_first_column(aligned_events, PSYCH_TEMP_COLUMNS)
-            if temp_col is not None:
-                temp_series = pd.to_numeric(aligned_events[temp_col], errors="coerce")
+        # Create separate behavioral response evolution figure
+        fig_behav, ax_behav = plt.subplots(1, 1, figsize=(10, 6))
         
-        # Prepare neural feature matrix (all power features across channels and bands)
-        feature_cols = [col for col in pow_df.columns if col.startswith('pow_')]
-        if len(feature_cols) < 2:
-            logger.warning(f"Insufficient power features ({len(feature_cols)}) for state space analysis")
-            return
-            
-        # Convert to numeric and handle missing data
-        X_raw = pow_df[feature_cols].apply(pd.to_numeric, errors='coerce')
+        # Remove NaN values for smoothing
+        y_clean = y.fillna(y.mean())
+        y_smooth = gaussian_filter1d(y_clean, sigma=2.0)
         
-        # Align all data to common length
-        min_len = min(len(X_raw), len(y))
-        if temp_series is not None:
-            min_len = min(min_len, len(temp_series))
-            
-        X = X_raw.iloc[:min_len]
-        y_aligned = y.iloc[:min_len]
-        temp_aligned = temp_series.iloc[:min_len] if temp_series is not None else None
+        ax_behav.scatter(trial_numbers, y, alpha=0.4, s=15, color='gray', label='Raw ratings')
+        ax_behav.plot(trial_numbers, y_smooth, color='red', linewidth=3, 
+                     label='Smoothed trend', alpha=0.8)
+        ax_behav.set_xlabel('Trial Number', fontweight='bold')
+        ax_behav.set_ylabel('Pain Rating', fontweight='bold')
+        ax_behav.set_title(f'Behavioral Response Evolution - sub-{subject}', fontweight='bold', fontsize=12)
+        ax_behav.legend(fontsize=10)
+        ax_behav.grid(True, alpha=0.3)
         
-        # Remove trials with missing behavioral data
-        valid_mask = y_aligned.notna()
-        if temp_aligned is not None:
-            valid_mask = valid_mask & temp_aligned.notna()
-            
-        X_clean = X.loc[valid_mask]
-        y_clean = y_aligned.loc[valid_mask]
-        temp_clean = temp_aligned.loc[valid_mask] if temp_aligned is not None else None
+        plt.tight_layout()
+        _save_fig(fig_behav, plots_dir / f"behavioral_response_evolution")
         
-        # Remove features with too many missing values or no variance
-        feature_valid_pct = X_clean.notna().mean()
-        good_features = feature_valid_pct[feature_valid_pct >= 0.7].index  # Keep features with ≥70% valid data
-        X_final = X_clean[good_features]
-        
-        # Impute remaining missing values with median
-        X_imputed = X_final.fillna(X_final.median())
-        
-        # Remove zero-variance features
-        X_var = X_imputed.var()
-        nonzero_var_features = X_var[X_var > 1e-12].index
-        X_processed = X_imputed[nonzero_var_features]
-        
-        if len(X_processed.columns) < 2:
-            logger.warning(f"Insufficient valid features ({len(X_processed.columns)}) after preprocessing")
-            return
+        # Create separate figure for each band with 2 subplots
+        for band in bands_to_plot:
+            band_color = BAND_COLORS.get(band, 'blue')
+            band_range = FEATURES_FREQ_BANDS.get(band)
+            band_label = f"{band.title()} ({band_range[0]:g}–{band_range[1]:g} Hz)" if band_range else band.title()
             
-        logger.info(f"Using {len(X_processed.columns)} neural features for {len(X_processed)} trials")
-        
-        # Standardize features
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X_processed)
-        
-        # Apply dimensionality reduction
-        if method.lower() == 'pca':
-            reducer = PCA(n_components=n_components, random_state=42)
-            X_reduced = reducer.fit_transform(X_scaled)
-            explained_var = reducer.explained_variance_ratio_
-            component_names = [f'PC{i+1}' for i in range(n_components)]
-        else:
-            logger.warning(f"Method '{method}' not implemented, falling back to PCA")
-            reducer = PCA(n_components=n_components, random_state=42)
-            X_reduced = reducer.fit_transform(X_scaled)
-            explained_var = reducer.explained_variance_ratio_
-            component_names = [f'PC{i+1}' for i in range(n_components)]
-        
-        # Create visualization
-        if n_components == 2:
-            fig = plt.figure(figsize=(14, 10))
+            # Get ROI-averaged power for this band
+            roi_power = {}
+            for roi in available_rois:
+                roi_cols = [f"pow_{band}_{ch}" for ch in roi_map[roi] 
+                          if f"pow_{band}_{ch}" in pow_df.columns]
+                if roi_cols:
+                    roi_power[roi] = pow_df[roi_cols].apply(
+                        pd.to_numeric, errors='coerce').mean(axis=1)
             
-            # Main scatter plot (top-left)
-            ax_main = plt.subplot2grid((3, 3), (0, 0), colspan=2, rowspan=2)
+            if not roi_power:
+                logger.warning(f"No power data available for {band} band")
+                continue
             
-            # Marginal histograms
-            ax_marg_x = plt.subplot2grid((3, 3), (2, 0), colspan=2, sharex=ax_main)
-            ax_marg_y = plt.subplot2grid((3, 3), (0, 2), rowspan=2, sharey=ax_main)
+            # Create figure with 2 subplots for this band
+            fig, axes = plt.subplots(2, 1, figsize=(10, 8))
             
-            # Feature importance plot
-            ax_features = plt.subplot2grid((3, 3), (2, 2))
+            # Top subplot: Running correlations
+            ax_corr = axes[0]
+            mid_points = []
+            correlations = {roi: [] for roi in roi_power.keys()}
             
-            # Main scatter plot colored by behavioral ratings
-            scatter = ax_main.scatter(
-                X_reduced[:, 0], X_reduced[:, 1], 
-                c=y_clean, cmap='RdYlBu_r', 
-                s=60 if temp_clean is None else temp_clean * 3,  # Size by temperature if available
-                alpha=0.7, edgecolors='white', linewidth=0.5
-            )
-            
-            # Add trajectory lines connecting consecutive trials
-            if len(X_reduced) > 1:
-                ax_main.plot(X_reduced[:, 0], X_reduced[:, 1], 
-                           color='gray', alpha=0.3, linewidth=1, zorder=0)
-                # Mark start and end
-                ax_main.scatter(X_reduced[0, 0], X_reduced[0, 1], 
-                              marker='s', s=100, color='green', alpha=0.8, 
-                              edgecolors='white', linewidth=2, zorder=10, label='Start')
-                ax_main.scatter(X_reduced[-1, 0], X_reduced[-1, 1], 
-                              marker='X', s=100, color='red', alpha=0.8, 
-                              edgecolors='white', linewidth=2, zorder=10, label='End')
-            
-            # Colorbar for behavioral ratings
-            cbar = plt.colorbar(scatter, ax=ax_main)
-            cbar.set_label('Pain Rating', fontsize=12, fontweight='bold')
-            
-            # Main plot labels
-            ax_main.set_xlabel(f'{component_names[0]} ({explained_var[0]:.1%} variance)', 
-                             fontsize=12, fontweight='bold')
-            ax_main.set_ylabel(f'{component_names[1]} ({explained_var[1]:.1%} variance)', 
-                             fontsize=12, fontweight='bold')
-            ax_main.set_title(f'Neural-Behavioral State Space: sub-{subject}', 
-                            fontsize=14, fontweight='bold')
-            ax_main.legend(loc='upper right')
-            ax_main.grid(True, alpha=0.3)
-            
-            # Marginal distributions
-            ax_marg_x.hist(X_reduced[:, 0], bins=20, alpha=0.7, color='steelblue', edgecolor='white')
-            ax_marg_x.set_ylabel('Count', fontweight='bold')
-            ax_marg_x.grid(True, alpha=0.3)
-            
-            ax_marg_y.hist(X_reduced[:, 1], bins=20, orientation='horizontal', 
-                          alpha=0.7, color='steelblue', edgecolor='white')
-            ax_marg_y.set_xlabel('Count', fontweight='bold')
-            ax_marg_y.grid(True, alpha=0.3)
-            
-            # Feature importance (top contributing features to each PC)
-            if hasattr(reducer, 'components_'):
-                # Get top features for PC1 and PC2
-                pc1_importance = np.abs(reducer.components_[0])
-                pc2_importance = np.abs(reducer.components_[1])
+            for start in range(n_trials - window_size + 1):
+                end = start + window_size
+                mid_points.append(start + window_size // 2 + 1)  # +1 for 1-based trial numbers
+                y_window = y.iloc[start:end]
                 
-                # Get top 5 features for each PC
-                top_features_pc1 = np.argsort(pc1_importance)[-5:][::-1]
-                top_features_pc2 = np.argsort(pc2_importance)[-5:][::-1]
-                
-                # Combine and get unique features
-                top_features = np.unique(np.concatenate([top_features_pc1, top_features_pc2]))
-                
-                if len(top_features) > 0:
-                    feature_names = [X_processed.columns[i] for i in top_features]
-                    importances = np.sqrt(pc1_importance[top_features]**2 + pc2_importance[top_features]**2)
-                    
-                    # Clean feature names for display
-                    display_names = []
-                    for fname in feature_names:
-                        # Extract band and channel from feature name like 'pow_alpha_Cz'
-                        parts = fname.split('_')
-                        if len(parts) >= 3:
-                            band = parts[1]
-                            channel = parts[2]
-                            display_names.append(f'{band}\n{channel}')
-                        else:
-                            display_names.append(fname.replace('_', '\n'))
-                    
-                    # Plot feature importance
-                    bars = ax_features.barh(range(len(importances)), importances, 
-                                          color='coral', alpha=0.7)
-                    ax_features.set_yticks(range(len(importances)))
-                    ax_features.set_yticklabels(display_names, fontsize=8)
-                    ax_features.set_xlabel('Importance', fontsize=10, fontweight='bold')
-                    ax_features.set_title('Top Features', fontsize=10, fontweight='bold')
-                    ax_features.grid(True, alpha=0.3, axis='x')
+                for roi in roi_power.keys():
+                    x_window = roi_power[roi].iloc[start:end]
+                    mask = x_window.notna() & y_window.notna()
+                    if mask.sum() >= 5:
+                        r, _ = stats.spearmanr(x_window[mask], y_window[mask])
+                        correlations[roi].append(r)
+                    else:
+                        correlations[roi].append(np.nan)
             
+            # Plot running correlations with different colors for each ROI
+            roi_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+            for roi_idx, roi in enumerate(roi_power.keys()):
+                color = roi_colors[roi_idx % len(roi_colors)]
+                ax_corr.plot(mid_points, correlations[roi], 
+                            label=f'{roi}', linewidth=2.5, alpha=0.8, color=color)
+            
+            ax_corr.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+            ax_corr.set_ylabel('Running Correlation (r)', fontweight='bold')
+            ax_corr.set_title(f'{band_label}: Power-Behavior Correlation Evolution', fontweight='bold', fontsize=12)
+            ax_corr.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=10)
+            ax_corr.grid(True, alpha=0.3)
+            ax_corr.set_ylim(-1, 1)
+            
+            # Bottom subplot: Power trends for key ROI
+            ax_power = axes[1]
+            
+            for roi_idx, roi in enumerate(roi_power.keys()):
+                color = roi_colors[roi_idx % len(roi_colors)]
+                power_clean = roi_power[roi].fillna(roi_power[roi].mean())
+                power_smooth = gaussian_filter1d(power_clean, sigma=2.0)
+                ax_power.plot(trial_numbers, power_smooth, 
+                             label=f'{roi}', linewidth=2.5, alpha=0.8, color=color)
+            
+            ax_power.set_xlabel('Trial Number', fontweight='bold')
+            ax_power.set_ylabel('log10(power/baseline)', fontweight='bold')
+            ax_power.set_title(f'{band_label} Power Evolution', fontweight='bold', fontsize=12)
+            ax_power.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=10)
+            ax_power.grid(True, alpha=0.3)
+            
+            plt.suptitle(f'Power Evolution: {band_label} - sub-{subject}', 
+                         fontsize=14, fontweight='bold', y=0.95)
             plt.tight_layout()
-            
-        elif n_components == 3:
-            # 3D visualization
-            fig = plt.figure(figsize=(12, 8))
-            ax = fig.add_subplot(111, projection='3d')
-            
-            scatter = ax.scatter(
-                X_reduced[:, 0], X_reduced[:, 1], X_reduced[:, 2],
-                c=y_clean, cmap='RdYlBu_r',
-                s=60 if temp_clean is None else temp_clean * 3,
-                alpha=0.7
-            )
-            
-            # Trajectory
-            if len(X_reduced) > 1:
-                ax.plot(X_reduced[:, 0], X_reduced[:, 1], X_reduced[:, 2],
-                       color='gray', alpha=0.3, linewidth=1)
-            
-            ax.set_xlabel(f'{component_names[0]} ({explained_var[0]:.1%})', fontweight='bold')
-            ax.set_ylabel(f'{component_names[1]} ({explained_var[1]:.1%})', fontweight='bold')
-            ax.set_zlabel(f'{component_names[2]} ({explained_var[2]:.1%})', fontweight='bold')
-            ax.set_title(f'Neural-Behavioral State Space (3D): sub-{subject}', fontweight='bold')
-            
-            cbar = plt.colorbar(scatter, ax=ax, shrink=0.5)
-            cbar.set_label('Pain Rating', fontweight='bold')
+            _save_fig(fig, plots_dir / f"power_evolution_{band}")
         
-        # Save figure
-        save_path = plots_dir / f'sub-{subject}_neural_behavioral_state_space_{method}_{n_components}d'
-        _save_fig(fig, save_path)
-        
-        # Export numerical results
-        results_df = pd.DataFrame({
-            'trial': range(len(X_reduced)),
-            f'{component_names[0]}': X_reduced[:, 0],
-            f'{component_names[1]}': X_reduced[:, 1],
-            'pain_rating': y_clean.values,
-        })
-        
-        if n_components >= 3:
-            results_df[f'{component_names[2]}'] = X_reduced[:, 2]
-            
-        if temp_clean is not None:
-            results_df['temperature'] = temp_clean.values
-            
-        results_df.to_csv(stats_dir / f'neural_state_space_{method}_{n_components}d.tsv', 
-                         sep='\t', index=False)
-        
-        # Export variance explained and feature contributions
-        variance_df = pd.DataFrame({
-            'component': component_names,
-            'variance_explained': explained_var,
-            'cumulative_variance': np.cumsum(explained_var)
-        })
-        variance_df.to_csv(stats_dir / f'neural_state_space_variance_{method}_{n_components}d.tsv', 
-                          sep='\t', index=False)
-        
-        # Correlate neural components with behavior
-        corr_results = []
-        for i, comp_name in enumerate(component_names):
-            r, p = stats.spearmanr(X_reduced[:, i], y_clean)
-            corr_results.append({
-                'component': comp_name,
-                'r_vs_rating': float(r),
-                'p_vs_rating': float(p),
-                'variance_explained': float(explained_var[i])
-            })
-            
-            if temp_clean is not None:
-                r_temp, p_temp = stats.spearmanr(X_reduced[:, i], temp_clean)
-                corr_results[-1]['r_vs_temperature'] = float(r_temp)
-                corr_results[-1]['p_vs_temperature'] = float(p_temp)
-        
-        corr_df = pd.DataFrame(corr_results)
-        corr_df.to_csv(stats_dir / f'neural_state_space_correlations_{method}_{n_components}d.tsv', 
-                      sep='\t', index=False)
-        
-        logger.info(f"Neural state space analysis complete. Explained variance: {explained_var.sum():.1%}")
-        logger.info(f"Strongest component-behavior correlation: r={corr_df['r_vs_rating'].abs().max():.3f}")
+        logger.info(f"Saved behavioral evolution figure and power evolution analysis for {len(bands_to_plot)} bands for sub-{subject}")
         
     except Exception as e:
-        logger.error(f"Failed to create neural state space visualization: {e}")
+        logger.error(f"Failed to create power-behavior evolution analysis: {e}")
         import traceback
         logger.error(traceback.format_exc())
         if 'fig' in locals():
@@ -3407,11 +3950,30 @@ def process_subject(
         # plot_topographic_correlation_maps(pow_df, y, POWER_BANDS_TO_USE, subject, plots_dir, logger)
         
         
-        # 8. Band power summary
-        plot_band_power_summary(pow_df, POWER_BANDS_TO_USE, subject, plots_dir, logger)
+        # 8. Band power summary - REMOVED
+        # plot_band_power_summary(pow_df, POWER_BANDS_TO_USE, subject, plots_dir, logger)
         
-        # 9. Neural-behavioral state space visualization
-        plot_neural_behavioral_state_space(subject, task, method='pca', n_components=2, rng=rng)
+        # 9. Neural-behavioral state space visualization - REMOVED
+        # plot_neural_behavioral_state_space(subject, task, method='pca', n_components=2, rng=rng)
+        
+        # 10. Trial-by-trial power-behavior evolution analysis
+        plot_power_behavior_evolution_across_trials(subject, task, window_size=20, bands_to_plot=None)
+        
+        # 11. Time-frequency correlation heatmap - NEW VISUALIZATION
+        plot_time_frequency_correlation_heatmap(
+            subject, 
+            task, 
+            use_spearman=use_spearman,
+            config=config
+        )
+        
+        # 11b. Sensorimotor ROI-specific time-frequency correlation heatmap
+        plot_time_frequency_correlation_heatmap(
+            subject, 
+            task, 
+            use_spearman=use_spearman,
+            config=config
+        )
         
         
     except Exception as e:
@@ -3449,6 +4011,12 @@ def process_subject(
         export_combined_power_corr_stats(subject)
     except Exception as e:
         logger.error(f"Combined power corr stats export failed for sub-{subject}: {e}")
+
+    # Plot top behavioral predictors based on combined correlation stats
+    try:
+        plot_top_behavioral_predictors(subject, task)
+    except Exception as e:
+        logger.error(f"Top behavioral predictors plot failed for sub-{subject}: {e}")
 
     # Apply a subject-level global FDR across all tests
     try:
@@ -3635,6 +4203,12 @@ def build_subject_report(subject: str, task: str = TASK) -> None:
         p = plots_dir / fn
         if p.exists():
             rep.add_image(p, title=fn, section="Psychometrics")
+    
+    # Top behavioral predictors plot
+    for fn in [f"sub-{subject}_top_20_behavioral_predictors.png"]:
+        p = plots_dir / fn
+        if p.exists():
+            rep.add_image(p, title="Top 20 Behavioral Predictors", section="Correlations")
     # Save stats TSVs as links
     for fn in [
         "corr_stats_pow_roi_vs_rating.tsv",
