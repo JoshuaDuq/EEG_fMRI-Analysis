@@ -17,18 +17,18 @@ paths:
   deriv_root: "eeg_pipeline/bids_output/derivatives"
   source_data: "eeg_pipeline/source_data"
   
-# Frequency bands for analysis
+# Frequency bands for analysis (matches features_freq_bands from config.py)
 frequency_bands:
-  theta: [4.0, 7.9]    # 4.0 to 8.0-0.1
-  alpha: [8.0, 12.9]   # 8.0 to 13.0-0.1  
-  beta: [13.0, 30.0]
-  gamma: [30.1, 80.0]  # 30.0+0.1 to 80.0
+  theta: [4.0, 7.9]    # 4.0 to (8.0 - 0.1) 
+  alpha: [8.0, 12.9]   # 8.0 to (13.0 - 0.1)
+  beta: [13.0, 30.0]   # 13.0 to 30.0
+  gamma: [30.1, 80.0]  # (30.0 + 0.1) to 80.0
   
 # Power analysis settings
 power:
   bands_to_use: ["theta", "alpha", "beta", "gamma"]  # Subset of frequency_bands for power features
   plateau_window: [0.0, 10.0]  # Time window for plateau analysis (seconds)
-  baseline_window: [-5.0, -0.1]  # Baseline window (seconds)
+  baseline_window: [-2.0, -1.0]  # Baseline window (seconds) - conservative, avoiding anticipatory activity
   
 # Event column mappings for behavioral data
 event_columns:
@@ -36,16 +36,16 @@ event_columns:
   rating: ["vas_final_coded_rating", "vas_final_rating", "vas_rating", "pain_intensity", "pain_rating", "rating"]
   pain_binary: ["pain_binary_coded", "pain_binary", "pain"]
   
-# Time-frequency analysis settings  
+# Time-frequency analysis settings (matches custom_tfr config from config.py)
 tfr:
-  custom_freqs: [1, 101, 1]  # [start, stop, step] for np.arange
-  n_cycles_factor: 3.0  # Divide frequencies by this for n_cycles
-  decim: 4
-  crop_time: false
-  return_itc: false
-  interpolate_bads: true
-  average_epochs: false
-  return_average: false
+  custom_freqs: [1, 101, 1]  # [start, stop, step] for np.arange - matches custom_tfr_freqs
+  n_cycles_factor: 3.0  # Divide frequencies by this for n_cycles - matches custom_tfr_n_cycles calculation
+  decim: 4  # Matches custom_tfr_decim
+  crop_time: false  # Matches custom_tfr_crop
+  return_itc: false  # Matches custom_tfr_return_itc
+  interpolate_bads: true  # Matches custom_tfr_interpolate_bads
+  average_epochs: false  # Matches custom_tfr_average
+  return_average: false  # Matches custom_tfr_return_average
 
 # Preprocessing pipeline settings
 preprocessing:
@@ -68,10 +68,10 @@ preprocessing:
   raw_resample_sfreq: 500
   
   # Epoching
-  conditions: ["Stim_on/S  1"]
+  conditions: ["Trig_therm/T  1"]
   epochs_tmin: -5
   epochs_tmax: 10
-  baseline: null  # null means no baseline correction
+  baseline: True  # null means no baseline correction
   find_breaks: false
   
   # Artifact rejection
@@ -322,21 +322,22 @@ analysis:
   # Time-frequency analysis
   time_frequency:
     default_temperature_strategy: "pooled"  # "pooled", "per", "both"
-    baseline_window: [-5.0, -0.1]  # TFR baseline window
+    baseline_window: [-2.0, -1.0]  # TFR baseline window (conservative, avoiding anticipatory activity)
     default_plateau_tmin: 0.0
     default_plateau_tmax: 10.0
     # TFR computation
-    freq_min: 4.0
+    freq_min: 1.0
     freq_max: 100.0
     n_freqs: 40
-    n_cycles_factor: 0.5  # n_cycles = freqs * factor
-    tfr_decim: 2
+    n_cycles_factor: 3.0  # n_cycles = freqs * factor (increased for better spectral resolution)
+    tfr_decim: 4
     tfr_picks: "eeg"
     # Band bounds
     band_bounds:
-      alpha: [8.0, 13.0]
-      beta: [13.0, 30.0]
-      gamma: [30.0, null]  # null means capped at data max freq
+      theta: [4.0, 7.9]    # 4.0 to (8.0 - 0.1) 
+      alpha: [8.0, 12.9]   # 8.0 to (13.0 - 0.1)
+      beta: [13.0, 30.0]   # 13.0 to 30.0
+      gamma: [30.1, 80.0]  # (30.0 + 0.1) to 80.0
     # Topomap styling
     topo_contours: 6
     topo_cmap: "RdBu_r"
@@ -353,15 +354,45 @@ analysis:
     do_group_default: false
     group_only_default: false
     build_reports_default: false
-
-  # Feature engineering plots
-  feature_engineering:
-    tfr_spectrogram_vlim: null  # Positive value to override robust vlim for ROI spectrograms
-
+    
   # Raw-to-BIDS conversion
   raw_to_bids:
     default_montage: "easycap-M1"
     default_line_freq: 60.0
+
+  # Behavior analysis settings (04_behavior_feature_analysis.py)
+  behavior_analysis:
+    # Time-frequency correlation heatmap parameters
+    time_frequency_heatmap:
+      time_resolution: 0.1  # Time bin size in seconds
+      freq_resolution: 2.0  # Frequency bin size in Hz
+      time_window: [-0.5, 10.0]  # Time window relative to event onset (seconds)
+      freq_range: [4.0, 80.0]  # Frequency range in Hz
+      alpha: 0.05  # Significance threshold for FDR correction
+      roi_selection: null  # ROI name or null for all channels
+      n_cycles_factor: 3.0  # Divide frequencies by this for adaptive n_cycles
+      decim: 4  # Decimation factor for TFR computation
+      min_valid_points: 5  # Minimum valid data points for correlation
+      
+    # Advanced visualization parameters
+    visualization:
+      figsize_heatmap: [16, 12]  # Figure size for heatmaps
+      correlation_vmin: -0.6  # Min correlation for color scale
+      correlation_vmax: 0.6   # Max correlation for color scale
+      significance_alpha: 0.7  # Alpha for significance overlay
+      
+    # Spline smoothing parameters
+    spline:
+      smoothing_factor: 0.3  # Smoothing parameter (fraction of data length)
+      min_smoothing: 1.0     # Minimum smoothing factor
+      max_iter: 50           # Maximum iterations for spline fitting
+      tolerance: 1e-3        # Convergence tolerance
+      
+    # Statistical parameters
+    statistics:
+      bootstrap_n: 1000      # Number of bootstrap samples
+      min_correlation_samples: 10  # Minimum samples for correlation
+      fdr_alpha: 0.05       # FDR correction threshold
 
 # Environment settings
 environment:
