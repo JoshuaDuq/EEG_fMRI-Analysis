@@ -463,6 +463,7 @@ def correlate_power_roi_stats(
     n_perm: int = 0,
     seed: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
+    seed: Optional[int] = None,
 ) -> None:
     logger = _setup_logging(subject)
     logger.info(f"Starting ROI power correlation analysis for sub-{subject}")
