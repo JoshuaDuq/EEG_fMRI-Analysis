@@ -55,14 +55,11 @@ def events_from_raw_annotations(raw: mne.io.BaseRaw) -> Tuple[Optional[np.ndarra
 
     If no events can be formed, returns (None, None).
     """
-    try:
-        # Let MNE infer mapping automatically
-        events, event_id = mne.events_from_annotations(raw, event_id=None)
-        if events is None or len(events) == 0 or not event_id:
-            return None, None
-        return events, event_id
-    except Exception:
+    # Let MNE infer mapping automatically
+    events, event_id = mne.events_from_annotations(raw, event_id=None)
+    if events is None or len(events) == 0 or not event_id:
         return None, None
+    return events, event_id
 
 
 def ensure_dataset_description(bids_root: Path, name: str = "EEG BIDS dataset") -> None:
@@ -101,7 +98,7 @@ def convert_one(
     if m_run:
         try:
             run_idx = int(m_run.group(1))
-        except Exception:
+        except ValueError:
             run_idx = None
     if run_idx is None:
         # Fallback: position in sorted list
@@ -138,26 +135,24 @@ def convert_one(
     # Optionally crop the raw to the first MRI volume trigger (e.g., "Volume/V 1" or "V  1") to remove dummy-scan period
     did_trim = False
     if trim_to_first_volume:
-        try:
-            anns0 = raw.annotations
-            if len(anns0) > 0:
-                # Match either 'Volume/V 1', 'Volume,V 1', or a bare 'V  1' (spaces normalized to single space)
-                _pat_v1 = re.compile(r"(^|[/,])V\s*1(\D|$)")
-                vol_idx = [
-                    i
-                    for i, d in enumerate(anns0.description)
-                    if _norm(d).startswith("Volume/V") or _pat_v1.search(_norm(d)) is not None
-                ]
-                if vol_idx:
-                    t0 = min(anns0.onset[i] for i in vol_idx)
-                    if isinstance(t0, (int, float)) and t0 > 0:
-                        # Crop so that time 0 aligns with the first detected volume trigger
-                        print(f"Trimming raw to first volume trigger at {t0:.3f}s relative to recording start.")
-                        raw.crop(tmin=float(t0), tmax=None)
-                        did_trim = True
-        except Exception:
-            # If cropping fails for any reason, proceed without cropping
-            pass
+        anns0 = raw.annotations
+        if len(anns0) > 0:
+            # Match either 'Volume/V 1', 'Volume,V 1', or a bare 'V  1' (spaces normalized to single space)
+            _pat_v1 = re.compile(r"(^|[/,])V\s*1(\D|$)")
+            vol_idx = [
+                i
+                for i, d in enumerate(anns0.description)
+                if _norm(d).startswith("Volume/V") or _pat_v1.search(_norm(d)) is not None
+            ]
+            if vol_idx:
+                t0 = min(anns0.onset[i] for i in vol_idx)
+                if isinstance(t0, (int, float)) and t0 > 0:
+                    # Crop so that time 0 aligns with the first detected volume trigger
+                    print(
+                        f"Trimming raw to first volume trigger at {t0:.3f}s relative to recording start."
+                    )
+                    raw.crop(tmin=float(t0), tmax=None)
+                    did_trim = True
 
     # If we trimmed/cropped the raw, preload to memory so write_raw_bids can write the modified data
     if did_trim and not raw.preload:
@@ -167,34 +162,30 @@ def convert_one(
     prefixes = event_prefixes if event_prefixes is not None else ["Trig_therm"]
     norm_prefixes = [_norm(p) for p in prefixes if str(p).strip() != ""]
     anns = raw.annotations
-    try:
-        if len(anns) > 0 and not keep_all_annotations:
-            keep_idx = [
-                i
-                for i, d in enumerate(anns.description)
-                if any(_norm(d).startswith(tp) for tp in norm_prefixes)
-            ]
-            if keep_idx:
-                new_onset = [anns.onset[i] for i in keep_idx]
-                new_duration = [anns.duration[i] for i in keep_idx]
-                new_desc = [anns.description[i] for i in keep_idx]
-                # Optionally zero-base onsets
-                if zero_base_onsets and len(new_onset) > 0:
-                    base = new_onset[0]
-                    new_onset = [o - base for o in new_onset]
-                new_anns = mne.Annotations(
-                    onset=new_onset,
-                    duration=new_duration,
-                    description=new_desc,
-                    orig_time=anns.orig_time,
-                )
-                raw.set_annotations(new_anns)
-            else:
-                # No matches found: clear annotations so nothing gets written
-                raw.set_annotations(mne.Annotations([], [], [], orig_time=anns.orig_time))
-    except Exception:
-        # If annotation filtering fails, proceed with whatever annotations exist
-        pass
+    if len(anns) > 0 and not keep_all_annotations:
+        keep_idx = [
+            i
+            for i, d in enumerate(anns.description)
+            if any(_norm(d).startswith(tp) for tp in norm_prefixes)
+        ]
+        if keep_idx:
+            new_onset = [anns.onset[i] for i in keep_idx]
+            new_duration = [anns.duration[i] for i in keep_idx]
+            new_desc = [anns.description[i] for i in keep_idx]
+            # Optionally zero-base onsets
+            if zero_base_onsets and len(new_onset) > 0:
+                base = new_onset[0]
+                new_onset = [o - base for o in new_onset]
+            new_anns = mne.Annotations(
+                onset=new_onset,
+                duration=new_duration,
+                description=new_desc,
+                orig_time=anns.orig_time,
+            )
+            raw.set_annotations(new_anns)
+        else:
+            # No matches found: clear annotations so nothing gets written
+            raw.set_annotations(mne.Annotations([], [], [], orig_time=anns.orig_time))
 
     bids_path = BIDSPath(
         subject=sub_label,
