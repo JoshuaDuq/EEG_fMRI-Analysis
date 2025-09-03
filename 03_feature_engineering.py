@@ -497,6 +497,57 @@ def plot_power_distributions(pow_df: pd.DataFrame, bands: List[str], subject: st
             plt.close(fig)
 
 
+def plot_power_distributions_group(
+    pow_df: pd.DataFrame, bands: List[str], save_dir: Path
+) -> None:
+    """Violin plots of band power pooled across all subjects and trials."""
+    logger = logging.getLogger("group_power_distributions")
+    try:
+        n_bands = len(bands)
+        n_cols = 2
+        n_rows = (n_bands + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4 * n_rows))
+        if n_bands == 1:
+            axes = [axes]
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        axes = axes.flatten()
+
+        for i, band in enumerate(bands):
+            band_cols = [c for c in pow_df.columns if c.startswith(f"pow_{band}_")]
+            if not band_cols:
+                continue
+            band_data = pow_df[band_cols].to_numpy().ravel()
+            band_data = band_data[~np.isnan(band_data)]
+            if band_data.size == 0:
+                continue
+            parts = axes[i].violinplot([band_data], positions=[1], showmeans=True, showmedians=True)
+            band_color = (
+                getattr(config.visualization.band_colors, band, "#1f77b4")
+                if hasattr(config.visualization, "band_colors")
+                else "#1f77b4"
+            )
+            for pc in parts["bodies"]:
+                pc.set_facecolor(band_color)
+                pc.set_alpha(0.7)
+            axes[i].axhline(0, color="red", linestyle="--", alpha=0.7)
+            axes[i].set_title(f"{band.capitalize()} Power Distribution")
+            axes[i].set_ylabel("log10(power/baseline)")
+            axes[i].set_xticks([])
+            axes[i].grid(True, alpha=0.3)
+
+        for j in range(len(bands), len(axes)):
+            axes[j].set_visible(False)
+        fig.suptitle("Band power distributions (all subjects)")
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+        _save_fig(fig, save_dir / "group_power_distributions_per_band")
+        plt.close(fig)
+    except Exception as e:
+        logger.error(f"Failed to create group power distributions: {e}")
+        if 'fig' in locals():
+            plt.close(fig)
+
+
 def plot_channel_power_heatmap(pow_df: pd.DataFrame, bands: List[str], subject: str, save_dir: Path, logger: logging.Logger):
     """Heatmap showing mean power values across channels and bands."""
     try:
@@ -1267,11 +1318,50 @@ def process_subject(subject: str, task: str = TASK) -> None:
     )
 
 
-def main(subjects: Optional[List[str]] = None, task: str = TASK):
+def aggregate_group_level(subjects: List[str], task: str = TASK) -> None:
+    """Concatenate per-subject feature matrices and save group-level summaries."""
+    group_dir = DERIV_ROOT / "group" / "eeg" / "features"
+    _ensure_dir(group_dir)
+    X_list: List[pd.DataFrame] = []
+    y_list: List[pd.DataFrame] = []
+    for sub in subjects:
+        fdir = DERIV_ROOT / f"sub-{sub}" / "eeg" / "features"
+        x_path = fdir / "features_all.tsv"
+        y_path = fdir / "target_vas_ratings.tsv"
+        if x_path.exists():
+            df = pd.read_csv(x_path, sep="\t")
+            df["subject"] = sub
+            X_list.append(df)
+        if y_path.exists():
+            dfy = pd.read_csv(y_path, sep="\t")
+            dfy["subject"] = sub
+            y_list.append(dfy)
+    if X_list:
+        Xg = pd.concat(X_list, ignore_index=True)
+        Xg.to_csv(group_dir / "features_all.tsv", sep="\t", index=False)
+        try:
+            plot_power_distributions_group(Xg, POWER_BANDS, group_dir)
+        except Exception:
+            pass
+        try:
+            corr = Xg.drop(columns=["subject"]).corr()
+            fig, ax = plt.subplots(figsize=(6, 5))
+            sns.heatmap(corr, ax=ax, cmap="viridis", center=0)
+            ax.set_title("Feature correlation (all subjects)")
+            _save_fig(fig, group_dir / "group_feature_correlation")
+        except Exception:
+            pass
+    if y_list:
+        yg = pd.concat(y_list, ignore_index=True)
+        yg.to_csv(group_dir / "target_vas_ratings.tsv", sep="\t", index=False)
+
+def main(subjects: Optional[List[str]] = None, task: str = TASK, do_group: bool = False):
     if subjects is None or subjects == ["all"]:
         subjects = SUBJECTS
     for sub in subjects:
         process_subject(sub, task)
+    if do_group or len(subjects) > 1:
+        aggregate_group_level(subjects, task)
 
 
 if __name__ == "__main__":
@@ -1279,6 +1369,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="EEG feature engineering: power + connectivity")
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
+    parser.add_argument(
+        "--subjects",
+        nargs="*",
+        default=None,
+        help="Subject IDs or 'all' for all configured subjects",
+    )
+    parser.add_argument(
+        "--do-group",
+        action="store_true",
+        help="Force concatenation even for a single subject (default when multiple subjects)",
+    )
     args = parser.parse_args()
 
-    main(task=args.task)
+    main(subjects=args.subjects, task=args.task, do_group=args.do_group)

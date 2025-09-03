@@ -8,6 +8,7 @@ This repository contains a comprehensive EEG analysis pipeline built on top of M
 - **Feature Engineering**: Extract ML-ready features from EEG power and connectivity
 - **Behavioral Analysis**: Correlate EEG features with behavioral measures using advanced statistical methods
 - **Pain Decoding**: State-of-the-art machine learning models with rigorous cross-validation and statistical validation
+- **Group-Level Support**: Core analysis scripts (01–04) accept multiple subjects and aggregate results to produce grand-average statistics and visualizations
 
 All scripts live in `eeg_pipeline/` and write outputs into a BIDS-style tree under `eeg_pipeline/bids_output/` and its `derivatives/` subfolder.
 
@@ -407,6 +408,8 @@ Arguments:
 - `--group` (flag): Also aggregate group-level results across subjects.
 - `--group-only` (flag): Only run group-level aggregation, skip per-subject analysis.
 - `--report` (flag): Build per-subject MNE HTML report.
+
+Group-level runs merge per-subject ROI power correlations for both pain ratings and stimulus temperature, and summarize connectivity ROI statistics across participants with FDR correction.
 
 **Detailed Analysis Pipeline:**
 

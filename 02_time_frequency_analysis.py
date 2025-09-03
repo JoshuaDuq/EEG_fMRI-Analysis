@@ -2,7 +2,7 @@ import os
 import sys
 import re
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import logging
 
 import matplotlib
@@ -2001,9 +2001,13 @@ def contrast_pain_nonpain_rois(
             print(f"ROI {roi} contrast failed: {e}")
 
 
-def main(subject: str = "001", task: str = DEFAULT_TASK,
-         plateau_tmin: float = DEFAULT_PLATEAU_TMIN, plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
-         temperature_strategy: str = DEFAULT_TEMPERATURE_STRATEGY) -> None:
+def process_subject(
+    subject: str = "001",
+    task: str = DEFAULT_TASK,
+    plateau_tmin: float = DEFAULT_PLATEAU_TMIN,
+    plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
+    temperature_strategy: str = DEFAULT_TEMPERATURE_STRATEGY,
+) -> Optional[mne.time_frequency.AverageTFR]:
     logger = _setup_logging(subject)
     logger.info(f"=== Time-frequency analysis: sub-{subject}, task-{task} ===")
     plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / "02_time_frequency_analysis"
@@ -2146,6 +2150,11 @@ def main(subject: str = "001", task: str = DEFAULT_TASK,
             logger.warning(f"QC baseline/plateau failed: {e}")
         else:
             print(f"QC baseline/plateau failed: {e}")
+
+    # Baseline correct a copy for group-level averaging
+    power_copy = power.copy()
+    _apply_baseline_safe(power_copy, baseline=BASELINE, logger=logger)
+    tfr_avg = power_copy.average()
 
     # Optionally run pooled (no temperature discrimination)
     if temperature_strategy in ("pooled", "both"):
@@ -2319,14 +2328,93 @@ def main(subject: str = "001", task: str = DEFAULT_TASK,
         logger.info(msg)
     else:
         print(msg)
+    return tfr_avg
+
+
+def aggregate_group_level(
+    tfrs: List[mne.time_frequency.AverageTFR],
+    plateau_tmin: float = DEFAULT_PLATEAU_TMIN,
+    plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
+) -> None:
+    """Compute grand-average TFRs across subjects and save group plots."""
+    if not tfrs:
+        return
+    out_dir = DERIV_ROOT / "group" / "eeg" / "plots" / "02_time_frequency_analysis"
+    _ensure_dir(out_dir)
+    grand = mne.grand_average(tfrs)
+    cz = _pick_central_channel(grand.info, preferred="Cz")
+    try:
+        fig = grand.plot(picks=cz, show=False)
+        _save_fig(fig, out_dir, f"group_tfr_{cz}.png")
+    except Exception:
+        pass
+    for band, (fmin, fmax) in BAND_BOUNDS.items():
+        try:
+            tfr_band = grand.copy().crop(fmin=fmin, fmax=fmax, tmin=plateau_tmin, tmax=plateau_tmax)
+            evk = tfr_band.average()
+            evk_mean = mne.EvokedArray(evk.data.mean(axis=1, keepdims=True), evk.info, tmin=0)
+            fig = evk_mean.plot_topomap(times=0, show=False)
+            _save_fig(fig, out_dir, f"group_topomap_{band}.png")
+        except Exception:
+            continue
+
+
+def main(
+    subjects: Optional[List[str]] = None,
+    task: str = DEFAULT_TASK,
+    plateau_tmin: float = DEFAULT_PLATEAU_TMIN,
+    plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
+    temperature_strategy: str = DEFAULT_TEMPERATURE_STRATEGY,
+    do_group: bool = False,
+) -> None:
+    if subjects is None or subjects == ["all"]:
+        subjects = SUBJECTS
+    tfrs: List[mne.time_frequency.AverageTFR] = []
+    for sub in subjects:
+        tfr_avg = process_subject(
+            subject=sub,
+            task=task,
+            plateau_tmin=plateau_tmin,
+            plateau_tmax=plateau_tmax,
+            temperature_strategy=temperature_strategy,
+        )
+        if tfr_avg is not None:
+            tfrs.append(tfr_avg)
+    if do_group or len(tfrs) > 1:
+        aggregate_group_level(tfrs, plateau_tmin=plateau_tmin, plateau_tmax=plateau_tmax)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Time-frequency analysis for one subject")
-    parser.add_argument("--subject", "-s", type=str, default=(SUBJECTS[0] if isinstance(SUBJECTS, (list, tuple)) and len(SUBJECTS) > 0 else "001"), help="BIDS subject label without 'sub-' prefix (e.g., 001)")
-    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label (default from config)")
+    parser = argparse.ArgumentParser(description="Time-frequency analysis")
+    parser.add_argument(
+        "--subjects",
+        nargs="*",
+        default=None,
+        help="Subject IDs (e.g., 001 002) or 'all'",
+    )
+    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label")
+    parser.add_argument("--plateau-tmin", type=float, default=DEFAULT_PLATEAU_TMIN)
+    parser.add_argument("--plateau-tmax", type=float, default=DEFAULT_PLATEAU_TMAX)
+    parser.add_argument(
+        "--temperature-strategy",
+        type=str,
+        default=DEFAULT_TEMPERATURE_STRATEGY,
+        help="'pooled', 'per', or 'both'",
+    )
+    parser.add_argument(
+        "--do-group",
+        action="store_true",
+        help="Force grand-average TFR even for a single subject (default when multiple subjects)",
+    )
     args = parser.parse_args()
 
-    main(subject=args.subject, task=args.task)
+    main(
+        subjects=args.subjects,
+        task=args.task,
+        plateau_tmin=args.plateau_tmin,
+        plateau_tmax=args.plateau_tmax,
+        temperature_strategy=args.temperature_strategy,
+        do_group=args.do_group,
+    )
