@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import logging
 
 import matplotlib
@@ -199,7 +199,9 @@ def _maybe_crop_epochs(
     return ep.crop(tmin=tmin, tmax=tmax, include_tmax=INCLUDE_TMAX_IN_CROP)
 
 
-def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
+def erp_contrast_pain(
+    epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None
+) -> Optional[Dict[str, mne.Evoked]]:
     # Prefer MNE metadata-based selection
     if epochs.metadata is None:
         msg = "ERP pain contrast: epochs.metadata is missing; skipping."
@@ -207,7 +209,7 @@ def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[loggin
             logger.warning(msg)
         else:
             print(msg)
-        return
+        return None
     col = None
     for candidate in PAIN_COLUMNS:
         if candidate in epochs.metadata.columns:
@@ -219,7 +221,7 @@ def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[loggin
             logger.warning(msg)
         else:
             print(msg)
-        return
+        return None
 
     # Build selections using MNE metadata query
     try:
@@ -238,7 +240,7 @@ def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[loggin
             logger.warning(msg)
         else:
             print(msg)
-        return
+        return None
 
     ev_pain = ep_pain.average(picks=ERP_PICKS)
     ev_non = ep_non.average(picks=ERP_PICKS)
@@ -281,15 +283,19 @@ def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[loggin
         else:
             print(msg)
 
+    return {"painful": ev_pain, "non-painful": ev_non}
 
-def erp_by_temperature(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
+
+def erp_by_temperature(
+    epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None
+) -> Optional[Dict[str, mne.Evoked]]:
     if epochs.metadata is None:
         msg = "ERP by temperature: epochs.metadata is missing; skipping."
         if logger:
             logger.warning(msg)
         else:
             print(msg)
-        return
+        return None
     col = None
     for candidate in TEMPERATURE_COLUMNS:
         if candidate in epochs.metadata.columns:
@@ -301,7 +307,7 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path, logger: Optional[loggi
             logger.warning(msg)
         else:
             print(msg)
-        return
+        return None
 
     # Determine unique, sensibly sorted levels
     levels_series = epochs.metadata[col]
@@ -343,7 +349,7 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path, logger: Optional[loggi
             logger.warning(msg)
         else:
             print(msg)
-        return
+        return None
 
     # One plot per temperature level (Evoked butterfly) with title
     for label, evk in evokeds.items():
@@ -382,23 +388,15 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path, logger: Optional[loggi
         else:
             print(msg)
 
+    return evokeds
 
-def main(
-    subject: Optional[str] = None,
+
+def process_subject(
+    subject: str,
     task: str = DEFAULT_TASK,
     crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
     crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
-) -> None:
-    # Resolve subject strictly from config if not provided
-    if subject is None:
-        subs = getattr(config, "subjects", [])
-        if isinstance(subs, list) and len(subs) > 0:
-            subject = subs[0]
-        else:
-            raise ValueError(
-                "No subject provided and config.project.subjects is empty or missing. "
-                "Pass --subject or set project.subjects in eeg_config.yaml."
-            )
+) -> Optional[Dict[str, Any]]:
     logger = _setup_logging(subject)
     logger.info(f"=== Foundational analysis: sub-{subject}, task-{task} ===")
     # Resolve paths
@@ -497,31 +495,143 @@ def main(
     if crop_tmin is not None or crop_tmax is not None:
         epochs = _maybe_crop_epochs(epochs, crop_tmin, crop_tmax, logger)
 
-    # ERP: pain vs non-pain and by temperature (requires metadata)
+    pain_evokeds = None
+    temp_evokeds = None
     if events_df is not None and epochs.metadata is not None:
-        erp_contrast_pain(epochs, plots_dir, logger)
-        erp_by_temperature(epochs, plots_dir, logger)
+        pain_evokeds = erp_contrast_pain(epochs, plots_dir, logger)
+        temp_evokeds = erp_by_temperature(epochs, plots_dir, logger)
 
     msg = "Done."
     if logger:
         logger.info(msg)
     else:
         print(msg)
+    return {"subject": subject, "pain_evokeds": pain_evokeds, "temp_evokeds": temp_evokeds}
+
+
+def aggregate_group_level(results: List[Dict[str, Any]]) -> None:
+    """Grand-average ERP data across subjects and generate group plots."""
+    if not results:
+        return
+    out_dir = DERIV_ROOT / "group" / "eeg" / "plots" / PLOTS_SUBDIR
+    _ensure_dir(out_dir)
+
+    pain_painful: List[mne.Evoked] = []
+    pain_non: List[mne.Evoked] = []
+    temp_map: Dict[str, List[mne.Evoked]] = {}
+    for res in results:
+        pe = res.get("pain_evokeds") or {}
+        if "painful" in pe and "non-painful" in pe:
+            pain_painful.append(pe["painful"])
+            pain_non.append(pe["non-painful"])
+        te = res.get("temp_evokeds") or {}
+        for label, evk in te.items():
+            temp_map.setdefault(label, []).append(evk)
+
+    if pain_painful and pain_non:
+        g_pain = mne.grand_average(pain_painful)
+        g_non = mne.grand_average(pain_non)
+        try:
+            fig = mne.viz.plot_compare_evokeds(
+                {"painful": g_pain, "non-painful": g_non},
+                picks=ERP_PICKS,
+                combine=ERP_COMBINE,
+                show=False,
+                colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
+            )
+            if isinstance(fig, list):
+                fig = fig[0]
+            _save_fig(fig, out_dir, "group_pain_gfp.png")
+        except Exception:
+            pass
+        try:
+            fig = mne.viz.plot_compare_evokeds(
+                {"painful": g_pain, "non-painful": g_non},
+                picks=ERP_PICKS,
+                combine=None,
+                show=False,
+                colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
+            )
+            if isinstance(fig, list):
+                fig = fig[0]
+            _save_fig(fig, out_dir, "group_pain_butterfly.png")
+        except Exception:
+            pass
+
+    if temp_map:
+        grand_temps: Dict[str, mne.Evoked] = {
+            label: mne.grand_average(evs) for label, evs in temp_map.items()
+        }
+        for label, evk in grand_temps.items():
+            try:
+                fig = evk.plot(picks=ERP_PICKS, spatial_colors=True, show=False)
+                try:
+                    fig.suptitle(f"ERP - Temperature {label}")
+                except Exception:
+                    pass
+                safe_label = (
+                    str(label).replace(" ", "_").replace("/", "-").replace("\\", "-")
+                )
+                _save_fig(fig, out_dir, f"group_temp_{safe_label}_butterfly.png")
+            except Exception:
+                pass
+        try:
+            fig = mne.viz.plot_compare_evokeds(
+                grand_temps,
+                picks=ERP_PICKS,
+                combine=ERP_COMBINE,
+                show=False,
+            )
+            if isinstance(fig, list):
+                fig = fig[0]
+            _save_fig(fig, out_dir, "group_temp_gfp.png")
+        except Exception:
+            pass
+
+
+def main(
+    subjects: Optional[List[str]] = None,
+    task: str = DEFAULT_TASK,
+    crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
+    crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
+    do_group: bool = False,
+) -> None:
+    if subjects is None or subjects == ["all"]:
+        subs = getattr(config, "subjects", [])
+        if not subs:
+            raise ValueError(
+                "No subjects provided and config.project.subjects is empty."
+            )
+        subjects = subs
+
+    results: List[Dict[str, Any]] = []
+    for sub in subjects:
+        res = process_subject(sub, task, crop_tmin=crop_tmin, crop_tmax=crop_tmax)
+        if res:
+            results.append(res)
+
+    if do_group or len(results) > 1:
+        aggregate_group_level(results)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Foundational EEG ERP analysis for one subject")
+    parser = argparse.ArgumentParser(description="Foundational EEG ERP analysis")
     parser.add_argument(
-        "--subject", "-s", type=str,
+        "--subjects",
+        nargs="*",
         default=None,
-        help=(
-            "BIDS subject label without 'sub-' prefix (e.g., 0000). "
-            "If omitted, uses the first entry in project.subjects from eeg_config.yaml."
-        ),
+        help="Subject IDs (e.g., 001 002) or 'all' for all configured subjects",
     )
-    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label (default from config)")
+    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label")
+    parser.add_argument("--crop-tmin", type=float, default=DEFAULT_CROP_TMIN, help="Epoch crop start")
+    parser.add_argument("--crop-tmax", type=float, default=DEFAULT_CROP_TMAX, help="Epoch crop end")
+    parser.add_argument(
+        "--do-group",
+        action="store_true",
+        help="Force grand-average ERPs even for a single subject (default when multiple subjects)",
+    )
     args = parser.parse_args()
 
-    main(subject=args.subject, task=args.task)
+    main(subjects=args.subjects, task=args.task, crop_tmin=args.crop_tmin, crop_tmax=args.crop_tmax, do_group=args.do_group)

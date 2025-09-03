@@ -2610,6 +2610,121 @@ def plot_top_behavioral_predictors(
             plt.close(fig)
 
 
+def plot_top_behavioral_predictors_group(
+    df: pd.DataFrame,
+    plots_dir: Path,
+    stats_dir: Path,
+    alpha: float = 0.05,
+    top_n: int = 20,
+) -> None:
+    """Plot group-level top N significant behavioral predictors.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Aggregated correlation statistics with columns ``channel``, ``band``,
+        ``r_group`` and ``p_group``.
+    plots_dir : Path
+        Output directory for plots.
+    stats_dir : Path
+        Output directory for exported TSV data.
+    alpha : float
+        Significance threshold (default 0.05).
+    top_n : int
+        Number of top predictors to show (default 20).
+    """
+    logger = logging.getLogger("group_top_behavioral_predictors")
+
+    if df.empty:
+        logger.warning("No correlation statistics provided for group plot")
+        return
+
+    df_sig = df[
+        (df["p_group"] <= alpha)
+        & df["r_group"].notna()
+        & df["channel"].notna()
+        & df["band"].notna()
+    ].copy()
+    if df_sig.empty:
+        logger.warning(f"No significant correlations found (p_group <= {alpha})")
+        return
+
+    df_sig["abs_r"] = df_sig["r_group"].abs()
+    df_top = df_sig.nlargest(top_n, "abs_r")
+    if df_top.empty:
+        logger.warning("No top correlations to plot")
+        return
+
+    df_top["predictor"] = df_top["channel"] + " (" + df_top["band"] + ")"
+    df_top = df_top.sort_values("abs_r", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(10, max(8, df_top.shape[0] * 0.4)))
+
+    band_colors: Dict[str, str] = {}
+    fallback_colors = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+    for idx, band in enumerate(df_top["band"].unique()):
+        band_colors[band] = BAND_COLORS.get(band, fallback_colors[idx % len(fallback_colors)])
+    colors = [band_colors[b] for b in df_top["band"]]
+
+    y_pos = np.arange(len(df_top))
+    ax.barh(
+        y_pos,
+        df_top["abs_r"],
+        color=colors,
+        alpha=0.8,
+        edgecolor="black",
+        linewidth=0.5,
+    )
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(df_top["predictor"], fontsize=11)
+    ax.set_xlabel("|Group r| with Behavior (p < 0.05)", fontweight="bold", fontsize=12)
+    ax.set_title(
+        f"Top {df_top.shape[0]} Significant Behavioral Predictors (Group)",
+        fontweight="bold",
+        fontsize=14,
+        pad=20,
+    )
+
+    for i, row in enumerate(df_top.itertuples(index=False)):
+        ax.text(
+            row.abs_r + 0.01,
+            i,
+            f"{row.abs_r:.3f} (p={row.p_group:.3f})",
+            va="center",
+            ha="left",
+            fontsize=10,
+        )
+
+    ax.set_xlim(0, df_top["abs_r"].max() * 1.25)
+    ax.grid(True, axis="x", alpha=0.3, linestyle="-", linewidth=0.5)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+
+    output_plot = plots_dir / f"group_top_{top_n}_behavioral_predictors"
+    _save_fig(fig, output_plot)
+
+    df_top_export = df_top[
+        ["predictor", "channel", "band", "r_group", "abs_r", "p_group", "n_subjects"]
+    ].sort_values("abs_r", ascending=False)
+    df_top_export.to_csv(
+        stats_dir / f"group_top_{top_n}_behavioral_predictors.tsv",
+        sep="\t",
+        index=False,
+    )
+
+
 # Connectivity ROI summary correlations (within/between ROI averages)
 # -----------------------------------------------------------------------------
 
@@ -4138,6 +4253,80 @@ def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK
         except (ValueError, KeyError, OSError):
             pass
 
+    # 1b) ROI power vs temperature
+    by_key = {}
+    for sub in subjects:
+        f = _stats_dir(sub) / "corr_stats_pow_roi_vs_temp.tsv"
+        if not f.exists():
+            continue
+        df = pd.read_csv(f, sep="\t")
+        for _, row in df.iterrows():
+            key = (str(row.get("roi")), str(row.get("band")))
+            r = row.get("r")
+            try:
+                r = float(r)
+            except (ValueError, TypeError):
+                r = np.nan
+            by_key.setdefault(key, []).append(r)
+    if by_key:
+        recs = []
+        for (roi, band), rs in by_key.items():
+            r_grp, ci_l, ci_h, n = _fisher_aggregate(rs)
+            recs.append(
+                {
+                    "roi": roi,
+                    "band": band,
+                    "r_group": r_grp,
+                    "r_ci_low": ci_l,
+                    "r_ci_high": ci_h,
+                    "n_subjects": n,
+                }
+            )
+        dfg = pd.DataFrame(recs)
+        pvals = []
+        for (roi, band), rs in by_key.items():
+            vals = np.array([r for r in rs if np.isfinite(r)])
+            vals = np.clip(vals, -0.999999, 0.999999)
+            n = vals.size
+            if n < 2:
+                pvals.append(np.nan)
+                continue
+            z = np.arctanh(vals)
+            tstat, p = stats.ttest_1samp(z, popmean=0.0)
+            pvals.append(float(p))
+        dfg["p_group"] = pvals
+        out_rows = []
+        for band in sorted(dfg["band"].unique()):
+            dfb = dfg[dfg["band"] == band].copy()
+            rej, crit = _fdr_bh(dfb["p_group"].to_numpy(), alpha=0.05)
+            dfb["fdr_reject"] = rej
+            dfb["fdr_crit_p"] = crit
+            out_rows.append(dfb)
+        dfg2 = pd.concat(out_rows, ignore_index=True)
+        dfg2.to_csv(gstats / "group_corr_pow_roi_vs_temp.tsv", sep="\t", index=False)
+        try:
+            for band in sorted(dfg2["band"].unique()):
+                dfb = dfg2[dfg2["band"] == band]
+                fig, ax = plt.subplots(figsize=(6, 3.2))
+                order = sorted(dfb["roi"].unique())
+                sns.barplot(data=dfb, x="roi", y="r_group", order=order, color="steelblue", ax=ax)
+                for i, roi in enumerate(order):
+                    row = dfb[dfb["roi"] == roi].iloc[0]
+                    yv = row["r_group"]
+                    yerr_low = yv - row["r_ci_low"] if np.isfinite(row["r_ci_low"]) else 0
+                    yerr_high = row["r_ci_high"] - yv if np.isfinite(row["r_ci_high"]) else 0
+                    ax.errorbar(i, yv, yerr=[[yerr_low], [yerr_high]], fmt="none", ecolor="k", capsize=3)
+                ax.set_ylabel("Group r (Fisher back-transformed)")
+                ax.set_xlabel("ROI")
+                band_rng = FEATURES_FREQ_BANDS.get(band)
+                band_label = f"{band} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng is not None else band
+                ax.set_title(f"Group ROI power vs temperature: {band_label}")
+                ax.axhline(0, color="k", linewidth=0.8)
+                fig.tight_layout()
+                _save_fig(fig, gplots / f"group_roi_power_vs_temp_{_sanitize(band)}")
+        except (ValueError, KeyError, OSError):
+            pass
+
     # 2) Connectivity ROI summaries per measure_band
     # Collect per subject files by measure_band
     per_pref: Dict[str, List[pd.DataFrame]] = {}
@@ -4183,6 +4372,99 @@ def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK
         out_df["fdr_reject"] = rej
         out_df["fdr_crit_p"] = crit
         out_df.to_csv(gstats / f"group_corr_conn_roi_summary_{_sanitize(pref)}_vs_rating.tsv", sep="\t", index=False)
+
+    # Connectivity ROI summaries vs temperature
+    per_pref = {}
+    for sub in subjects:
+        subj_stats = _stats_dir(sub)
+        if not subj_stats.exists():
+            continue
+        for f in subj_stats.glob("corr_stats_conn_roi_summary_*_vs_temp.tsv"):
+            try:
+                df = pd.read_csv(f, sep="\t")
+            except (FileNotFoundError, OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+            if df.empty or "measure_band" not in df.columns:
+                continue
+            per_pref.setdefault(str(df["measure_band"].iloc[0]), []).append(df)
+    for pref, dfs in per_pref.items():
+        cat = pd.concat(dfs, ignore_index=True)
+        out_rows = []
+        for (roi_i, roi_j), grp in cat.groupby(["roi_i", "roi_j"], dropna=False):
+            rs = grp["r"].to_numpy(dtype=float)
+            r_grp, ci_l, ci_h, n = _fisher_aggregate(rs.tolist())
+            vals = np.clip(rs[np.isfinite(rs)], -0.999999, 0.999999)
+            if vals.size >= 2:
+                tstat, p = stats.ttest_1samp(np.arctanh(vals), popmean=0.0)
+                pval = float(p)
+            else:
+                pval = np.nan
+            out_rows.append(
+                {
+                    "measure_band": pref,
+                    "roi_i": roi_i,
+                    "roi_j": roi_j,
+                    "summary_type": "within" if roi_i == roi_j else "between",
+                    "r_group": r_grp,
+                    "r_ci_low": ci_l,
+                    "r_ci_high": ci_h,
+                    "n_subjects": n,
+                    "p_group": pval,
+                }
+            )
+        out_df = pd.DataFrame(out_rows)
+        rej, crit = _fdr_bh(out_df["p_group"].to_numpy(), alpha=0.05)
+        out_df["fdr_reject"] = rej
+        out_df["fdr_crit_p"] = crit
+        out_df.to_csv(gstats / f"group_corr_conn_roi_summary_{_sanitize(pref)}_vs_temp.tsv", sep="\t", index=False)
+
+
+    # 3) Top behavioral predictors (power features)
+    comb: Dict[Tuple[str, str], List[float]] = {}
+    for sub in subjects:
+        f = _stats_dir(sub) / "corr_stats_pow_combined_vs_rating.tsv"
+        if not f.exists():
+            continue
+        try:
+            df = pd.read_csv(f, sep="\t")
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            continue
+        for _, row in df.iterrows():
+            key = (str(row.get("channel")), str(row.get("band")))
+            r = row.get("r")
+            try:
+                r = float(r)
+            except (ValueError, TypeError):
+                r = np.nan
+            comb.setdefault(key, []).append(r)
+    if comb:
+        rows = []
+        for (ch, band), rs in comb.items():
+            r_grp, ci_l, ci_h, n = _fisher_aggregate(rs)
+            vals = np.array([r for r in rs if np.isfinite(r)])
+            vals = np.clip(vals, -0.999999, 0.999999)
+            if vals.size >= 2:
+                tstat, p = stats.ttest_1samp(np.arctanh(vals), popmean=0.0)
+                pval = float(p)
+            else:
+                pval = np.nan
+            rows.append(
+                {
+                    "channel": ch,
+                    "band": band,
+                    "r_group": r_grp,
+                    "r_ci_low": ci_l,
+                    "r_ci_high": ci_h,
+                    "n_subjects": n,
+                    "p_group": pval,
+                }
+            )
+        df_grp = pd.DataFrame(rows)
+        rej, crit = _fdr_bh(df_grp["p_group"].to_numpy(), alpha=0.05)
+        df_grp["fdr_reject"] = rej
+        df_grp["fdr_crit_p"] = crit
+        df_grp.to_csv(gstats / "group_corr_stats_pow_combined_vs_rating.tsv", sep="\t", index=False)
+        plot_top_behavioral_predictors_group(df_grp, gplots, gstats)
 
 
 def build_subject_report(subject: str, task: str = TASK) -> None:
@@ -4266,7 +4548,7 @@ def main(
                 build_report=build_reports,
                 rng_seed=rng_seed,
             )
-    if do_group or group_only:
+    if do_group or group_only or len(subjects) > 1:
         aggregate_group_level(subjects, task)
 
 
