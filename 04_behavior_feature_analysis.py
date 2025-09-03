@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import itertools
 import logging
+import hashlib
 
 import matplotlib
 matplotlib.use("Agg")  # headless-friendly
@@ -460,6 +461,7 @@ def correlate_power_roi_stats(
     partial_covars: Optional[List[str]] = None,
     bootstrap: int = 0,
     n_perm: int = 0,
+    seed: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
 ) -> None:
     logger = _setup_logging(subject)
@@ -471,7 +473,10 @@ def correlate_power_roi_stats(
 
     # Initialize RNG if not provided
     if rng is None:
-        rng = np.random.default_rng(42)
+        if seed is None:
+            # Stable hash ensures subject-specific reproducibility
+            seed = int(hashlib.sha256(subject.encode("utf-8")).hexdigest()[:8], 16)
+        rng = np.random.default_rng(seed)
 
     # Load power features, target ratings, and sensor info
     pow_df, _conn_df, y, info = _load_features_and_targets(subject, task)
@@ -698,17 +703,17 @@ def correlate_power_roi_stats(
                 p_partial_perm = np.nan
                 p_partial_given_temp_perm = np.nan
                 if n_perm and n_eff >= 5:
-                    p_perm = _perm_pval_simple(x, y_r, method, int(n_perm), rng)
+                    p_perm = _perm_pval_simple(x, y_r, method, int(n_perm), rng=rng)
                     if Z_df_full is not None and len(Z_df_full) > 0:
                         n_len_pt = min(len(x), len(y_r), len(Z_df_full))
                         p_partial_perm = _perm_pval_partial_FL(
-                            x.iloc[:n_len_pt], y_r.iloc[:n_len_pt], Z_df_full.iloc[:n_len_pt], method, int(n_perm), rng
+                            x.iloc[:n_len_pt], y_r.iloc[:n_len_pt], Z_df_full.iloc[:n_len_pt], method, int(n_perm), rng=rng
                         )
                     if temp_series is not None and len(temp_series) > 0:
                         n_len_tmp = min(len(x), len(y_r), len(temp_series))
                         df_tmp = pd.DataFrame({"temp": temp_series.iloc[:n_len_tmp]})
                         p_partial_given_temp_perm = _perm_pval_partial_FL(
-                            x.iloc[:n_len_tmp], y_r.iloc[:n_len_tmp], df_tmp.iloc[:n_len_tmp], method, int(n_perm), rng
+                            x.iloc[:n_len_tmp], y_r.iloc[:n_len_tmp], df_tmp.iloc[:n_len_tmp], method, int(n_perm), rng=rng
                         )
 
                 recs_rating.append({
@@ -785,11 +790,11 @@ def correlate_power_roi_stats(
                     p2_perm = np.nan
                     p2_partial_perm = np.nan
                     if n_perm and n_eff2 >= 5:
-                        p2_perm = _perm_pval_simple(x2, t2, method2, int(n_perm), rng)
+                        p2_perm = _perm_pval_simple(x2, t2, method2, int(n_perm), rng=rng)
                         if Z_df_temp is not None and len(Z_df_temp) > 0:
                             n_len_pt2 = min(len(x2), len(t2), len(Z_df_temp))
                             p2_partial_perm = _perm_pval_partial_FL(
-                                x2.iloc[:n_len_pt2], t2.iloc[:n_len_pt2], Z_df_temp.iloc[:n_len_pt2], method2, int(n_perm), rng
+                                x2.iloc[:n_len_pt2], t2.iloc[:n_len_pt2], Z_df_temp.iloc[:n_len_pt2], method2, int(n_perm), rng=rng
                             )
 
                     recs_temp.append({
@@ -4015,13 +4020,15 @@ def process_subject(
     bootstrap: int = 0,
     n_perm: int = 0,
     build_report: bool = False,
-    rng_seed: int = 42,
+    rng_seed: Optional[int] = 42,
 ) -> None:
     logger = _setup_logging(subject)
     logger.info(f"=== Behavior-feature analyses: sub-{subject}, task-{task} ===")
     
-    # Initialize shared RNG for consistent but independent randomization across functions
-    rng = np.random.default_rng(rng_seed)
+    # Initialize shared RNG for consistent but subject-specific randomization across functions
+    subj_hash = int(hashlib.sha256(subject.encode("utf-8")).hexdigest()[:8], 16)
+    combined_seed = (rng_seed + subj_hash) % (2**32) if rng_seed is not None else subj_hash
+    rng = np.random.default_rng(combined_seed)
     try:
         plot_psychometrics(subject, task)
     except Exception as e:
