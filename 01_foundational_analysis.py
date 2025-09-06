@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
 
 import matplotlib
@@ -11,6 +11,9 @@ import numpy as np
 import pandas as pd
 import mne
 from mne_bids import BIDSPath
+
+# Strict alignment utilities
+from alignment_utils import align_events_to_epochs_strict, validate_alignment
 
 # Load centralized configuration
 from config_loader import load_config, get_legacy_constants
@@ -32,18 +35,24 @@ PAIN_COLUMNS = _constants["PAIN_COLUMNS"]
 TEMPERATURE_COLUMNS = _constants["TEMPERATURE_COLUMNS"]
 
 # Extract parameters from config
-FIG_PAD_INCH = config.visualization.pad_inches
-BBOX_INCHES = config.visualization.bbox_inches
-PAIN_COLOR = config.analysis.erp.pain_color
-NONPAIN_COLOR = config.analysis.erp.nonpain_color
-INCLUDE_TMAX_IN_CROP = config.analysis.erp.include_tmax_in_crop
-DEFAULT_CROP_TMIN = config.analysis.erp.default_crop_tmin
-DEFAULT_CROP_TMAX = config.analysis.erp.default_crop_tmax
-ERP_COMBINE = config.analysis.erp.combine
-PLOTS_SUBDIR = config.analysis.erp.plots_subdir
-LOG_FILE_NAME = config.logging.file_names.foundational
-COUNTS_FILE_NAME = config.analysis.erp.counts_file_name
-ERP_OUTPUT_FILES = dict(config.analysis.erp.output_files)
+FIG_PAD_INCH = float(config.get("output.pad_inches", 0.02))
+BBOX_INCHES = config.get("output.bbox_inches", "tight")
+PAIN_COLOR = config.get("foundational_analysis.erp.pain_color", "crimson")
+NONPAIN_COLOR = config.get("foundational_analysis.erp.nonpain_color", "navy")
+INCLUDE_TMAX_IN_CROP = bool(config.get("foundational_analysis.erp.include_tmax_in_crop", False))
+DEFAULT_CROP_TMIN = config.get("foundational_analysis.erp.default_crop_tmin", None)
+DEFAULT_CROP_TMAX = config.get("foundational_analysis.erp.default_crop_tmax", None)
+ERP_COMBINE = config.get("foundational_analysis.erp.combine", "gfp")
+PLOTS_SUBDIR = config.get("foundational_analysis.erp.plots_subdir", "01_foundational_analysis")
+LOG_FILE_NAME = config.get("logging.file_names.foundational", "01_foundational_analysis.log")
+COUNTS_FILE_NAME = config.get("foundational_analysis.erp.counts_file_name", "counts_pain.tsv")
+ERP_OUTPUT_FILES = dict(config.get("foundational_analysis.erp.output_files", {
+    "pain_gfp": "erp_pain_binary_gfp.png",
+    "pain_butterfly": "erp_pain_binary_butterfly.png",
+    "temp_gfp": "erp_by_temperature_gfp.png",
+    "temp_butterfly": "erp_by_temperature_butterfly.png",
+    "temp_butterfly_template": "erp_by_temperature_butterfly_{label}.png",
+}))
 
 
 def _ensure_dir(p: Path) -> None:
@@ -127,9 +136,16 @@ def _load_events_df(subject: str, task: str, logger: Optional[logging.Logger] = 
         return None
 
 
-def _setup_logging(subject: str) -> logging.Logger:
+def _setup_logging(subject: Optional[str] = None) -> logging.Logger:
     """Set up logging with console and file handlers for foundational analysis."""
-    logger = logging.getLogger(f"foundational_analysis_sub_{subject}")
+    if subject is None:
+        logger_name = "foundational_analysis_group"
+        log_dir = DERIV_ROOT / "group" / "eeg" / "logs"
+    else:
+        logger_name = f"foundational_analysis_sub_{subject}"
+        log_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "logs"
+    
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
     # Avoid duplicate handlers if already set
     if logger.handlers:
@@ -145,7 +161,6 @@ def _setup_logging(subject: str) -> logging.Logger:
     logger.addHandler(console_handler)
     
     # File handler
-    log_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "logs"  # e.g., derivatives/sub-001/eeg/logs/
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / LOG_FILE_NAME
     file_handler = logging.FileHandler(log_file, mode='w')  # Overwrite each run
@@ -167,6 +182,250 @@ def _save_fig(fig: plt.Figure, out_dir: Path, name: str, logger: Optional[loggin
         logger.info(msg)
     else:
         print(msg)
+
+
+def _get_available_subjects() -> List[str]:
+    """Find all available subjects in DERIV_ROOT with cleaned epochs files."""
+    subjects = []
+    if not DERIV_ROOT.exists():
+        return subjects
+    
+    for subj_dir in DERIV_ROOT.glob("sub-*"):
+        if subj_dir.is_dir():
+            subject_id = subj_dir.name[4:]  # Remove 'sub-' prefix
+            # Check if cleaned epochs exist for this subject
+            if _find_clean_epochs_path(subject_id, DEFAULT_TASK) is not None:
+                subjects.append(subject_id)
+    
+    return sorted(subjects)
+
+
+def process_single_subject(
+    subject: str,
+    task: str = DEFAULT_TASK,
+    crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
+    crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
+    logger: Optional[logging.Logger] = None
+) -> Tuple[Optional[mne.Epochs], bool]:
+    """Process a single subject and return epochs and success status.
+    
+    Returns
+    -------
+    epochs : mne.Epochs or None
+        The processed epochs, or None if processing failed
+    success : bool
+        True if processing completed successfully
+    """
+    if logger is None:
+        logger = _setup_logging(subject)
+    
+    logger.info(f"=== Processing sub-{subject}, task-{task} ===")
+    
+    # Resolve paths
+    plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / PLOTS_SUBDIR
+    _ensure_dir(plots_dir)
+
+    # Load epochs
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None or not epo_path.exists():
+        logger.error(f"Could not find cleaned epochs file for sub-{subject}, task-{task}")
+        return None, False
+    
+    logger.info(f"Loading epochs: {epo_path}")
+    
+    try:
+        epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+    except Exception as e:
+        logger.error(f"Failed to load epochs for sub-{subject}: {e}")
+        return None, False
+
+    # Load events dataframe and attach as metadata
+    events_df = _load_events_df(subject, task, logger)
+    if events_df is None:
+        logger.warning("Events TSV not found; ERP contrasts will be skipped.")
+    else:
+        logger.info(f"Loaded events: {len(events_df)} rows")
+        try:
+            events_aligned = align_events_to_epochs_strict(events_df, epochs, logger)
+            if events_aligned is not None:
+                epochs.metadata = events_aligned
+                validate_alignment(events_aligned, epochs, logger)
+        except ValueError as e:
+            logger.error(f"Event alignment failed strictly: {e}")
+            return None, False
+
+    # Optional epoch time cropping prior to averaging/plotting
+    if crop_tmin is not None or crop_tmax is not None:
+        epochs = _maybe_crop_epochs(epochs, crop_tmin, crop_tmax, logger)
+
+    # ERP: pain vs non-pain and by temperature (requires metadata)
+    if events_df is not None and epochs.metadata is not None:
+        erp_contrast_pain(epochs, plots_dir, logger)
+        erp_by_temperature(epochs, plots_dir, logger)
+
+    logger.info("Single subject processing completed.")
+    return epochs, True
+
+
+def group_erp_contrast_pain(all_epochs: List[mne.Epochs], out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
+    """Create group-level pain vs non-pain ERP contrasts using grand averaging."""
+    if not all_epochs:
+        return
+    
+    pain_evokeds = []
+    nonpain_evokeds = []
+    
+    for epochs in all_epochs:
+        if epochs.metadata is None:
+            continue
+            
+        # Find pain column
+        col = None
+        for candidate in PAIN_COLUMNS:
+            if candidate in epochs.metadata.columns:
+                col = candidate
+                break
+        if col is None:
+            continue
+            
+        # Build selections
+        try:
+            ep_pain = epochs[f"{col} == 1"]
+            ep_non = epochs[f"{col} == 0"]
+        except Exception:
+            try:
+                ep_pain = epochs[np.asarray(pd.to_numeric(epochs.metadata[col], errors="coerce") == 1)]
+                ep_non = epochs[np.asarray(pd.to_numeric(epochs.metadata[col], errors="coerce") == 0)]
+            except Exception:
+                continue
+        
+        if len(ep_pain) > 0:
+            pain_evokeds.append(ep_pain.average(picks=ERP_PICKS))
+        if len(ep_non) > 0:
+            nonpain_evokeds.append(ep_non.average(picks=ERP_PICKS))
+    
+    if len(pain_evokeds) == 0 or len(nonpain_evokeds) == 0:
+        if logger:
+            logger.warning("Group ERP pain contrast: insufficient data across subjects")
+        return
+    
+    # Create grand averages
+    grand_pain = mne.grand_average(pain_evokeds, interpolate_bads=True)
+    grand_nonpain = mne.grand_average(nonpain_evokeds, interpolate_bads=True)
+    
+    # GFP contrast
+    try:
+        fig = mne.viz.plot_compare_evokeds(
+            {"painful": grand_pain, "non-painful": grand_nonpain},
+            picks=ERP_PICKS,
+            combine=ERP_COMBINE,
+            show=False,
+            colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
+        )
+        if isinstance(fig, list):
+            fig = fig[0]
+        fig.suptitle(f"Group ERP: Pain vs Non-Pain (N={len(pain_evokeds)} subjects)", fontsize=14, fontweight='bold')
+        _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["pain_gfp"], logger)
+    except Exception as e:
+        if logger:
+            logger.error(f"Group ERP pain contrast (GFP) failed: {e}")
+
+    # Butterfly overlay
+    try:
+        fig = mne.viz.plot_compare_evokeds(
+            {"painful": grand_pain, "non-painful": grand_nonpain},
+            picks=ERP_PICKS,
+            combine=None,
+            show=False,
+            colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
+        )
+        if isinstance(fig, list):
+            fig = fig[0]
+        fig.suptitle(f"Group ERP: Pain vs Non-Pain (N={len(pain_evokeds)} subjects)", fontsize=14, fontweight='bold')
+        _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["pain_butterfly"], logger)
+    except Exception as e:
+        if logger:
+            logger.error(f"Group ERP pain contrast (butterfly) failed: {e}")
+
+
+def group_erp_by_temperature(all_epochs: List[mne.Epochs], out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
+    """Create group-level temperature ERP contrasts using grand averaging."""
+    if not all_epochs:
+        return
+    
+    # Collect temperature levels across all subjects
+    temp_evokeds_by_level: Dict[str, List[mne.Evoked]] = {}
+    
+    for epochs in all_epochs:
+        if epochs.metadata is None:
+            continue
+            
+        # Find temperature column
+        col = None
+        for candidate in TEMPERATURE_COLUMNS:
+            if candidate in epochs.metadata.columns:
+                col = candidate
+                break
+        if col is None:
+            continue
+            
+        # Determine unique, sensibly sorted levels
+        levels_series = epochs.metadata[col]
+        try:
+            numeric_levels = pd.to_numeric(levels_series, errors="coerce")
+            if numeric_levels.notna().all():
+                uniq_sorted = np.sort(numeric_levels.unique())
+                represent = {v: str(int(v)) if float(v).is_integer() else str(v) for v in uniq_sorted}
+                use_numeric = True
+            else:
+                raise ValueError
+        except Exception:
+            uniq_sorted = sorted(levels_series.astype(str).unique())
+            use_numeric = False
+        
+        # Process each temperature level
+        for lvl in uniq_sorted:
+            if use_numeric:
+                query = f"{col} == {lvl}"
+                label = represent[lvl]
+            else:
+                lvl_str = str(lvl).replace('"', '\\"')
+                query = f"{col} == \"{lvl_str}\""
+                label = str(lvl)
+            
+            try:
+                ep_temp = epochs[query]
+                if len(ep_temp) > 0:
+                    evoked = ep_temp.average(picks=ERP_PICKS)
+                    if label not in temp_evokeds_by_level:
+                        temp_evokeds_by_level[label] = []
+                    temp_evokeds_by_level[label].append(evoked)
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Temperature level {lvl}: selection/averaging failed: {e}")
+    
+    if not temp_evokeds_by_level:
+        if logger:
+            logger.warning("Group ERP by temperature: No evokeds computed across subjects")
+        return
+    
+    # Create grand averages for each temperature level
+    grand_temp_evokeds: Dict[str, mne.Evoked] = {}
+    for label, evokeds_list in temp_evokeds_by_level.items():
+        if len(evokeds_list) > 0:
+            grand_temp_evokeds[label] = mne.grand_average(evokeds_list, interpolate_bads=True)
+    
+    # Plot GFP across temperature levels
+    try:
+        fig = mne.viz.plot_compare_evokeds(grand_temp_evokeds, picks=ERP_PICKS, combine=ERP_COMBINE, show=False)
+        if isinstance(fig, list):
+            fig = fig[0]
+        n_subjects_info = ", ".join([f"{k}: N={len(v)}" for k, v in temp_evokeds_by_level.items()])
+        fig.suptitle(f"Group ERP by Temperature ({n_subjects_info} subjects)", fontsize=14, fontweight='bold')
+        _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["temp_gfp"], logger)
+    except Exception as e:
+        if logger:
+            logger.error(f"Group ERP by temperature (GFP) failed: {e}")
 
 
 def _maybe_crop_epochs(
@@ -199,9 +458,7 @@ def _maybe_crop_epochs(
     return ep.crop(tmin=tmin, tmax=tmax, include_tmax=INCLUDE_TMAX_IN_CROP)
 
 
-def erp_contrast_pain(
-    epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None
-) -> Optional[Dict[str, mne.Evoked]]:
+def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
     # Prefer MNE metadata-based selection
     if epochs.metadata is None:
         msg = "ERP pain contrast: epochs.metadata is missing; skipping."
@@ -209,7 +466,7 @@ def erp_contrast_pain(
             logger.warning(msg)
         else:
             print(msg)
-        return None
+        return
     col = None
     for candidate in PAIN_COLUMNS:
         if candidate in epochs.metadata.columns:
@@ -221,7 +478,7 @@ def erp_contrast_pain(
             logger.warning(msg)
         else:
             print(msg)
-        return None
+        return
 
     # Build selections using MNE metadata query
     try:
@@ -240,7 +497,7 @@ def erp_contrast_pain(
             logger.warning(msg)
         else:
             print(msg)
-        return None
+        return
 
     ev_pain = ep_pain.average(picks=ERP_PICKS)
     ev_non = ep_non.average(picks=ERP_PICKS)
@@ -283,19 +540,15 @@ def erp_contrast_pain(
         else:
             print(msg)
 
-    return {"painful": ev_pain, "non-painful": ev_non}
 
-
-def erp_by_temperature(
-    epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None
-) -> Optional[Dict[str, mne.Evoked]]:
+def erp_by_temperature(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
     if epochs.metadata is None:
         msg = "ERP by temperature: epochs.metadata is missing; skipping."
         if logger:
             logger.warning(msg)
         else:
             print(msg)
-        return None
+        return
     col = None
     for candidate in TEMPERATURE_COLUMNS:
         if candidate in epochs.metadata.columns:
@@ -307,7 +560,7 @@ def erp_by_temperature(
             logger.warning(msg)
         else:
             print(msg)
-        return None
+        return
 
     # Determine unique, sensibly sorted levels
     levels_series = epochs.metadata[col]
@@ -349,7 +602,7 @@ def erp_by_temperature(
             logger.warning(msg)
         else:
             print(msg)
-        return None
+        return
 
     # One plot per temperature level (Evoked butterfly) with title
     for label, evk in evokeds.items():
@@ -388,250 +641,99 @@ def erp_by_temperature(
         else:
             print(msg)
 
-    return evokeds
-
-
-def process_subject(
-    subject: str,
-    task: str = DEFAULT_TASK,
-    crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
-    crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
-) -> Optional[Dict[str, Any]]:
-    logger = _setup_logging(subject)
-    logger.info(f"=== Foundational analysis: sub-{subject}, task-{task} ===")
-    # Resolve paths
-    plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / PLOTS_SUBDIR
-    _ensure_dir(plots_dir)
-
-    # Load epochs
-    epo_path = _find_clean_epochs_path(subject, task)
-    if epo_path is None or not epo_path.exists():
-        msg = f"Error: could not find cleaned epochs file for sub-{subject}, task-{task} under {DERIV_ROOT}."
-        if logger:
-            logger.error(msg)
-        else:
-            print(msg)
-        sys.exit(1)
-    msg = f"Loading epochs: {epo_path}"
-    if logger:
-        logger.info(msg)
-    else:
-        print(msg)
-    epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
-
-    # Load events dataframe and attach as metadata (MNE-native selection uses this)
-    events_df = _load_events_df(subject, task, logger)
-    if events_df is None:
-        msg = "Warning: events TSV not found; ERP contrasts will be skipped."
-        if logger:
-            logger.warning(msg)
-        else:
-            print(msg)
-    else:
-        msg = f"Loaded events: {len(events_df)} rows"
-        if logger:
-            logger.info(msg)
-        else:
-            print(msg)
-        # Align events to epochs using selection or sample index; fallback to trimming
-        aligned = False
-        sel = getattr(epochs, "selection", None)
-        if sel is not None and len(sel) == len(epochs):
-            try:
-                if len(events_df) > int(np.max(sel)):
-                    events_aligned = events_df.iloc[sel].reset_index(drop=True)
-                    epochs.metadata = events_aligned
-                    aligned = True
-                    if len(events_df) != len(epochs):
-                        msg = f"Aligned metadata using epochs.selection (kept {len(epochs)} of {len(events_df)} events)."
-                        if logger:
-                            logger.info(msg)
-                        else:
-                            print(msg)
-            except Exception as e:
-                msg = f"Selection-based alignment failed: {e}"
-                if logger:
-                    logger.warning(msg)
-                else:
-                    print(msg)
-
-        if not aligned and "sample" in events_df.columns and isinstance(getattr(epochs, "events", None), np.ndarray):
-            try:
-                samples = epochs.events[:, 0]
-                events_by_sample = events_df.set_index("sample")
-                # Reindex to epochs' event sample order
-                events_aligned = events_by_sample.reindex(samples)
-                # If any rows are completely missing, abort this method
-                if len(events_aligned) == len(epochs) and not events_aligned.isna().all(axis=1).any():
-                    epochs.metadata = events_aligned.reset_index()
-                    aligned = True
-                    msg = "Aligned metadata using 'sample' column to epochs.events."
-                    if logger:
-                        logger.info(msg)
-                    else:
-                        print(msg)
-            except Exception as e:
-                msg = f"Sample-based alignment failed: {e}"
-                if logger:
-                    logger.warning(msg)
-                else:
-                    print(msg)
-
-        if not aligned:
-            # Fallback: naive min-length trimming in original order
-            n = min(len(events_df), len(epochs))
-            if len(events_df) != len(epochs):
-                msg = f"Warning: events rows ({len(events_df)}) != epochs ({len(epochs)}); trimming to {n}."
-                if logger:
-                    logger.warning(msg)
-                else:
-                    print(msg)
-            if len(epochs) != n:
-                epochs = epochs[:n]
-            epochs.metadata = events_df.iloc[:n].reset_index(drop=True)
-
-
-    # Optional epoch time cropping prior to averaging/plotting
-    if crop_tmin is not None or crop_tmax is not None:
-        epochs = _maybe_crop_epochs(epochs, crop_tmin, crop_tmax, logger)
-
-    pain_evokeds = None
-    temp_evokeds = None
-    if events_df is not None and epochs.metadata is not None:
-        pain_evokeds = erp_contrast_pain(epochs, plots_dir, logger)
-        temp_evokeds = erp_by_temperature(epochs, plots_dir, logger)
-
-    msg = "Done."
-    if logger:
-        logger.info(msg)
-    else:
-        print(msg)
-    return {"subject": subject, "pain_evokeds": pain_evokeds, "temp_evokeds": temp_evokeds}
-
-
-def aggregate_group_level(results: List[Dict[str, Any]]) -> None:
-    """Grand-average ERP data across subjects and generate group plots."""
-    if not results:
-        return
-    out_dir = DERIV_ROOT / "group" / "eeg" / "plots" / PLOTS_SUBDIR
-    _ensure_dir(out_dir)
-
-    pain_painful: List[mne.Evoked] = []
-    pain_non: List[mne.Evoked] = []
-    temp_map: Dict[str, List[mne.Evoked]] = {}
-    for res in results:
-        pe = res.get("pain_evokeds") or {}
-        if "painful" in pe and "non-painful" in pe:
-            pain_painful.append(pe["painful"])
-            pain_non.append(pe["non-painful"])
-        te = res.get("temp_evokeds") or {}
-        for label, evk in te.items():
-            temp_map.setdefault(label, []).append(evk)
-
-    if pain_painful and pain_non:
-        g_pain = mne.grand_average(pain_painful)
-        g_non = mne.grand_average(pain_non)
-        try:
-            fig = mne.viz.plot_compare_evokeds(
-                {"painful": g_pain, "non-painful": g_non},
-                picks=ERP_PICKS,
-                combine=ERP_COMBINE,
-                show=False,
-                colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
-            )
-            if isinstance(fig, list):
-                fig = fig[0]
-            _save_fig(fig, out_dir, "group_pain_gfp.png")
-        except Exception:
-            pass
-        try:
-            fig = mne.viz.plot_compare_evokeds(
-                {"painful": g_pain, "non-painful": g_non},
-                picks=ERP_PICKS,
-                combine=None,
-                show=False,
-                colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
-            )
-            if isinstance(fig, list):
-                fig = fig[0]
-            _save_fig(fig, out_dir, "group_pain_butterfly.png")
-        except Exception:
-            pass
-
-    if temp_map:
-        grand_temps: Dict[str, mne.Evoked] = {
-            label: mne.grand_average(evs) for label, evs in temp_map.items()
-        }
-        for label, evk in grand_temps.items():
-            try:
-                fig = evk.plot(picks=ERP_PICKS, spatial_colors=True, show=False)
-                try:
-                    fig.suptitle(f"ERP - Temperature {label}")
-                except Exception:
-                    pass
-                safe_label = (
-                    str(label).replace(" ", "_").replace("/", "-").replace("\\", "-")
-                )
-                _save_fig(fig, out_dir, f"group_temp_{safe_label}_butterfly.png")
-            except Exception:
-                pass
-        try:
-            fig = mne.viz.plot_compare_evokeds(
-                grand_temps,
-                picks=ERP_PICKS,
-                combine=ERP_COMBINE,
-                show=False,
-            )
-            if isinstance(fig, list):
-                fig = fig[0]
-            _save_fig(fig, out_dir, "group_temp_gfp.png")
-        except Exception:
-            pass
-
 
 def main(
     subjects: Optional[List[str]] = None,
+    all_subjects: bool = False,
     task: str = DEFAULT_TASK,
     crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
     crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
-    do_group: bool = False,
 ) -> None:
-    if subjects is None or subjects == ["all"]:
-        subs = getattr(config, "subjects", [])
-        if not subs:
-            raise ValueError(
-                "No subjects provided and config.project.subjects is empty."
-            )
-        subjects = subs
-
-    results: List[Dict[str, Any]] = []
-    for sub in subjects:
-        res = process_subject(sub, task, crop_tmin=crop_tmin, crop_tmax=crop_tmax)
-        if res:
-            results.append(res)
-
-    if do_group or len(results) > 1:
-        aggregate_group_level(results)
+    """Main function for foundational EEG ERP analysis.
+    
+    Supports both single-subject and multi-subject analysis.
+    Creates individual subject plots plus group-level grand average ERPs.
+    """
+    # Determine subjects to process (CLI only; no YAML fallback)
+    if all_subjects:
+        subjects = _get_available_subjects()
+        if not subjects:
+            raise ValueError(f"No subjects with cleaned epochs found in {DERIV_ROOT}")
+    elif subjects is None or len(subjects) == 0:
+        raise ValueError(
+            "No subjects specified. Use --subject (can repeat) or --all-subjects."
+        )
+    
+    # Setup group logging
+    group_logger = _setup_logging()
+    group_logger.info(f"=== Multi-subject foundational analysis: {len(subjects)} subjects, task-{task} ===")
+    group_logger.info(f"Subjects: {', '.join(subjects)}")
+    
+    # Process each subject individually
+    all_epochs = []
+    successful_subjects = []
+    
+    for subject in subjects:
+        group_logger.info(f"--- Processing subject: {subject} ---")
+        epochs, success = process_single_subject(subject, task, crop_tmin, crop_tmax, group_logger)
+        if success and epochs is not None:
+            all_epochs.append(epochs)
+            successful_subjects.append(subject)
+        else:
+            group_logger.warning(f"Failed to process subject {subject}, excluding from group analysis")
+    
+    # Group-level analysis
+    if len(all_epochs) >= 2:  # Need at least 2 subjects for meaningful group analysis
+        group_logger.info(f"=== Group analysis: {len(successful_subjects)} successful subjects ===")
+        group_plots_dir = DERIV_ROOT / "group" / "eeg" / "plots" / PLOTS_SUBDIR
+        _ensure_dir(group_plots_dir)
+        
+        # Group ERP analyses
+        group_erp_contrast_pain(all_epochs, group_plots_dir, group_logger)
+        group_erp_by_temperature(all_epochs, group_plots_dir, group_logger)
+        
+        group_logger.info(f"Group analysis completed. Results saved to: {group_plots_dir}")
+    else:
+        group_logger.warning(f"Only {len(all_epochs)} subjects processed successfully. Skipping group analysis.")
+    
+    group_logger.info(f"=== Analysis complete ===")
+    if successful_subjects:
+        group_logger.info(f"Successfully processed: {', '.join(successful_subjects)}")
+    failed_subjects = set(subjects) - set(successful_subjects)
+    if failed_subjects:
+        group_logger.warning(f"Failed to process: {', '.join(failed_subjects)}")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Foundational EEG ERP analysis")
-    parser.add_argument(
-        "--subjects",
-        nargs="*",
-        default=None,
-        help="Subject IDs (e.g., 001 002) or 'all' for all configured subjects",
+    parser = argparse.ArgumentParser(description="Foundational EEG ERP analysis supporting single and multiple subjects")
+    
+    # Subject selection arguments (mutually exclusive)
+    subject_group = parser.add_mutually_exclusive_group()
+    subject_group.add_argument(
+        "--subject", "-s", type=str, action="append",
+        help=(
+            "BIDS subject label(s) without 'sub-' prefix (e.g., 0000). "
+            "Can be specified multiple times for multiple subjects. "
+            "Required unless --all-subjects is provided."
+        ),
     )
-    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label")
-    parser.add_argument("--crop-tmin", type=float, default=DEFAULT_CROP_TMIN, help="Epoch crop start")
-    parser.add_argument("--crop-tmax", type=float, default=DEFAULT_CROP_TMAX, help="Epoch crop end")
-    parser.add_argument(
-        "--do-group",
-        action="store_true",
-        help="Force grand-average ERPs even for a single subject (default when multiple subjects)",
+    subject_group.add_argument(
+        "--all-subjects", action="store_true",
+        help="Process all available subjects with cleaned epochs files"
     )
+    
+    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label (default from config)")
+    parser.add_argument("--crop-tmin", type=float, default=DEFAULT_CROP_TMIN, help="ERP epoch crop start time (s)")
+    parser.add_argument("--crop-tmax", type=float, default=DEFAULT_CROP_TMAX, help="ERP epoch crop end time (s)")
+    
     args = parser.parse_args()
 
-    main(subjects=args.subjects, task=args.task, crop_tmin=args.crop_tmin, crop_tmax=args.crop_tmax, do_group=args.do_group)
+    main(
+        subjects=args.subject, 
+        all_subjects=args.all_subjects, 
+        task=args.task,
+        crop_tmin=args.crop_tmin,
+        crop_tmax=args.crop_tmax
+    )
