@@ -309,19 +309,31 @@ def group_erp_contrast_pain(all_epochs: List[mne.Epochs], out_dir: Path, logger:
             logger.warning("Group ERP pain contrast: insufficient data across subjects")
         return
     
-    # Create grand averages
+    # Create grand averages (fallback visualization)
     grand_pain = mne.grand_average(pain_evokeds, interpolate_bads=True)
     grand_nonpain = mne.grand_average(nonpain_evokeds, interpolate_bads=True)
     
     # GFP contrast
     try:
-        fig = mne.viz.plot_compare_evokeds(
-            {"painful": grand_pain, "non-painful": grand_nonpain},
-            picks=ERP_PICKS,
-            combine=ERP_COMBINE,
-            show=False,
-            colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
-        )
+        # Prefer CI shading across subjects when available (newer MNE)
+        try:
+            fig = mne.viz.plot_compare_evokeds(
+                {"painful": pain_evokeds, "non-painful": nonpain_evokeds},
+                picks=ERP_PICKS,
+                combine=ERP_COMBINE,
+                show=False,
+                colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
+                ci=0.95,
+            )
+        except TypeError:
+            # Older MNE without 'ci' or list handling for CI
+            fig = mne.viz.plot_compare_evokeds(
+                {"painful": grand_pain, "non-painful": grand_nonpain},
+                picks=ERP_PICKS,
+                combine=ERP_COMBINE,
+                show=False,
+                colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
+            )
         if isinstance(fig, list):
             fig = fig[0]
         fig.suptitle(f"Group ERP: Pain vs Non-Pain (N={len(pain_evokeds)} subjects)", fontsize=14, fontweight='bold')
@@ -414,10 +426,59 @@ def group_erp_by_temperature(all_epochs: List[mne.Epochs], out_dir: Path, logger
     for label, evokeds_list in temp_evokeds_by_level.items():
         if len(evokeds_list) > 0:
             grand_temp_evokeds[label] = mne.grand_average(evokeds_list, interpolate_bads=True)
-    
+
+    # Plot per-temperature butterfly (grand average across subjects for each level)
+    try:
+        for label, evk in grand_temp_evokeds.items():
+            try:
+                fig = evk.plot(picks=ERP_PICKS, spatial_colors=True, show=False)
+                try:
+                    fig.suptitle(f"Group ERP - Temperature {label}")
+                except Exception:
+                    pass
+                safe_label = (
+                    str(label)
+                    .replace(" ", "_")
+                    .replace("/", "-")
+                    .replace("\\", "-")
+                    .replace(".", "p")
+                    .replace(":", "-")
+                )
+                _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["temp_butterfly_template"].format(label=safe_label), logger)
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Group per-temperature butterfly failed for {label}: {e}")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Group per-temperature butterfly plotting failed: {e}")
+
+    # Combined butterfly overlay across all temperature levels (grand averages)
+    try:
+        if len(grand_temp_evokeds) >= 2:
+            fig = mne.viz.plot_compare_evokeds(
+                grand_temp_evokeds, picks=ERP_PICKS, combine=None, show=False
+            )
+            if isinstance(fig, list):
+                fig = fig[0]
+            try:
+                n_info = ", ".join([f"{k}: N={len(temp_evokeds_by_level[k])}" for k in grand_temp_evokeds.keys()])
+                fig.suptitle(f"Group ERP by Temperature (Butterfly) — {n_info}", fontsize=14, fontweight='bold')
+            except Exception:
+                pass
+            _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["temp_butterfly"], logger)
+    except Exception as e:
+        if logger:
+            logger.warning(f"Group combined temperature butterfly failed: {e}")
+
     # Plot GFP across temperature levels
     try:
-        fig = mne.viz.plot_compare_evokeds(grand_temp_evokeds, picks=ERP_PICKS, combine=ERP_COMBINE, show=False)
+        # Prefer CI shading across subjects when available (newer MNE)
+        try:
+            fig = mne.viz.plot_compare_evokeds(
+                temp_evokeds_by_level, picks=ERP_PICKS, combine=ERP_COMBINE, show=False, ci=0.95
+            )
+        except TypeError:
+            fig = mne.viz.plot_compare_evokeds(grand_temp_evokeds, picks=ERP_PICKS, combine=ERP_COMBINE, show=False)
         if isinstance(fig, list):
             fig = fig[0]
         n_subjects_info = ", ".join([f"{k}: N={len(v)}" for k, v in temp_evokeds_by_level.items()])
@@ -456,6 +517,56 @@ def _maybe_crop_epochs(
     if not getattr(ep, "preload", False):
         ep.load_data()
     return ep.crop(tmin=tmin, tmax=tmax, include_tmax=INCLUDE_TMAX_IN_CROP)
+
+
+def _write_group_pain_counts(
+    all_epochs: List[mne.Epochs], subjects: List[str], out_dir: Path, logger: Optional[logging.Logger] = None
+) -> None:
+    """Write per-subject trial counts for pain vs non-pain to TSV.
+
+    The output includes columns: subject, n_pain, n_nonpain, n_total.
+    Subjects missing metadata or pain columns are recorded with zeros.
+    """
+    rows = []
+    for subj, epochs in zip(subjects, all_epochs):
+        n_pain = 0
+        n_non = 0
+        if epochs.metadata is not None:
+            col = None
+            for candidate in PAIN_COLUMNS:
+                if candidate in epochs.metadata.columns:
+                    col = candidate
+                    break
+            if col is not None:
+                vals = pd.to_numeric(epochs.metadata[col], errors="coerce")
+                n_pain = int((vals == 1).sum())
+                n_non = int((vals == 0).sum())
+        rows.append({
+            "subject": subj,
+            "n_pain": n_pain,
+            "n_nonpain": n_non,
+            "n_total": n_pain + n_non,
+        })
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    # Add summary row
+    total = df[["n_pain", "n_nonpain", "n_total"]].sum()
+    total_row = {"subject": "TOTAL", **{k: int(v) for k, v in total.to_dict().items()}}
+    df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+    _ensure_dir(out_dir)
+    out_path = out_dir / COUNTS_FILE_NAME
+    try:
+        df.to_csv(out_path, sep="\t", index=False)
+        if logger:
+            logger.info(f"Saved counts: {out_path}")
+        else:
+            print(f"Saved counts: {out_path}")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to write counts TSV at {out_path}: {e}")
+        else:
+            print(f"Warning: Failed to write counts TSV at {out_path}: {e}")
 
 
 def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
@@ -628,6 +739,24 @@ def erp_by_temperature(epochs: mne.Epochs, out_dir: Path, logger: Optional[loggi
             else:
                 print(msg)
 
+    # Combined butterfly overlay across all temperature levels
+    try:
+        if len(evokeds) >= 2:
+            fig = mne.viz.plot_compare_evokeds(evokeds, picks=ERP_PICKS, combine=None, show=False)
+            if isinstance(fig, list):
+                fig = fig[0]
+            try:
+                fig.suptitle("ERP by Temperature (Butterfly)")
+            except Exception:
+                pass
+            _save_fig(fig, out_dir, ERP_OUTPUT_FILES["temp_butterfly"], logger)
+    except Exception as e:
+        msg = f"ERP by temperature (combined butterfly) failed: {e}"
+        if logger:
+            logger.error(msg)
+        else:
+            print(msg)
+
     # Plot GFP across levels
     try:
         fig = mne.viz.plot_compare_evokeds(evokeds, picks=ERP_PICKS, combine=ERP_COMBINE, show=False)
@@ -648,21 +777,43 @@ def main(
     task: str = DEFAULT_TASK,
     crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
     crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
+    group: Optional[str] = None,
 ) -> None:
     """Main function for foundational EEG ERP analysis.
     
     Supports both single-subject and multi-subject analysis.
     Creates individual subject plots plus group-level grand average ERPs.
     """
-    # Determine subjects to process (CLI only; no YAML fallback)
-    if all_subjects:
-        subjects = _get_available_subjects()
-        if not subjects:
-            raise ValueError(f"No subjects with cleaned epochs found in {DERIV_ROOT}")
-    elif subjects is None or len(subjects) == 0:
-        raise ValueError(
-            "No subjects specified. Use --subject (can repeat) or --all-subjects."
-        )
+    # Determine subjects to process from CLI
+    if group is not None:
+        if group.strip().lower() in {"all", "*", "@all"}:
+            subjects = _get_available_subjects()
+            if not subjects:
+                raise ValueError(f"No subjects with cleaned epochs found in {DERIV_ROOT}")
+        else:
+            # Parse comma/space separated labels
+            cand = [s.strip() for s in group.replace(";", ",").replace(" ", ",").split(",") if s.strip()]
+            if not cand:
+                raise ValueError("--group provided but no valid subject labels parsed")
+            # Filter to those that have data; warn for missing
+            valid = []
+            for s in cand:
+                if _find_clean_epochs_path(s, task) is not None:
+                    valid.append(s)
+                else:
+                    print(f"Warning: --group subject '{s}' has no cleaned epochs; skipping")
+            subjects = valid
+            if not subjects:
+                raise ValueError("--group provided but no valid subjects with data found")
+    else:
+        if all_subjects:
+            subjects = _get_available_subjects()
+            if not subjects:
+                raise ValueError(f"No subjects with cleaned epochs found in {DERIV_ROOT}")
+        elif subjects is None or len(subjects) == 0:
+            raise ValueError(
+                "No subjects specified. Use --group all|A,B,C, or --subject (can repeat) or --all-subjects."
+            )
     
     # Setup group logging
     group_logger = _setup_logging()
@@ -691,6 +842,8 @@ def main(
         # Group ERP analyses
         group_erp_contrast_pain(all_epochs, group_plots_dir, group_logger)
         group_erp_by_temperature(all_epochs, group_plots_dir, group_logger)
+        # Trial counts summary
+        _write_group_pain_counts(all_epochs, successful_subjects, group_plots_dir, group_logger)
         
         group_logger.info(f"Group analysis completed. Results saved to: {group_plots_dir}")
     else:
@@ -712,11 +865,17 @@ if __name__ == "__main__":
     # Subject selection arguments (mutually exclusive)
     subject_group = parser.add_mutually_exclusive_group()
     subject_group.add_argument(
+        "--group", type=str,
+        help=(
+            "Group of subjects to process: either 'all' or a comma/space-separated "
+            "list of BIDS labels without 'sub-' (e.g., '0001,0002,0003')."
+        ),
+    )
+    subject_group.add_argument(
         "--subject", "-s", type=str, action="append",
         help=(
             "BIDS subject label(s) without 'sub-' prefix (e.g., 0000). "
-            "Can be specified multiple times for multiple subjects. "
-            "Required unless --all-subjects is provided."
+            "Can be specified multiple times for multiple subjects."
         ),
     )
     subject_group.add_argument(
@@ -735,5 +894,6 @@ if __name__ == "__main__":
         all_subjects=args.all_subjects, 
         task=args.task,
         crop_tmin=args.crop_tmin,
-        crop_tmax=args.crop_tmax
+        crop_tmax=args.crop_tmax,
+        group=args.group,
     )
