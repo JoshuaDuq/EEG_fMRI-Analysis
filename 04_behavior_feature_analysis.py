@@ -246,6 +246,108 @@ def _pick_first_column(df: Optional[pd.DataFrame], candidates: List[str]) -> Opt
     return None
 
 
+def _build_covariate_matrices(
+    df_events: Optional[pd.DataFrame],
+    partial_covars: Optional[List[str]],
+    temp_col: Optional[str],
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """Construct design matrices for partial correlations.
+
+    Returns ``(Z_full, Z_temp)`` where ``Z_full`` includes all covariates and
+    ``Z_temp`` drops the temperature column (when present) for temperature
+    correlations.
+    """
+    if df_events is None:
+        return None, None
+    covars = list(partial_covars) if partial_covars is not None else []
+    if not covars:
+        tcol = _pick_first_column(df_events, PSYCH_TEMP_COLUMNS)
+        if tcol is not None:
+            covars.append(tcol)
+        for c in ["trial", "trial_number", "trial_index", "run", "block"]:
+            if c in df_events.columns:
+                covars.append(c)
+                break
+    if not covars:
+        return None, None
+    Z = pd.DataFrame()
+    for c in covars:
+        if c in df_events.columns:
+            Z[c] = pd.to_numeric(df_events[c], errors="coerce")
+    if Z.empty:
+        return None, None
+    Z_temp = Z.drop(columns=[temp_col], errors="ignore") if temp_col else Z.copy()
+    if Z_temp.shape[1] == 0:
+        Z_temp = None
+    return Z, Z_temp
+
+
+def _partial_corr_xy_given_Z(
+    x: pd.Series, y: pd.Series, Z: pd.DataFrame, method: str
+) -> Tuple[float, float, int]:
+    """Compute partial correlation of ``x`` and ``y`` controlling for ``Z``."""
+    df_full = pd.concat([x.rename("x"), y.rename("y"), Z], axis=1)
+    df = df_full.dropna()
+    if len(df) < 5 or df["y"].nunique() <= 1:
+        return np.nan, np.nan, 0
+    if method == "spearman":
+        xr = stats.rankdata(df["x"].to_numpy())
+        yr = stats.rankdata(df["y"].to_numpy())
+        Zr = (
+            np.column_stack([stats.rankdata(df[c].to_numpy()) for c in Z.columns])
+            if len(Z.columns)
+            else np.empty((len(df), 0))
+        )
+        Xd = np.column_stack([np.ones(len(df)), Zr])
+        bx = np.linalg.lstsq(Xd, xr, rcond=None)[0]
+        by = np.linalg.lstsq(Xd, yr, rcond=None)[0]
+        x_res = xr - Xd.dot(bx)
+        y_res = yr - Xd.dot(by)
+        r_p, p_p = stats.pearsonr(x_res, y_res)
+    else:
+        Xd = np.column_stack([np.ones(len(df)), df[Z.columns].to_numpy()])
+        bx = np.linalg.lstsq(Xd, df["x"].to_numpy(), rcond=None)[0]
+        by = np.linalg.lstsq(Xd, df["y"].to_numpy(), rcond=None)[0]
+        x_res = df["x"].to_numpy() - Xd.dot(bx)
+        y_res = df["y"].to_numpy() - Xd.dot(by)
+        r_p, p_p = stats.pearsonr(x_res, y_res)
+    return float(r_p), float(p_p), int(len(df))
+
+
+def _partial_residuals_xy_given_Z(
+    x: pd.Series, y: pd.Series, Z: pd.DataFrame, method: str
+) -> Tuple[pd.Series, pd.Series, int]:
+    """Compute partial residuals of ``x`` and ``y`` after regressing out ``Z``."""
+    df_full = pd.concat([x.rename("x"), y.rename("y"), Z], axis=1)
+    df = df_full.dropna()
+    if len(df) < 5 or df["y"].nunique() <= 1:
+        return pd.Series(dtype=float), pd.Series(dtype=float), 0
+    if method == "spearman":
+        xr = stats.rankdata(df["x"].to_numpy())
+        yr = stats.rankdata(df["y"].to_numpy())
+        Zr = (
+            np.column_stack([stats.rankdata(df[c].to_numpy()) for c in Z.columns])
+            if len(Z.columns)
+            else np.empty((len(df), 0))
+        )
+        Xd = np.column_stack([np.ones(len(df)), Zr])
+        bx = np.linalg.lstsq(Xd, xr, rcond=None)[0]
+        by = np.linalg.lstsq(Xd, yr, rcond=None)[0]
+        x_res = xr - Xd.dot(bx)
+        y_res = yr - Xd.dot(by)
+    else:
+        Xd = np.column_stack([np.ones(len(df)), df[Z.columns].to_numpy()])
+        bx = np.linalg.lstsq(Xd, df["x"].to_numpy(), rcond=None)[0]
+        by = np.linalg.lstsq(Xd, df["y"].to_numpy(), rcond=None)[0]
+        x_res = df["x"].to_numpy() - Xd.dot(bx)
+        y_res = df["y"].to_numpy() - Xd.dot(by)
+    return (
+        pd.Series(x_res, index=df.index),
+        pd.Series(y_res, index=df.index),
+        int(len(df)),
+    )
+
+
 def _features_dir(subject: str) -> Path:
     return DERIV_ROOT / f"sub-{subject}" / "eeg" / "features"
 
@@ -325,7 +427,32 @@ def _setup_logging(subject: str) -> logging.Logger:
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    
+
+    return logger
+
+
+def _setup_group_logging() -> logging.Logger:
+    """Set up logging for group-level analysis."""
+    logger = logging.getLogger("behavior_analysis_group")
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    log_dir = _group_plots_dir().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / LOG_FILE_NAME
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
     return logger
 
 
@@ -455,6 +582,246 @@ def _bh_adjust(pvals: np.ndarray) -> np.ndarray:
     q[order] = q_sorted
     return q
 
+# -----------------------------------------------------------------------------
+# Shared visualization utilities
+# -----------------------------------------------------------------------------
+
+
+def _sig_color(p: float) -> str:
+    """Return a color based on statistical significance."""
+    return "#C42847" if (np.isfinite(p) and p < 0.05) else "#666666"
+
+
+def _fisher_ci_r(r: float, n: int, alpha: float = 0.05) -> Tuple[float, float]:
+    """Fisher z-transform based confidence interval for correlations."""
+    if not np.isfinite(r) or n < 4:
+        return np.nan, np.nan
+    r = float(np.clip(r, -0.999999, 0.999999))
+    z = np.arctanh(r)
+    se = 1.0 / np.sqrt(n - 3)
+    zcrit = float(stats.norm.ppf(1 - alpha / 2.0))
+    lo = z - zcrit * se
+    hi = z + zcrit * se
+    return float(np.tanh(lo)), float(np.tanh(hi))
+
+
+def _bootstrap_corr_ci(
+    x: pd.Series,
+    y: pd.Series,
+    method: str,
+    n_boot: int = 1000,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[float, float]:
+    """Bootstrap confidence interval for correlation."""
+    dfb = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
+    if n_boot <= 0 or len(dfb) < 5:
+        return np.nan, np.nan
+    if rng is None:
+        rng = np.random.default_rng(42)
+    Xv = dfb["x"].to_numpy()
+    Yv = dfb["y"].to_numpy()
+    N = len(dfb)
+    vals: List[float] = []
+    for _ in range(int(n_boot)):
+        idx = rng.integers(0, N, size=N)
+        xb = Xv[idx]
+        yb = Yv[idx]
+        if method == "spearman" and len(np.unique(yb)) > 5:
+            rb, _ = stats.spearmanr(xb, yb, nan_policy="omit")
+        else:
+            rb, _ = stats.pearsonr(xb, yb)
+        if np.isfinite(rb):
+            vals.append(float(rb))
+    if not vals:
+        return np.nan, np.nan
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+
+def _generate_correlation_scatter(
+    x_data: pd.Series,
+    y_data: pd.Series,
+    x_label: str,
+    y_label: str,
+    title_prefix: str,
+    band_color: str,
+    output_path: Path,
+    *,
+    method_code: str = "spearman",
+    Z_covars: Optional[pd.DataFrame] = None,
+    covar_names: Optional[List[str]] = None,
+    bootstrap_ci: int = 0,
+    rng: Optional[np.random.Generator] = None,
+    is_partial_residuals: bool = False,
+    roi_channels: Optional[List[str]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[float, float, int]:
+    """Generate correlation scatter plots with marginal histograms and stats.
+
+    Returns the correlation coefficient, p-value and effective sample size.
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    if len(x_data) != len(y_data):
+        logger.warning(
+            f"Data length mismatch: x={len(x_data)}, y={len(y_data)}. Using overlap for correlation."
+        )
+    n_len = min(len(x_data), len(y_data))
+    x = x_data.iloc[:n_len] if hasattr(x_data, "iloc") else x_data[:n_len]
+    y = y_data.iloc[:n_len] if hasattr(y_data, "iloc") else y_data[:n_len]
+
+    if is_partial_residuals:
+        m = pd.Series([True] * len(x), index=x.index if hasattr(x, "index") else range(len(x)))
+        n_eff = len(x)
+        x_clean = x
+        y_clean = y
+    else:
+        m = x.notna() & y.notna()
+        n_eff = int(m.sum())
+        x_clean = x[m]
+        y_clean = y[m]
+
+    if n_eff < 5:
+        return np.nan, np.nan, n_eff
+
+    if is_partial_residuals:
+        if method_code == "spearman":
+            r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
+        else:
+            r, p = stats.pearsonr(x_clean, y_clean)
+        r_part, p_part, n_part = np.nan, np.nan, 0
+    else:
+        if method_code == "spearman" and y.nunique() > 5:
+            r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
+        else:
+            r, p = stats.pearsonr(x_clean, y_clean)
+        r_part, p_part, n_part = np.nan, np.nan, 0
+        if Z_covars is not None and len(Z_covars) > 0:
+            n_len_pt = min(len(x), len(y), len(Z_covars))
+            r_part, p_part, n_part = _partial_corr_xy_given_Z(
+                x.iloc[:n_len_pt], y.iloc[:n_len_pt], Z_covars.iloc[:n_len_pt], method_code
+            )
+
+    if method_code == "pearson" and n_eff >= 4:
+        ci = _fisher_ci_r(r, n_eff)
+    elif method_code == "spearman" and bootstrap_ci > 0:
+        ci = _bootstrap_corr_ci(x_clean, y_clean, method_code, n_boot=int(bootstrap_ci), rng=rng)
+    else:
+        ci = (np.nan, np.nan)
+
+    fig = plt.figure(figsize=(8, 6))
+    gs = fig.add_gridspec(
+        2,
+        2,
+        width_ratios=[4, 1],
+        height_ratios=[1, 4],
+        hspace=0.15,
+        wspace=0.15,
+        left=0.1,
+        right=0.95,
+        top=0.80,
+        bottom=0.12,
+    )
+    ax_main = fig.add_subplot(gs[1, 0])
+    ax_histx = fig.add_subplot(gs[0, 0], sharex=ax_main)
+    ax_histy = fig.add_subplot(gs[1, 1], sharey=ax_main)
+    ax_histx.tick_params(labelbottom=False)
+    ax_histy.tick_params(labelleft=False)
+
+    line_color = _sig_color(p)
+    sns.regplot(
+        x=x_clean,
+        y=y_clean,
+        ax=ax_main,
+        ci=95,
+        scatter_kws={"s": 30, "alpha": 0.7, "color": band_color, "edgecolor": "white", "linewidths": 0.3},
+        line_kws={"color": line_color, "lw": 1.5},
+    )
+
+    ax_histx.hist(x_clean, bins=15, color=band_color, alpha=0.7, edgecolor="white", linewidth=0.5)
+    try:
+        from scipy.stats import gaussian_kde
+
+        if len(x_clean) > 3:
+            kde_x = gaussian_kde(x_clean)
+            x_range = np.linspace(x_clean.min(), x_clean.max(), 100)
+            kde_vals = kde_x(x_range)
+            hist_counts, _ = np.histogram(x_clean, bins=15)
+            kde_scale = hist_counts.max() / kde_vals.max() if kde_vals.max() > 0 else 1
+            ax_histx.plot(x_range, kde_vals * kde_scale, color="darkblue", linewidth=1.5, alpha=0.8)
+    except (ImportError, ValueError, ZeroDivisionError):
+        pass
+
+    ax_histy.hist(
+        y_clean,
+        bins=15,
+        orientation="horizontal",
+        color=band_color,
+        alpha=0.7,
+        edgecolor="white",
+        linewidth=0.5,
+    )
+    try:
+        from scipy.stats import gaussian_kde
+
+        if len(y_clean) > 3:
+            kde_y = gaussian_kde(y_clean)
+            y_range = np.linspace(y_clean.min(), y_clean.max(), 100)
+            kde_vals_y = kde_y(y_range)
+            hist_counts_y, _ = np.histogram(y_clean, bins=15)
+            kde_scale_y = hist_counts_y.max() / kde_vals_y.max() if kde_vals_y.max() > 0 else 1
+            ax_histy.plot(kde_vals_y * kde_scale_y, y_range, color="darkblue", linewidth=1.5, alpha=0.8)
+    except (ImportError, ValueError, ZeroDivisionError):
+        pass
+
+    ax_main.set_xlabel(x_label)
+    ax_main.set_ylabel(y_label)
+
+    show_pct_axis = False
+    if not is_partial_residuals and "log10(power" in x_label:
+        show_pct_axis = True
+    elif is_partial_residuals and method_code == "pearson" and "residuals of log10(power" in x_label:
+        show_pct_axis = True
+
+    if show_pct_axis:
+        try:
+            ax_pct = ax_histx.secondary_xaxis("top", functions=(_logratio_to_pct, _pct_to_logratio))
+            ax_pct.set_xlabel("Power Change (%)", fontsize=9)
+            ax_pct.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    label = "Spearman ρ" if method_code == "spearman" else "Pearson r"
+    stats_text = f"{label} = {r:.3f}\np = {p:.3f}\nn = {n_eff}"
+    fig.text(
+        0.98,
+        0.94,
+        stats_text,
+        fontsize=10,
+        va="top",
+        ha="right",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
+    if roi_channels:
+        try:
+            chan_text = "Channels: " + ", ".join(roi_channels[:10])
+            fig.text(
+                0.02,
+                0.94,
+                chan_text,
+                fontsize=8,
+                va="top",
+                ha="left",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+            )
+        except Exception:
+            pass
+
+    ax_main.set_title(title_prefix)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+    return float(r), float(p), int(n_eff)
 
 
 # -----------------------------------------------------------------------------
@@ -1121,38 +1488,7 @@ def plot_power_roi_scatter(
         if tcol is not None:
             temp_col = tcol
             temp_series = pd.to_numeric(aligned_events[tcol], errors="coerce")
-
-    # Helper to build covariate design matrix Z
-    def _build_Z(df_events: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-        if df_events is None:
-            return None
-        covars = list(partial_covars) if partial_covars is not None else []
-        if not covars:
-            # Reasonable defaults: temperature and a trial index if present
-            tcol_loc = _pick_first_column(df_events, PSYCH_TEMP_COLUMNS)
-            if tcol_loc is not None:
-                covars.append(tcol_loc)
-            for c in ["trial", "trial_number", "trial_index", "run", "block"]:
-                if c in df_events.columns:
-                    covars.append(c)
-                    break
-        if not covars:
-            return None
-        Z = pd.DataFrame()
-        for c in covars:
-            if c in df_events.columns:
-                Z[c] = pd.to_numeric(df_events[c], errors="coerce")
-        return Z if not Z.empty else None
-
-    Z_df_full = _build_Z(aligned_events)
-    Z_df_temp = None
-    if Z_df_full is not None:
-        try:
-            Z_df_temp = Z_df_full.drop(columns=[temp_col], errors="ignore") if temp_col else Z_df_full.copy()
-            if Z_df_temp.shape[1] == 0:
-                Z_df_temp = None
-        except (KeyError, AttributeError, ValueError):
-            Z_df_temp = Z_df_full
+    Z_df_full, Z_df_temp = _build_covariate_matrices(aligned_events, partial_covars, temp_col)
 
     # Helpers: significance formatting, CIs, bootstrap CIs, and stats textbox
     def _p_to_stars(p: float) -> str:
@@ -1165,50 +1501,6 @@ def plot_power_roi_scatter(
         if p < 0.05:
             return "*"
         return "n.s."
-
-    def _sig_color(p: float) -> str:
-        return "#C42847" if (np.isfinite(p) and p < 0.05) else "#666666"
-
-    def _fisher_ci_r(r: float, n: int, alpha: float = 0.05) -> Tuple[float, float]:
-        if not np.isfinite(r) or n < 4:
-            return np.nan, np.nan
-        r = float(np.clip(r, -0.999999, 0.999999))
-        z = np.arctanh(r)
-        se = 1.0 / np.sqrt(n - 3)
-        zcrit = float(stats.norm.ppf(1 - alpha / 2.0))
-        lo = z - zcrit * se
-        hi = z + zcrit * se
-        return float(np.tanh(lo)), float(np.tanh(hi))
-
-    def _bootstrap_corr_ci(
-        x: pd.Series,
-        y: pd.Series,
-        method: str,
-        n_boot: int = 1000,
-        rng: Optional[np.random.Generator] = None,
-    ) -> Tuple[float, float]:
-        dfb = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
-        if n_boot <= 0 or len(dfb) < 5:
-            return np.nan, np.nan
-        if rng is None:
-            rng = np.random.default_rng(42)
-        Xv = dfb["x"].to_numpy()
-        Yv = dfb["y"].to_numpy()
-        N = len(dfb)
-        vals: List[float] = []
-        for _ in range(int(n_boot)):
-            idx = rng.integers(0, N, size=N)
-            xb = Xv[idx]
-            yb = Yv[idx]
-            if method == "spearman" and len(np.unique(yb)) > 5:
-                rb, _ = stats.spearmanr(xb, yb, nan_policy="omit")
-            else:
-                rb, _ = stats.pearsonr(xb, yb)
-            if np.isfinite(rb):
-                vals.append(float(rb))
-        if not vals:
-            return np.nan, np.nan
-        return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
 
     def _fmt_stats_text(
         r: float,
@@ -1320,7 +1612,7 @@ def plot_power_roi_scatter(
         fig, ax = plt.subplots(figsize=(5.2, 3.8))
         return fig, ax
 
-    def _generate_correlation_scatter(
+    def _generate_correlation_scatter_local(
         x_data: pd.Series,
         y_data: pd.Series,
         x_label: str,
@@ -1585,7 +1877,7 @@ def plot_power_roi_scatter(
         _ensure_dir(overall_plots_dir)
         
         # Rating target scatter (overall)
-        _generate_correlation_scatter(
+        _generate_correlation_scatter_local(
             x_data=overall_vals,
             y_data=y,
             x_label="log10(power/baseline [-5–0 s])",
@@ -1629,7 +1921,7 @@ def plot_power_roi_scatter(
                 )
                 residual_ylabel = "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
                 
-                _generate_correlation_scatter(
+                _generate_correlation_scatter_local(
                     x_data=x_res_sr,
                     y_data=y_res_sr,
                     x_label=residual_xlabel,
@@ -1650,7 +1942,7 @@ def plot_power_roi_scatter(
             method2_code = "spearman" if do_spear_t else "pearson"
             covar_names_temp = list(Z_df_temp.columns) if Z_df_temp is not None else None
             
-            _generate_correlation_scatter(
+            _generate_correlation_scatter_local(
                 x_data=overall_vals,
                 y_data=temp_series,
                 x_label="log10(power/baseline [-5–0 s])",
@@ -1693,7 +1985,7 @@ def plot_power_roi_scatter(
                     )
                     residual_ylabel = "Partial residuals (ranked) of temperature (°C)" if method2_code == "spearman" else "Partial residuals of temperature (°C)"
                     
-                    _generate_correlation_scatter(
+                    _generate_correlation_scatter_local(
                         x_data=x2_res_sr,
                         y_data=y2_res_sr,
                         x_label=residual_xlabel,
@@ -1718,7 +2010,7 @@ def plot_power_roi_scatter(
             _ensure_dir(roi_plots_dir)
 
             # ROI-specific rating scatter
-            _generate_correlation_scatter(
+            _generate_correlation_scatter_local(
                 x_data=roi_vals,
                 y_data=y,
                 x_label="log10(power/baseline [-5–0 s])",
@@ -1763,7 +2055,7 @@ def plot_power_roi_scatter(
                     )
                     residual_ylabel = "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
                     
-                    _generate_correlation_scatter(
+                    _generate_correlation_scatter_local(
                     x_data=x_res_sr,
                     y_data=y_res_sr,
                     x_label=residual_xlabel,
@@ -1785,7 +2077,7 @@ def plot_power_roi_scatter(
                 method2_code = "spearman" if do_spear_t else "pearson"
                 covar_names_temp = list(Z_df_temp.columns) if Z_df_temp is not None else None
                 
-                _generate_correlation_scatter(
+                _generate_correlation_scatter_local(
                     x_data=roi_vals,
                     y_data=temp_series,
                     x_label="log10(power/baseline [-5–0 s])",
@@ -1828,8 +2120,7 @@ def plot_power_roi_scatter(
                             else "Partial residuals of log10(power/baseline)"
                         )
                         residual_ylabel = "Partial residuals (ranked) of temperature (°C)" if method2_code == "spearman" else "Partial residuals of temperature (°C)"
-                        
-                        _generate_correlation_scatter(
+                        _generate_correlation_scatter_local(
                             x_data=x2_res_sr,
                             y_data=y2_res_sr,
                             x_label=residual_xlabel,
@@ -1843,6 +2134,242 @@ def plot_power_roi_scatter(
                             is_partial_residuals=True,
                             roi_channels=chs,
                         )
+
+# -----------------------------------------------------------------------------
+# Group-level visualization: pooled ROI power scatter plots
+# -----------------------------------------------------------------------------
+
+def plot_group_power_roi_scatter(
+    subjects: List[str],
+    task: str = TASK,
+    use_spearman: bool = True,
+    partial_covars: Optional[List[str]] = None,
+    do_temp: bool = True,
+    bootstrap_ci: int = 0,
+    rng: Optional[np.random.Generator] = None,
+) -> None:
+    """Create pooled ROI power scatter plots across subjects."""
+    logger = _setup_group_logging()
+    plots_dir = _group_plots_dir()
+    stats_dir = _group_stats_dir()
+    _ensure_dir(plots_dir)
+    _ensure_dir(stats_dir)
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    rating_x_by_key: Dict[Tuple[str, str], List[np.ndarray]] = {}
+    rating_y_by_key: Dict[Tuple[str, str], List[np.ndarray]] = {}
+    rating_Z_by_key: Dict[Tuple[str, str], List[pd.DataFrame]] = {}
+    temp_x_by_key: Dict[Tuple[str, str], List[np.ndarray]] = {}
+    temp_y_by_key: Dict[Tuple[str, str], List[np.ndarray]] = {}
+    temp_Z_by_key: Dict[Tuple[str, str], List[pd.DataFrame]] = {}
+    have_temp = False
+
+    for sub in subjects:
+        try:
+            pow_df, _conn_df, y, info = _load_features_and_targets(sub, task)
+        except Exception as e:
+            logger.warning(f"Skipping sub-{sub} for group scatter: {e}")
+            continue
+        y = pd.to_numeric(y, errors="coerce")
+
+        # Load events for covariates and temperature
+        try:
+            epo_path = _find_clean_epochs_path(sub, task)
+            if epo_path is None:
+                raise FileNotFoundError("epochs not found")
+            epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+            events = _load_events_df(sub, task)
+            aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
+        except Exception as e:
+            logger.warning(f"Skipping sub-{sub} due to events/epochs issue: {e}")
+            continue
+
+        temp_series: Optional[pd.Series] = None
+        temp_col: Optional[str] = None
+        if aligned_events is not None:
+            tcol = _pick_first_column(aligned_events, PSYCH_TEMP_COLUMNS)
+            if tcol is not None:
+                temp_col = tcol
+                temp_series = pd.to_numeric(aligned_events[tcol], errors="coerce")
+                have_temp = True
+
+        Z_df_full, Z_df_temp = _build_covariate_matrices(aligned_events, partial_covars, temp_col)
+
+        roi_map = _build_rois(info)
+        for band in POWER_BANDS_TO_USE:
+            band_cols = [c for c in pow_df.columns if c.startswith(f"pow_{band}_")]
+            if not band_cols:
+                continue
+            band_vals = pow_df[band_cols].apply(pd.to_numeric, errors="coerce")
+            overall_vals = band_vals.mean(axis=1).to_numpy()
+            key_overall = (band, "All")
+            rating_x_by_key.setdefault(key_overall, []).append(overall_vals)
+            rating_y_by_key.setdefault(key_overall, []).append(y.to_numpy())
+            if Z_df_full is not None:
+                rating_Z_by_key.setdefault(key_overall, []).append(Z_df_full)
+            if do_temp and temp_series is not None:
+                temp_x_by_key.setdefault(key_overall, []).append(overall_vals)
+                temp_y_by_key.setdefault(key_overall, []).append(temp_series.to_numpy())
+                if Z_df_temp is not None:
+                    temp_Z_by_key.setdefault(key_overall, []).append(Z_df_temp)
+            for roi, chs in roi_map.items():
+                cols = [f"pow_{band}_{ch}" for ch in chs if f"pow_{band}_{ch}" in pow_df.columns]
+                if not cols:
+                    continue
+                roi_vals = pow_df[cols].apply(pd.to_numeric, errors="coerce").mean(axis=1).to_numpy()
+                key = (band, roi)
+                rating_x_by_key.setdefault(key, []).append(roi_vals)
+                rating_y_by_key.setdefault(key, []).append(y.to_numpy())
+                if Z_df_full is not None:
+                    rating_Z_by_key.setdefault(key, []).append(Z_df_full)
+                if do_temp and temp_series is not None:
+                    temp_x_by_key.setdefault(key, []).append(roi_vals)
+                    temp_y_by_key.setdefault(key, []).append(temp_series.to_numpy())
+                    if Z_df_temp is not None:
+                        temp_Z_by_key.setdefault(key, []).append(Z_df_temp)
+
+    rating_records: List[Dict[str, object]] = []
+    method_code = "spearman" if use_spearman else "pearson"
+    for (band, roi), x_lists in rating_x_by_key.items():
+        y_lists = rating_y_by_key.get((band, roi))
+        if not y_lists:
+            continue
+        x_all = pd.Series(np.concatenate(x_lists))
+        y_all = pd.Series(np.concatenate(y_lists))
+        Z_lists = rating_Z_by_key.get((band, roi))
+        Z_all = pd.concat(Z_lists, ignore_index=True) if Z_lists else None
+        band_rng = FEATURES_FREQ_BANDS.get(band)
+        band_title = f"{band.capitalize()} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band.capitalize()
+        title_roi = "Overall" if roi == "All" else roi
+        title_prefix = f"{band_title} power vs rating — {title_roi}"
+        out_dir = plots_dir / ("overall" if roi == "All" else "roi_scatters" / _sanitize(roi))
+        _ensure_dir(out_dir)
+        base_name = (
+            f"scatter_pow_overall_{_sanitize(band)}_vs_rating" if roi == "All" else f"scatter_pow_{_sanitize(band)}_vs_rating"
+        )
+        out_path = out_dir / base_name
+        r, p, n_eff = _generate_correlation_scatter(
+            x_data=x_all,
+            y_data=y_all,
+            x_label="log10(power/baseline [-5–0 s])",
+            y_label="Rating",
+            title_prefix=title_prefix,
+            band_color=_get_band_color(band),
+            output_path=out_path,
+            method_code=method_code,
+            Z_covars=Z_all,
+            covar_names=list(Z_all.columns) if Z_all is not None else None,
+            bootstrap_ci=bootstrap_ci,
+            rng=rng,
+            logger=logger,
+        )
+        rating_records.append({"roi": roi, "band": band, "r_pooled": r, "p_pooled": p, "n_total": n_eff})
+
+        if Z_all is not None and len(Z_all) > 0:
+            x_res, y_res, n_res = _partial_residuals_xy_given_Z(x_all, y_all, Z_all, method_code)
+            if n_res >= 5:
+                residual_xlabel = (
+                    "Partial residuals (ranked) of log10(power/baseline)"
+                    if method_code == "spearman"
+                    else "Partial residuals of log10(power/baseline)"
+                )
+                residual_ylabel = (
+                    "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
+                )
+                _generate_correlation_scatter(
+                    x_data=x_res,
+                    y_data=y_res,
+                    x_label=residual_xlabel,
+                    y_label=residual_ylabel,
+                    title_prefix=f"Partial residuals — {band_title} power vs rating — {title_roi}",
+                    band_color=_get_band_color(band),
+                    output_path=out_dir / f"{base_name}_partial",
+                    method_code=method_code,
+                    is_partial_residuals=True,
+                    rng=rng,
+                    logger=logger,
+                )
+
+    if rating_records:
+        df = pd.DataFrame(rating_records)
+        rej, crit = _fdr_bh(df["p_pooled"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
+        df["fdr_reject"] = rej
+        df["fdr_crit_p"] = crit
+        df.to_csv(stats_dir / "group_pooled_corr_pow_roi_vs_rating.tsv", sep="\t", index=False)
+
+    if do_temp and have_temp:
+        temp_records: List[Dict[str, object]] = []
+        for (band, roi), x_lists in temp_x_by_key.items():
+            y_lists = temp_y_by_key.get((band, roi))
+            if not y_lists:
+                continue
+            x_all = pd.Series(np.concatenate(x_lists))
+            y_all = pd.Series(np.concatenate(y_lists))
+            Z_lists = temp_Z_by_key.get((band, roi))
+            Z_all = pd.concat(Z_lists, ignore_index=True) if Z_lists else None
+            band_rng = FEATURES_FREQ_BANDS.get(band)
+            band_title = f"{band.capitalize()} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band.capitalize()
+            title_roi = "Overall" if roi == "All" else roi
+            title_prefix = f"{band_title} power vs temperature — {title_roi}"
+            out_dir = plots_dir / ("overall" if roi == "All" else "roi_scatters" / _sanitize(roi))
+            _ensure_dir(out_dir)
+            base_name = (
+                f"scatter_pow_overall_{_sanitize(band)}_vs_temp" if roi == "All" else f"scatter_pow_{_sanitize(band)}_vs_temp"
+            )
+            out_path = out_dir / base_name
+            method2_code = "spearman" if (use_spearman and y_all.nunique() > 5) else "pearson"
+            r, p, n_eff = _generate_correlation_scatter(
+                x_data=x_all,
+                y_data=y_all,
+                x_label="log10(power/baseline [-5–0 s])",
+                y_label="Temperature (°C)",
+                title_prefix=title_prefix,
+                band_color=_get_band_color(band),
+                output_path=out_path,
+                method_code=method2_code,
+                Z_covars=Z_all,
+                covar_names=list(Z_all.columns) if Z_all is not None else None,
+                bootstrap_ci=bootstrap_ci,
+                rng=rng,
+                logger=logger,
+            )
+            temp_records.append({"roi": roi, "band": band, "r_pooled": r, "p_pooled": p, "n_total": n_eff})
+
+            if Z_all is not None and len(Z_all) > 0:
+                x_res2, y_res2, n_res2 = _partial_residuals_xy_given_Z(x_all, y_all, Z_all, method2_code)
+                if n_res2 >= 5:
+                    residual_xlabel = (
+                        "Partial residuals (ranked) of log10(power/baseline)"
+                        if method2_code == "spearman"
+                        else "Partial residuals of log10(power/baseline)"
+                    )
+                    residual_ylabel = (
+                        "Partial residuals (ranked) of temperature (°C)"
+                        if method2_code == "spearman"
+                        else "Partial residuals of temperature (°C)"
+                    )
+                    _generate_correlation_scatter(
+                        x_data=x_res2,
+                        y_data=y_res2,
+                        x_label=residual_xlabel,
+                        y_label=residual_ylabel,
+                        title_prefix=f"Partial residuals — {band_title} power vs temperature — {title_roi}",
+                        band_color=_get_band_color(band),
+                        output_path=out_dir / f"{base_name}_partial",
+                        method_code=method2_code,
+                        is_partial_residuals=True,
+                        rng=rng,
+                        logger=logger,
+                    )
+
+        if temp_records:
+            df_t = pd.DataFrame(temp_records)
+            rej_t, crit_t = _fdr_bh(df_t["p_pooled"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
+            df_t["fdr_reject"] = rej_t
+            df_t["fdr_crit_p"] = crit_t
+            df_t.to_csv(stats_dir / "group_pooled_corr_pow_roi_vs_temp.tsv", sep="\t", index=False)
 
 # Residual Diagnostic Visualization for Regression Analysis
 # -----------------------------------------------------------------------------
@@ -4696,6 +5223,22 @@ def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK
         out_df["fdr_reject"] = rej
         out_df["fdr_crit_p"] = crit
         out_df.to_csv(gstats / f"group_corr_conn_roi_summary_{_sanitize(pref)}_vs_rating.tsv", sep="\t", index=False)
+
+    # Generate pooled scatter plots across subjects
+    try:
+        plot_group_power_roi_scatter(
+            subjects,
+            task=task,
+            use_spearman=USE_SPEARMAN_DEFAULT,
+            partial_covars=PARTIAL_COVARS_DEFAULT,
+            do_temp=True,
+            bootstrap_ci=0,
+            rng=None,
+        )
+    except Exception as e:
+        logging.getLogger("behavior_analysis_group").error(
+            f"Group scatter plotting failed: {e}"
+        )
 
 
 def build_subject_report(subject: str, task: str = TASK) -> None:
