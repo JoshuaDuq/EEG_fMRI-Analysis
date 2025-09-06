@@ -1359,10 +1359,13 @@ def load_tabular_features_and_targets(
         # Ensure numeric target (first column assumed to be rating as saved by 03_feature_engineering)
         tgt_col = y_df.columns[0]
         y = pd.to_numeric(y_df[tgt_col], errors="coerce")
-        # Align lengths
-        n = min(len(X), len(y))
-        if n == 0:
-            logger.warning(f"No trials after alignment for {sub}; skipping.")
+        # Strict alignment check
+        if len(X) != len(y):
+            logger.error(f"Feature-target length mismatch for {sub}: X={len(X)}, y={len(y)}. "
+                        f"Cannot guarantee alignment. Skipping subject.")
+            continue
+        if len(X) == 0:
+            logger.warning(f"No trials for {sub}; skipping.")
             continue
         # Enforce consistent column order across subjects
         if col_template is None:
@@ -3057,10 +3060,17 @@ def load_epochs_targets_groups(
                         return out.reset_index()
                 except Exception:
                     pass
-            n = min(len(events_df), len(epochs))
-            if n == 0:
-                return None
-            return events_df.iloc[:n].reset_index(drop=True)
+            # Critical failure: Cannot guarantee alignment
+            logger.critical(f"CRITICAL: Unable to align events to epochs reliably. "
+                           f"Events: {len(events_df)} rows, Epochs: {len(epochs)} epochs. "
+                           f"This would result in invalid correlations due to trial misalignment.")
+            
+            raise ValueError(
+                f"Cannot guarantee events-to-epochs alignment for reliable analysis. "
+                f"Events DataFrame ({len(events_df)} rows) cannot be reliably aligned to "
+                f"epochs ({len(epochs)} epochs). This is a critical failure that would "
+                f"invalidate all behavioral correlations."
+            )
 
         def __fallback_pick_target_column(df):
             candidates = [
@@ -3144,14 +3154,14 @@ def load_epochs_targets_groups(
             logger.warning(f"No suitable target column for {sub}; skipping.")
             continue
         y = pd.to_numeric(aligned[tgt_col], errors="coerce")
-        # Align lengths with epochs
-        n = min(len(epochs), len(y))
-        if n == 0:
-            logger.warning(f"No trials after alignment for {sub}; skipping.")
+        # Strict alignment check
+        if len(epochs) != len(y):
+            logger.error(f"Epochs-target length mismatch for {sub}: epochs={len(epochs)}, y={len(y)}. "
+                        f"Cannot guarantee alignment. Skipping subject.")
             continue
-        if len(epochs) != n:
-            epochs = epochs[:n]
-        y = y.iloc[:n]
+        if len(epochs) == 0:
+            logger.warning(f"No trials for {sub}; skipping.")
+            continue
 
         out.append((sub, epochs, y))
         ch_sets.append(set([ch for ch in epochs.info["ch_names"] if epochs.get_channel_types(picks=[ch])[0] == "eeg"]))
@@ -3627,10 +3637,12 @@ def riemann_visualize_cov_bins(
             except Exception:
                 pass
         X = epochs_use.get_data(picks="eeg")
-        n = min(len(X), len(y))
-        if n < 2:
+        if len(X) != len(y):
+            logger.error(f"X-y length mismatch: X={len(X)}, y={len(y)}. Skipping fold.")
             continue
-        yv = pd.to_numeric(y.iloc[:n], errors="coerce").to_numpy()
+        if len(X) < 2:
+            continue
+        yv = pd.to_numeric(y, errors="coerce").to_numpy()
         subj_data.append((sub, X[:n], yv, epochs_use.info))
         if info_for_plot is None:
             # Use first subject's info (already in canonical order) for topomap positions
@@ -4378,7 +4390,7 @@ def run_riemann_sliding_window(
 # -----------------------------------------------------------------------------
 
 @_validate_inputs
-def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -1, seed: int = RANDOM_STATE, outer_n_jobs: int = 1) -> None:
+def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -1, seed: int = RANDOM_STATE, outer_n_jobs: int = 1, all_subjects: bool = False) -> None:
     deriv_root = Path(DERIV_ROOT)
     results_dir = deriv_root / CONFIG["paths"]["results_subdir"]
     plots_dir = results_dir / CONFIG["paths"]["plots_subdir"] / "05_decode_pain_experience"
@@ -4427,6 +4439,10 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     # (These will be explicitly set via argparse in __main__.)
 
     # 1) Tabular features aggregation
+    if all_subjects:
+        subjects = None  # trigger auto-detect in loader
+    elif subjects is None or len(subjects) == 0:
+        raise ValueError("No subjects specified. Use --subjects or --all-subjects.")
     X_all, y_all, groups, feat_names, meta = load_tabular_features_and_targets(deriv_root, subjects=subjects)
     # Guard against too few subjects for LOSO
     if len(np.unique(groups)) < 2:
@@ -5398,7 +5414,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG feature correlations")
-    parser.add_argument("--subjects", nargs="*", default=None, help="Subject IDs to process (e.g., 001 002) or 'all' for all configured subjects")
+    subj_group = parser.add_mutually_exclusive_group(required=True)
+    subj_group.add_argument("--subjects", nargs="*", help="Subject IDs to process (e.g., 001 002)")
+    subj_group.add_argument("--all-subjects", action="store_true", help="Process all subjects with available features")
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
     args = parser.parse_args()
 
@@ -5424,5 +5442,4 @@ if __name__ == "__main__":
     if args.no_shap:
         CONFIG["flags"]["run_shap"] = False
 
-    subs = None if args.subjects in (None, [], ["all"]) else args.subjects
-    main(subjects=subs, task=args.task, n_jobs=args.n_jobs, seed=RANDOM_STATE, outer_n_jobs=int(args.outer_n_jobs))
+    main(subjects=args.subjects, task=args.task, n_jobs=args.n_jobs, seed=RANDOM_STATE, outer_n_jobs=int(args.outer_n_jobs), all_subjects=args.all_subjects)
