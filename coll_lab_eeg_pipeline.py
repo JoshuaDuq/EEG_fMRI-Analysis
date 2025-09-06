@@ -437,10 +437,8 @@ def run_bads_detection(
                     chan_file.loc[chan_file["name"] == ch, "description"] = (
                         "Bad channel detected by pyprep"
                     )
-                    # Different description if ch in custom_bad_dict
-                    if custom_bad_dict is not None and ch in custom_bad_dict.get(
-                        get_entities_from_fname(file)["subject"], []
-                    ):
+                    # Different description if ch in custom bad-channel list for this task/subject
+                    if custom_bad_dict is not None and ch in custom_bad_dict.get(task, {}).get(sub, []):
                         chan_file.loc[chan_file["name"] == ch, "description"] = (
                             "Bad channel from custom bad channel list"
                         )
@@ -863,10 +861,30 @@ def collect_preprocessing_stats(bids_path, pipeline_path, task):
 
         sub_num = "sub-" + get_entities_from_fname(p)["subject"]
 
-        # Get the channel file
+        # Get the channel file - try consolidated first, then run-specific
         chan_filename = p.replace("_proc-clean_epo.fif", "_bads.tsv")
-
-        chan_file = pd.read_csv(chan_filename, sep="\t")
+        
+        if not os.path.exists(chan_filename):
+            # Try to find run-specific bads files and aggregate them
+            import glob
+            run_pattern = chan_filename.replace("_bads.tsv", "_run-*_bads.tsv")
+            run_bads_files = glob.glob(run_pattern)
+            
+            if run_bads_files:
+                # Read all run-specific bads files and get unique bad channels
+                all_bad_channels = set()
+                for run_file in run_bads_files:
+                    run_bads = pd.read_csv(run_file, sep="\t")
+                    all_bad_channels.update(run_bads['name'].tolist())
+                
+                # Create a temporary dataframe with unique bad channels
+                chan_file = pd.DataFrame({'name': list(all_bad_channels)})
+            else:
+                # No bads files found, assume no bad channels
+                logger.warning(f"No bads file found for {sub_num}, assuming no bad channels")
+                chan_file = pd.DataFrame({'name': []})
+        else:
+            chan_file = pd.read_csv(chan_filename, sep="\t")
 
         msg = "Collecting preprocessing stats."
         logger.info(
@@ -2884,6 +2902,82 @@ def custom_tfr(
         )
 
 
+def synchronize_bad_channels_across_runs(config_file):
+    """
+    Synchronize bad channels across all runs for each subject.
+    
+    This function reads all channel TSV files for each subject, identifies 
+    the union of bad channels across all runs, and updates all channel files
+    to have the same bad channels. This ensures compatibility with MNE functions
+    that require matching bad channels across runs (e.g., concatenate_epochs).
+    """
+    from mne_bids_pipeline._logging import gen_log_kwargs, logger
+    import pandas as pd
+    import glob
+    import os
+    
+    # Get config values
+    bids_root = get_config_keyval(config_file, "bids_root")
+    subjects_config = get_config_keyval(config_file, "subjects")
+    task = get_config_keyval(config_file, "task")
+    
+    logger.info("🔄 Synchronizing bad channels across runs for each subject...")
+    
+    # Handle subjects = "all" case by discovering actual subject IDs
+    if subjects_config == "all":
+        # Find all subject directories in BIDS root
+        subject_dirs = glob.glob(os.path.join(bids_root, "sub-*"))
+        subjects = [os.path.basename(d).replace("sub-", "") for d in subject_dirs if os.path.isdir(d)]
+        logger.info(f"📂 Discovered {len(subjects)} subjects: {subjects}")
+    else:
+        subjects = subjects_config
+    
+    for subject in subjects:
+        # Find all channel TSV files for this subject and task
+        pattern = os.path.join(bids_root, f"sub-{subject}", "eeg", f"sub-{subject}_task-{task}_*_channels.tsv")
+        channel_files = glob.glob(pattern)
+        
+        if not channel_files:
+            logger.warning(f"No channel files found for subject {subject}")
+            continue
+            
+        logger.info(f"📋 Processing {len(channel_files)} channel files for sub-{subject}")
+        
+        # Collect all bad channels across runs
+        all_bad_channels = set()
+        channel_data = {}
+        
+        for file_path in channel_files:
+            df = pd.read_csv(file_path, sep='\t')
+            # Find bad channels (status == 'bad')
+            bad_channels = df[df['status'] == 'bad']['name'].tolist()
+            all_bad_channels.update(bad_channels)
+            channel_data[file_path] = df
+            
+            run_info = os.path.basename(file_path).split('_')
+            run_id = next((part for part in run_info if part.startswith('run-')), 'unknown')
+            logger.info(f"  📁 {run_id}: Found {len(bad_channels)} bad channels: {bad_channels}")
+        
+        # Union of all bad channels
+        unified_bad_channels = sorted(list(all_bad_channels))
+        logger.info(f"🔗 Unified bad channels for sub-{subject}: {unified_bad_channels} (total: {len(unified_bad_channels)})")
+        
+        # Update all channel files with unified bad channels
+        for file_path, df in channel_data.items():
+            # Reset all channels to 'good' first
+            df['status'] = 'good'
+            # Mark unified bad channels as 'bad'
+            df.loc[df['name'].isin(unified_bad_channels), 'status'] = 'bad'
+            # Save updated file
+            df.to_csv(file_path, sep='\t', index=False)
+            
+            run_info = os.path.basename(file_path).split('_')
+            run_id = next((part for part in run_info if part.startswith('run-')), 'unknown')
+            logger.info(f"  ✅ Updated {run_id} with {len(unified_bad_channels)} bad channels")
+    
+    logger.info("✅ Bad channel synchronization completed")
+
+
 def run_pipeline_task(task, config_file):
     #########################################################
     # Update config file with task
@@ -2905,6 +2999,8 @@ def run_pipeline_task(task, config_file):
     #########################################################
     if get_config_keyval(config_file, "use_pyprep"):
         run_bads_detection(**get_specific_config(config_file, "pyprep"))
+        # Synchronize bad channels across all runs for each subject
+        synchronize_bad_channels_across_runs(config_file)
 
     #########################################################
     # First pass mne-bids pipeline to get ICA components and create the components.tsv file
@@ -2918,10 +3014,19 @@ def run_pipeline_task(task, config_file):
             + config_file
             + "', '--steps=init,preprocessing/_01_data_quality,preprocessing/_04_frequency_filter,preprocessing/_05_regress_artifact,preprocessing/_06a1_fit_ica']; main()",
         ]
+        logger.info(f"Running MNE-BIDS pipeline command: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Log both stdout and stderr for debugging
+        if result.stdout:
+            logger.info(f"MNE-BIDS pipeline stdout: {result.stdout}")
+        if result.stderr:
+            logger.warning(f"MNE-BIDS pipeline stderr: {result.stderr}")
+            
         if result.returncode != 0:
-            logger.error(f"MNE-BIDS pipeline failed with error: {result.stderr}")
-            raise RuntimeError(f"MNE-BIDS pipeline step failed: {result.stderr}")
+            error_msg = result.stderr if result.stderr else result.stdout if result.stdout else "No error output captured"
+            logger.error(f"MNE-BIDS pipeline failed with return code {result.returncode}. Error output: {error_msg}")
+            raise RuntimeError(f"MNE-BIDS pipeline step failed with return code {result.returncode}: {error_msg}")
     else:
         # If not using icalabel, use mne_bids_pipeline to find bad icas
         cmd = [
@@ -2931,10 +3036,19 @@ def run_pipeline_task(task, config_file):
             + config_file
             + "', '--steps=init,preprocessing/_01_data_quality,preprocessing/_04_frequency_filter,preprocessing/_05_regress_artifact,preprocessing/_06a1_fit_ica,preprocessing/_06a2_find_ica_artifacts.py']; main()",
         ]
+        logger.info(f"Running MNE-BIDS pipeline command: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Log both stdout and stderr for debugging
+        if result.stdout:
+            logger.info(f"MNE-BIDS pipeline stdout: {result.stdout}")
+        if result.stderr:
+            logger.warning(f"MNE-BIDS pipeline stderr: {result.stderr}")
+            
         if result.returncode != 0:
-            logger.error(f"MNE-BIDS pipeline failed with error: {result.stderr}")
-            raise RuntimeError(f"MNE-BIDS pipeline step failed: {result.stderr}")
+            error_msg = result.stderr if result.stderr else result.stdout if result.stdout else "No error output captured"
+            logger.error(f"MNE-BIDS pipeline failed with return code {result.returncode}. Error output: {error_msg}")
+            raise RuntimeError(f"MNE-BIDS pipeline step failed with return code {result.returncode}: {error_msg}")
 
     #########################################################
     # Flag bad ICA components using mne_icalabel (not yet implemented in mne-bids pipeline for EEG)
