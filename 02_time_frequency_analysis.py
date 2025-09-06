@@ -2,7 +2,7 @@ import os
 import sys
 import re
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any
 import logging
 
 import matplotlib
@@ -17,6 +17,7 @@ from mne_bids import BIDSPath
 
 # Load centralized configuration
 from config_loader import load_config, get_legacy_constants
+from tfr_utils import compute_adaptive_n_cycles
 
 config = load_config()
 config.setup_matplotlib()
@@ -35,49 +36,54 @@ RATING_COLUMNS = _constants["RATING_COLUMNS"]
 PAIN_BINARY_COLUMNS = _constants["PAIN_BINARY_COLUMNS"]
 POWER_BANDS_TO_USE = _constants["POWER_BANDS_TO_USE"]
 PLATEAU_WINDOW = _constants["PLATEAU_WINDOW"]
-FIG_DPI = _constants["FIG_DPI"]
-SAVE_FORMATS = _constants["SAVE_FORMATS"]
+FIG_DPI = int(config.get("output.fig_dpi", 300))
+SAVE_FORMATS = config.get("output.save_formats", ["png"])  # minimal control
 LOG_FILE_NAME = config.get("logging.file_names.time_frequency", "02_time_frequency_analysis.log")
-USE_SPEARMAN_DEFAULT = _constants["USE_SPEARMAN_DEFAULT"]
-PARTIAL_COVARS_DEFAULT = _constants["PARTIAL_COVARS_DEFAULT"]
-BOOTSTRAP_DEFAULT = _constants["BOOTSTRAP_DEFAULT"]
-N_PERM_DEFAULT = _constants["N_PERM_DEFAULT"]
-DO_GROUP_DEFAULT = _constants["DO_GROUP_DEFAULT"]
-GROUP_ONLY_DEFAULT = _constants["GROUP_ONLY_DEFAULT"]
-BUILD_REPORTS_DEFAULT = _constants["BUILD_REPORTS_DEFAULT"]
-DEFAULT_TEMPERATURE_STRATEGY = _constants["DEFAULT_TEMPERATURE_STRATEGY"]
-DEFAULT_PLATEAU_TMIN = _constants["DEFAULT_PLATEAU_TMIN"]
-DEFAULT_PLATEAU_TMAX = _constants["DEFAULT_PLATEAU_TMAX"]
+USE_SPEARMAN_DEFAULT = bool(config.get("statistics.use_spearman_default", True))
+PARTIAL_COVARS_DEFAULT = config.get("statistics.partial_covars_default", None)
+BOOTSTRAP_DEFAULT = int(config.get("random.bootstrap_default", 0))
+N_PERM_DEFAULT = int(config.get("statistics.n_perm_default", 0))
+DO_GROUP_DEFAULT = bool(config.get("statistics.do_group_default", False))
+GROUP_ONLY_DEFAULT = bool(config.get("statistics.group_only_default", False))
+BUILD_REPORTS_DEFAULT = bool(config.get("statistics.build_reports_default", False))
+DEFAULT_TEMPERATURE_STRATEGY = config.get("time_frequency_analysis.temperature_strategy", "pooled")
+DEFAULT_PLATEAU_TMIN = float(config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])[0])
+DEFAULT_PLATEAU_TMAX = float(config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])[1])
 
 # Extract parameters from config
 DEFAULT_TASK = TASK
-FREQ_MIN = config.analysis.time_frequency.freq_min
-FREQ_MAX = config.analysis.time_frequency.freq_max
-N_FREQS = config.analysis.time_frequency.n_freqs
-N_CYCLES_FACTOR = config.analysis.time_frequency.n_cycles_factor
-TFR_DECIM = config.analysis.time_frequency.tfr_decim
-TFR_PICKS = config.analysis.time_frequency.tfr_picks
-BASELINE = tuple(config.analysis.time_frequency.baseline_window)
-BAND_BOUNDS = {k: (v[0], v[1] if v[1] is not None else None) for k, v in config.analysis.time_frequency.band_bounds.items()}
-FIG_DPI = config.visualization.dpi
-FIG_PAD_INCH = config.visualization.pad_inches
-BBOX_INCHES = config.visualization.bbox_inches
-TOPO_CONTOURS = config.analysis.time_frequency.topo_contours
-TOPO_CMAP = config.analysis.time_frequency.topo_cmap
-COLORBAR_FRACTION = config.analysis.time_frequency.colorbar_fraction
-COLORBAR_PAD = config.analysis.time_frequency.colorbar_pad
-ROI_MASK_PARAMS_DEFAULT = dict(config.analysis.time_frequency.roi_mask_params)
-TEMPERATURE_COLUMNS = config.event_columns.temperature
-N_PERM_DEFAULT = config.analysis.time_frequency.n_perm_default
-DO_GROUP_DEFAULT = config.analysis.time_frequency.do_group_default
-GROUP_ONLY_DEFAULT = config.analysis.time_frequency.group_only_default
-BUILD_REPORTS_DEFAULT = config.analysis.time_frequency.build_reports_default
-DEFAULT_TEMPERATURE_STRATEGY = config.analysis.time_frequency.default_temperature_strategy
-DEFAULT_PLATEAU_TMIN = config.analysis.time_frequency.default_plateau_tmin
-DEFAULT_PLATEAU_TMAX = config.analysis.time_frequency.default_plateau_tmax
-
-# Minimum baseline coverage
-MIN_BASELINE_SAMPLES = config.analysis.time_frequency.min_baseline_samples
+FREQ_MIN = float(config.get("time_frequency_analysis.tfr.freq_min", 1.0))
+FREQ_MAX = float(config.get("time_frequency_analysis.tfr.freq_max", 100.0))
+N_FREQS = int(config.get("time_frequency_analysis.tfr.n_freqs", 40))
+N_CYCLES_FACTOR = float(config.get("time_frequency_analysis.tfr.n_cycles_factor", 2.0))
+TFR_DECIM = int(config.get("time_frequency_analysis.tfr.decim", 4))
+TFR_PICKS = config.get("time_frequency_analysis.tfr.picks", "eeg")
+BASELINE = tuple(config.get("time_frequency_analysis.baseline_window", [-5.0, -0.01]))
+BAND_BOUNDS = {k: (v[0], (v[1] if v[1] is not None else None)) for k, v in dict(config.get("time_frequency_analysis.bands", {
+    "theta": [4.0, 7.9],
+    "alpha": [8.0, 12.9],
+    "beta": [13.0, 30.0],
+    "gamma": [30.1, 80.0],
+})).items()}
+FIG_PAD_INCH = float(config.get("output.pad_inches", 0.02))
+BBOX_INCHES = config.get("output.bbox_inches", "tight")
+TOPO_CONTOURS = int(config.get("time_frequency_analysis.topo_contours", 6))
+TOPO_CMAP = config.get("time_frequency_analysis.topo_cmap", "RdBu_r")
+COLORBAR_FRACTION = float(config.get("time_frequency_analysis.colorbar_fraction", 0.03))
+COLORBAR_PAD = float(config.get("time_frequency_analysis.colorbar_pad", 0.02))
+ROI_MASK_PARAMS_DEFAULT = dict(config.get("time_frequency_analysis.roi_mask_params", {
+    "marker": "o",
+    "markerfacecolor": "w",
+    "markeredgecolor": "k",
+    "linewidth": 0.5,
+    "markersize": 4,
+}))
+TEMPERATURE_COLUMNS = config.get("event_columns.temperature", [])
+MIN_BASELINE_SAMPLES = int(config.get("time_frequency_analysis.min_baseline_samples", 5))
+# Alignment behavior: default to strict (fail on misalignment) unless explicitly allowed to trim
+ALLOW_MISALIGNED_TRIM = bool(
+    config.get("time_frequency_analysis.allow_misaligned_trim", False)
+)
 
 
 def _validate_baseline_indices(
@@ -85,24 +91,41 @@ def _validate_baseline_indices(
     baseline: Tuple[Optional[float], Optional[float]],
     min_samples: int = MIN_BASELINE_SAMPLES,
 ) -> Tuple[float, float, np.ndarray]:
-    """Validate baseline window and return a time mask.
-
-    Ensures the baseline interval ends before stimulus onset and
-    contains at least ``min_samples`` samples.
+    """Validate and return baseline window parameters.
+    
+    Args:
+        times: Time vector from epochs
+        baseline: Baseline window (start, end) in seconds
+        min_samples: Minimum required samples in baseline window
+    
+    Returns:
+        Tuple of (b_start, b_end, baseline_indices)
+    
+    Raises:
+        ValueError: If baseline window is invalid
     """
     b_start, b_end = baseline
     if b_start is None:
-        b_start = float(times.min())
+        b_start = times[0]
     if b_end is None:
         b_end = 0.0
-    if b_end >= 0:
-        raise ValueError("Baseline window must end before 0 s")
-    mask = (times >= b_start) & (times < b_end)
-    if mask.sum() < min_samples:
+
+    # Allow baselines that end exactly at 0.0 s (common MNE convention)
+    if b_end > 0:
         raise ValueError(
-            f"Baseline window has {int(mask.sum())} samples; at least {min_samples} required"
+            "Baseline window must end at or before 0 s (stimulus onset)"
         )
-    return b_start, b_end, mask
+    
+    baseline_mask = (times >= b_start) & (times <= b_end)
+    baseline_indices = np.where(baseline_mask)[0]
+    
+    if len(baseline_indices) < min_samples:
+        raise ValueError(
+            f"Baseline window contains only {len(baseline_indices)} samples "
+            f"(minimum {min_samples} required)"
+        )
+    
+    return b_start, b_end, baseline_indices
 
 
 def _ensure_dir(p: Path) -> None:
@@ -118,10 +141,15 @@ def _roi_definitions() -> Dict[str, list[str]]:
 
     Patterns are regexes matched case-insensitively against channel names.
     """
-    return {
-        roi: list(patterns)
-        for roi, patterns in config.analysis.time_frequency.rois.items()
-    }
+    rois = config.get("time_frequency_analysis.rois", {
+        "Frontal": [r"^(Fpz|Fp[12]|AFz|AF[3-8]|Fz|F[1-8])$"],
+        "Central": [r"^(Cz|C[1-6])$"],
+        "Parietal": [r"^(Pz|P[1-8])$"],
+        "Occipital": [r"^(Oz|O[12]|POz|PO[3-8])$"],
+        "Temporal": [r"^(T7|T8|TP7|TP8|FT7|FT8)$"],
+        "Sensorimotor": [r"^(FC[234]|FCz)$", r"^(C[234]|Cz)$", r"^(CP[234]|CPz)$"],
+    })
+    return {roi: list(patterns) for roi, patterns in rois.items()}
 
 
 def _find_roi_channels(info: mne.Info, patterns: list[str]) -> list[str]:
@@ -141,12 +169,84 @@ def _find_roi_channels(info: mne.Info, patterns: list[str]) -> list[str]:
 
 
 def _build_rois(info: mne.Info) -> Dict[str, list[str]]:
+    """Build ROI channel mappings.
+    
+    Args:
+        info: MNE info object containing channel information
+    
+    Returns:
+        Dictionary mapping ROI names to lists of channel names
+    """
     roi_map = {}
     for roi, pats in _roi_definitions().items():
         chans = _find_roi_channels(info, pats)
-        if len(chans) > 0:
-            roi_map[roi] = chans
+        roi_map[roi] = chans
     return roi_map
+
+
+def _is_valid_eeg_channel(ch_name: str) -> bool:
+    """Basic validation for EEG channel names.
+    
+    Accepts common EEG naming conventions:
+    - 10-20 system: Fp1, F3, C4, P4, O2, etc.
+    - Extended systems: FC1, CP2, etc.
+    - Some common variants and reference channels
+    """
+    import re
+    # Pattern matches: Letter(s) + number(s), possibly with z suffix
+    # Examples: F3, FC1, Cz, T7, TP10, etc.
+    pattern = r'^[A-Za-z]{1,3}[0-9]*[z]?$'
+    return bool(re.match(pattern, ch_name.strip()))
+
+
+def run_quick_baseline_diagnostics(subject: str, task: str = DEFAULT_TASK) -> None:
+    """Compute a quick set of baseline diagnostics and Cz plots for a subject.
+
+    - Loads cleaned epochs
+    - Computes TFR (Morlet) with config freqs/n_cycles/decim
+    - Generates raw and baseline-corrected Cz plots
+    - Runs baseline diagnostics (comparison of methods, QC baseline vs plateau)
+    """
+    logger = _setup_logging(subject)
+    out_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / "02_time_frequency_analysis"
+    _ensure_dir(out_dir)
+
+    # Load epochs
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None or not epo_path.exists():
+        logger.error(f"No cleaned epochs for sub-{subject}, task-{task}")
+        return
+    epochs = mne.read_epochs(epo_path, preload=True, verbose=False)
+
+    # Compute TFR
+    freqs = np.linspace(float(FREQ_MIN), float(FREQ_MAX), int(N_FREQS))
+    n_cycles = np.maximum(freqs / float(N_CYCLES_FACTOR), 3.0)
+    try:
+        tfr = mne.time_frequency.tfr_morlet(
+            epochs,
+            freqs=freqs,
+            n_cycles=n_cycles,
+            use_fft=True,
+            return_itc=False,
+            average=False,
+            decim=int(TFR_DECIM),
+            n_jobs=1,
+            picks=TFR_PICKS,
+            verbose=False,
+        )
+    except Exception as e:
+        logger.error(f"TFR computation failed: {e}")
+        return
+
+    # Plots and diagnostics
+    try:
+        plot_cz_all_trials_raw(tfr, out_dir, logger)
+        plot_cz_all_trials(tfr, out_dir, baseline=BASELINE, plateau_window=(DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX), logger=logger)
+        diagnostic_baseline_correction_methods(tfr, out_dir, baseline=BASELINE, plateau_window=(DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX), logger=logger)
+        qc_baseline_plateau_power(tfr, out_dir, baseline=BASELINE, plateau_window=(DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX), logger=logger)
+        logger.info(f"Quick baseline diagnostics complete for sub-{subject}")
+    except Exception as e:
+        logger.error(f"Diagnostics failed: {e}")
 
 
 def _find_clean_epochs_path(subject: str, task: str) -> Optional[Path]:
@@ -268,6 +368,22 @@ def _find_temperature_column(events_df: Optional[pd.DataFrame]) -> Optional[str]
     return None
 
 
+def _find_pain_binary_column(events_df: Optional[pd.DataFrame]) -> Optional[str]:
+    """Find the pain binary column in events metadata using config mapping.
+
+    Tries configured pain binary column names from PAIN_BINARY_COLUMNS.
+    Returns the column name if found, else None.
+    """
+    if events_df is None:
+        return None
+    for c in PAIN_BINARY_COLUMNS:
+        if c in events_df.columns:
+            return c
+    return None
+
+
+
+
 def _format_temp_label(val: float) -> str:
     """Format a temperature value as a safe label for paths, e.g., 47.3 -> '47p3'."""
     try:
@@ -279,23 +395,6 @@ def _format_temp_label(val: float) -> str:
     return s.replace(".", "p")
 
 
-def _find_tfr_path(subject: str, task: str) -> Optional[Path]:
-    # Prefer exact brief-provided filename
-    p1 = DERIV_ROOT / f"sub-{subject}" / "eeg" / f"sub-{subject}_task-{task}_power_epo-tfr.h5"
-    if p1.exists():
-        return p1
-    # Fallback: any *_epo-tfr.h5 under subject eeg dir
-    eeg_dir = DERIV_ROOT / f"sub-{subject}" / "eeg"
-    if eeg_dir.exists():
-        cands = sorted(eeg_dir.glob(f"sub-{subject}_task-{task}*_epo-tfr.h5"))
-        if cands:
-            return cands[0]
-    # Last resort: recursive search in subject dir
-    subj_dir = DERIV_ROOT / f"sub-{subject}"
-    if subj_dir.exists():
-        for c in sorted(subj_dir.rglob(f"sub-{subject}_task-{task}*_epo-tfr.h5")):
-            return c
-    return None
 
 
 def _apply_baseline_safe(
@@ -303,11 +402,49 @@ def _apply_baseline_safe(
     baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
     mode: str = "logratio",
     logger: Optional[logging.Logger] = None,
+    force: bool = False,
 ):
+    """Apply baseline safely and idempotently.
+
+    Uses an explicit sentinel in `tfr_obj.comment` to detect prior application.
+    Falls back to applying baseline on AverageTFR with a warning, but prefers
+    per-epoch baseline (EpochsTFR) before averaging.
+    """
+    sentinel = "BASELINED:"
+
     try:
+        # Skip if a sentinel indicates baseline has already been applied
+        comment = getattr(tfr_obj, "comment", None)
+        if not force and isinstance(comment, str) and sentinel in comment:
+            msg = "Detected baseline-corrected TFR by sentinel; skipping re-application."
+            if logger:
+                logger.info(msg)
+            else:
+                print(msg)
+            return
+
+        # Warn if baselining an already-averaged TFR (less ideal)
+        if isinstance(tfr_obj, mne.time_frequency.AverageTFR):
+            warn_msg = (
+                "Applying baseline to AverageTFR (averaged) — prefer per-epoch baseline"
+            )
+            if logger:
+                logger.warning(warn_msg)
+            else:
+                print(f"Warning: {warn_msg}")
+
         times = np.asarray(tfr_obj.times)
         b_start, b_end, _ = _validate_baseline_indices(times, baseline)
         tfr_obj.apply_baseline(baseline=(b_start, b_end), mode=mode)
+
+        # Record sentinel in comment to avoid double application
+        try:
+            prev = getattr(tfr_obj, "comment", "")
+            tag = f"{sentinel}mode={mode};win=({b_start:.3f},{b_end:.3f})"
+            tfr_obj.comment = (f"{prev} | {tag}" if prev else tag)
+        except Exception:
+            pass
+
         msg = f"Applied baseline {(b_start, b_end)} with mode='{mode}'."
         if logger:
             logger.info(msg)
@@ -497,6 +634,41 @@ def _plot_topomap_on_ax(
         )
 
 
+def _get_consistent_bands(max_freq_available: Optional[float] = None) -> Dict[str, Tuple[float, float]]:
+    """Get consistent frequency band definitions across subjects.
+    
+    Returns fixed band definitions with a consistent gamma upper bound,
+    ensuring cross-subject comparability by avoiding variable frequency limits.
+    Uses config-defined gamma upper limit of 80.0 Hz.
+    
+    Args:
+        max_freq_available: Optional maximum frequency available in data.
+                          If provided, will cap gamma upper bound if necessary.
+    
+    Returns:
+        Dictionary mapping band names to (low, high) frequency tuples.
+    """
+    bands: Dict[str, Tuple[float, float]] = {}
+    # Include theta if defined in configuration
+    if "theta" in BAND_BOUNDS:
+        bands["theta"] = BAND_BOUNDS["theta"]
+    # Always include alpha and beta
+    bands["alpha"] = BAND_BOUNDS["alpha"]
+    bands["beta"] = BAND_BOUNDS["beta"]
+    
+    gamma_lower, gamma_upper = BAND_BOUNDS["gamma"]
+    if gamma_upper is None:
+        # Use config-defined 80 Hz upper limit for consistency across subjects
+        gamma_upper = 80.0
+    
+    # Cap by available frequency if provided and necessary
+    if max_freq_available is not None and gamma_upper > max_freq_available:
+        gamma_upper = max_freq_available
+    
+    bands["gamma"] = (gamma_lower, gamma_upper)
+    return bands
+
+
 def _robust_sym_vlim(
     arrs: "np.ndarray | list[np.ndarray]",
     q_low: float = 0.02,
@@ -506,6 +678,11 @@ def _robust_sym_vlim(
 ) -> float:
     """Compute robust symmetric vlim (positive scalar) centered at 0.
 
+    Parameters optimized for EEG power data in logratio units:
+    - q_low/q_high: 2%-98% quantiles to exclude extreme outliers
+    - cap: Maximum vlim of 0.25 (logratio units) ≈ 78% power change
+    - min_v: Minimum vlim to avoid zero scaling
+    
     - Concatenates arrays, removes non-finite, takes [q_low, q_high] quantiles.
     - Uses max absolute quantile and caps by `cap` to avoid outliers.
     - Returns a positive scalar v to be used as vmin=-v, vmax=+v.
@@ -582,6 +759,14 @@ def plot_cz_all_trials(
         tmin_req, tmax_req = plateau_window
         tmask = (times >= float(tmin_req)) & (times < float(tmax_req))
         if not np.any(tmask):
+            if logger:
+                logger.warning(
+                    f"Plateau window [{tmin_req}, {tmax_req}] outside data range; using entire time span"
+                )
+            else:
+                print(
+                    f"Warning: Plateau window [{tmin_req}, {tmax_req}] outside data range; using entire time span"
+                )
             tmask = np.ones_like(times, dtype=bool)
         mu = float(np.nanmean(arr[:, tmask]))
         pct = (10.0 ** (mu) - 1.0) * 100.0
@@ -596,6 +781,271 @@ def plot_cz_all_trials(
         _save_fig(fig, out_dir, f"tfr_Cz_all_trials_baseline_logratio.png", logger=logger)
     except Exception as e:
         msg = f"Cz TFR plot failed: {e}"
+        if logger:
+            logger.error(msg)
+        else:
+            print(msg)
+
+
+def diagnostic_baseline_correction_methods(
+    tfr,
+    out_dir: Path,
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Diagnostic comparison of different baseline correction methods.
+    
+    Compares raw power, logratio, ratio, percent, and zscore baseline corrections
+    to identify potential issues causing generalized suppression.
+    """
+    try:
+        diag_dir = out_dir / "baseline_diagnostics"
+        _ensure_dir(diag_dir)
+        
+        # Only work with EpochsTFR - if already averaged, warn and skip
+        if not isinstance(tfr, mne.time_frequency.EpochsTFR):
+            msg = "Baseline correction diagnostics require EpochsTFR. Skipping."
+            if logger:
+                logger.warning(msg)
+            else:
+                print(msg)
+            return
+        
+        # Get EEG channels for scalp-averaged analysis
+        eeg_picks = mne.pick_types(tfr.info, eeg=True, exclude=[])
+        if len(eeg_picks) == 0:
+            msg = "No EEG channels found for baseline diagnostics"
+            if logger:
+                logger.warning(msg)
+            else:
+                print(msg)
+            return
+        
+        # Baseline correction methods to test
+        correction_modes = ['logratio', 'ratio', 'percent', 'zscore']
+        
+        # Extract frequency bands
+        bands = {
+            "Alpha": (8.0, 13.0),
+            "Beta": (13.0, 30.0), 
+            "Gamma": (30.0, 80.0)
+        }
+        
+        # Create comparison figure - 6 subplots: raw + 4 correction modes + stats
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes = axes.flatten()
+        
+        # Plot 1: Raw power (no baseline correction)
+        try:
+            tfr_raw = tfr.copy()
+            tfr_raw_avg = tfr_raw.average()
+            times = np.asarray(tfr_raw_avg.times)
+            
+            for band_name, (fmin, fmax) in bands.items():
+                freqs = np.asarray(tfr_raw_avg.freqs)
+                fmask = (freqs >= fmin) & (freqs <= fmax)
+                if fmask.sum() == 0:
+                    continue
+                    
+                # Scalp-averaged band power over time
+                band_data = tfr_raw_avg.data[eeg_picks, :, :][:, fmask, :].mean(axis=(0, 1))
+                axes[0].plot(times, band_data, label=f"{band_name} ({fmin:.0f}-{fmax:.0f}Hz)", alpha=0.8)
+            
+            axes[0].set_title("Raw Power (No Baseline Correction)")
+            axes[0].set_xlabel("Time (s)")
+            axes[0].set_ylabel("Power (arbitrary units)")
+            axes[0].legend(fontsize=8)
+            axes[0].grid(True, alpha=0.3)
+            axes[0].axvline(0, color='red', linestyle='--', alpha=0.5, label='Stimulus')
+        except Exception as e:
+            axes[0].text(0.5, 0.5, f"Raw plot failed: {e}", transform=axes[0].transAxes, ha='center')
+        
+        # Plots 2-5: Each baseline correction mode
+        for plot_idx, mode in enumerate(correction_modes, start=1):
+            try:
+                # Apply baseline to epochs, then average
+                tfr_corrected = tfr.copy()
+                _apply_baseline_safe(tfr_corrected, baseline=baseline, mode=mode, logger=None)
+                tfr_corrected_avg = tfr_corrected.average()
+                
+                times = np.asarray(tfr_corrected_avg.times)
+                
+                for band_name, (fmin, fmax) in bands.items():
+                    freqs = np.asarray(tfr_corrected_avg.freqs)
+                    fmask = (freqs >= fmin) & (freqs <= fmax)
+                    if fmask.sum() == 0:
+                        continue
+                        
+                    # Scalp-averaged band power over time
+                    band_data = tfr_corrected_avg.data[eeg_picks, :, :][:, fmask, :].mean(axis=(0, 1))
+                    axes[plot_idx].plot(times, band_data, label=f"{band_name} ({fmin:.0f}-{fmax:.0f}Hz)", alpha=0.8)
+                
+                axes[plot_idx].set_title(f"Baseline Correction: {mode}")
+                axes[plot_idx].set_xlabel("Time (s)")
+                axes[plot_idx].axvline(0, color='red', linestyle='--', alpha=0.5)
+                axes[plot_idx].axhline(0 if mode in ['logratio', 'percent', 'zscore'] else 1, 
+                                     color='gray', linestyle='-', alpha=0.5)
+                
+                if mode == "logratio":
+                    axes[plot_idx].set_ylabel("log10(power/baseline)")
+                elif mode == "ratio":
+                    axes[plot_idx].set_ylabel("power/baseline")
+                elif mode == "percent":
+                    axes[plot_idx].set_ylabel("% change")
+                elif mode == "zscore":
+                    axes[plot_idx].set_ylabel("Z-score")
+                axes[plot_idx].legend(fontsize=8)
+                axes[plot_idx].grid(True, alpha=0.3)
+                
+            except Exception as e:
+                axes[plot_idx].text(0.5, 0.5, f"{mode} failed: {e}", 
+                                   transform=axes[plot_idx].transAxes, ha='center')
+            
+        # Summary statistics in last subplot
+        axes[5].axis('off')
+        stats_text = f"Baseline Window: {baseline[0]:.1f} to {baseline[1]:.1f} s\n"
+        stats_text += f"Plateau Window: {plateau_window[0]:.1f} to {plateau_window[1]:.1f} s\n"
+        stats_text += f"Number of epochs: {len(tfr)}\n"
+        stats_text += f"EEG channels: {len(eeg_picks)}\n\n"
+        stats_text += "Baseline Correction Modes:\n"
+        stats_text += "• logratio: log10(power/baseline)\n"
+        stats_text += "• ratio: power/baseline\n"
+        stats_text += "• percent: 100*(power-baseline)/baseline\n"
+        stats_text += "• zscore: (power-baseline_mean)/baseline_std"
+        
+        axes[5].text(0.05, 0.95, stats_text, transform=axes[5].transAxes, 
+                    fontsize=9, verticalalignment='top', fontfamily='monospace')
+        
+        fig.suptitle("Baseline Correction Method Comparison", fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        _save_fig(fig, diag_dir, "baseline_correction_methods_comparison.png", formats=["png", "svg"], logger=logger)
+        
+        if logger:
+            logger.info(f"Saved baseline correction methods diagnostic plot")
+        
+    except Exception as e:
+        msg = f"Baseline correction methods diagnostic failed: {e}"
+        if logger:
+            logger.error(msg)
+        else:
+            print(msg)
+
+
+def diagnostic_alternative_baselines(
+    tfr,
+    out_dir: Path,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Test alternative baseline windows to identify optimal baseline period.
+    
+    Tests different baseline windows to find one without anticipatory artifacts.
+    """
+    try:
+        diag_dir = out_dir / "baseline_diagnostics"
+        _ensure_dir(diag_dir)
+        
+        # Handle EpochsTFR vs AverageTFR
+        if isinstance(tfr, mne.time_frequency.EpochsTFR):
+            tfr_avg = tfr.average()
+        else:
+            tfr_avg = tfr.copy()
+            
+        # Get EEG channels for scalp-averaged analysis  
+        eeg_picks = mne.pick_types(tfr_avg.info, eeg=True, exclude=[])
+        if len(eeg_picks) == 0:
+            raise RuntimeError("No EEG channels found for diagnostic analysis")
+        eeg_ch_names = [tfr_avg.info['ch_names'][i] for i in eeg_picks]
+        
+        times = np.asarray(tfr_avg.times)
+        
+        # Test different baseline windows
+        baseline_windows = [
+            (-3.0, -2.0),  # Earlier baseline (avoid anticipation)
+            (-2.5, -1.5),  # Shifted baseline
+            (-2.0, -1.0),  # Current baseline
+            (-1.5, -0.5),  # Later baseline
+            (-4.0, -1.0),  # Longer baseline
+            (-2.0, 0.0),   # Extended to stimulus
+        ]
+        
+        # Get frequency bands
+        bands = _get_consistent_bands()
+        freqs = np.asarray(tfr_avg.freqs)
+        
+        # Create comparison figure
+        n_bands = len(bands)
+        fig, axes = plt.subplots(n_bands, 2, figsize=(12, 3 * n_bands), constrained_layout=True)
+        if n_bands == 1:
+            axes = axes[None, :]
+            
+        for band_idx, (band_name, (fmin, fmax)) in enumerate(bands.items()):
+            fmax_eff = min(fmax, freqs.max())
+            if fmin >= fmax_eff:
+                for c in range(2):
+                    axes[band_idx, c].axis('off')
+                continue
+            # Plot raw power trace - scalp averaged
+            raw_data = tfr_avg.data[eeg_picks, :, :].mean(axis=0)  # Average across EEG channels
+            band_power = raw_data[fmask, :].mean(axis=0)
+            
+            axes[band_idx, 0].plot(times, band_power, 'k-', alpha=0.8, label='Raw power')
+            axes[band_idx, 0].axvline(0, color='red', linestyle='--', alpha=0.7, label='Stimulus')
+            
+            # Show all baseline windows
+            colors = plt.cm.tab10(np.linspace(0, 1, len(baseline_windows)))
+            for i, (b_start, b_end) in enumerate(baseline_windows):
+                # Check if baseline window is valid for this data
+                if b_start < times.min() or b_end > times.max():
+                    continue
+                if b_end > 0:
+                    continue  # Skip invalid baselines that extend into post-stimulus
+                    
+                axes[band_idx, 0].axvspan(b_start, b_end, alpha=0.3, color=colors[i], 
+                                        label=f'BL {b_start:.1f}-{b_end:.1f}s')
+                
+            axes[band_idx, 0].set_title(f"Raw {band_name} Power - Scalp Average ({len(eeg_picks)} channels)")
+            axes[band_idx, 0].set_xlabel("Time (s)")
+            axes[band_idx, 0].set_ylabel("Power (a.u.)")
+            axes[band_idx, 0].legend(fontsize=8)
+            axes[band_idx, 0].grid(True, alpha=0.3)
+            
+            # Plot baseline-corrected traces for each window
+            for i, (b_start, b_end) in enumerate(baseline_windows):
+                # Check validity
+                if b_start < times.min() or b_end > times.max() or b_end > 0:
+                    continue
+                    
+                try:
+                    tfr_test = tfr.copy()  # Use original epochs
+                    _apply_baseline_safe(tfr_test, baseline=(b_start, b_end), mode="logratio", logger=None)
+                    tfr_test_avg = tfr_test.average()  # Then average
+                    corrected_data = tfr_test_avg.data[eeg_picks, :, :].mean(axis=0)  # Scalp average
+                    band_corrected = corrected_data[fmask, :].mean(axis=0)
+                    
+                    axes[band_idx, 1].plot(times, band_corrected, color=colors[i], alpha=0.8,
+                                         label=f'BL {b_start:.1f}-{b_end:.1f}s')
+                except Exception:
+                    continue
+                    
+            axes[band_idx, 1].axvline(0, color='red', linestyle='--', alpha=0.7)
+            axes[band_idx, 1].axhline(0, color='gray', linestyle='-', alpha=0.5)
+            axes[band_idx, 1].set_title(f"Baseline-Corrected {band_name} Power")
+            axes[band_idx, 1].set_xlabel("Time (s)")
+            axes[band_idx, 1].set_ylabel("log10(power/baseline)")
+            axes[band_idx, 1].legend(fontsize=8)
+            axes[band_idx, 1].grid(True, alpha=0.3)
+            
+        fig.suptitle("Alternative Baseline Window Comparison", fontsize=14, fontweight='bold')
+        _save_fig(fig, diag_dir, "alternative_baselines_comparison.png", formats=["png", "svg"], logger=logger)
+        
+        if logger:
+            logger.info(f"Saved alternative baseline diagnostic plots to {diag_dir}")
+        else:
+            print(f"Saved alternative baseline diagnostic plots to {diag_dir}")
+            
+    except Exception as e:
+        msg = f"Alternative baseline diagnostics failed: {e}"
         if logger:
             logger.error(msg)
         else:
@@ -805,8 +1255,9 @@ def contrast_pain_nonpain(
         else:
             print(msg)
         return
-    if events_df is None or "pain_binary_coded" not in events_df.columns:
-        msg = "Events with 'pain_binary_coded' required for contrast; skipping."
+    pain_col = _find_pain_binary_column(events_df)
+    if pain_col is None:
+        msg = f"Events with pain binary column {PAIN_BINARY_COLUMNS} required for contrast; skipping."
         if logger:
             logger.warning(msg)
         else:
@@ -816,18 +1267,23 @@ def contrast_pain_nonpain(
     n_epochs = tfr.data.shape[0]
     n_meta = len(events_df)
     n = min(n_epochs, n_meta)
-    if n_epochs != n_meta:
-        msg = f"Warning: tfr epochs ({n_epochs}) != events rows ({n_meta}); trimming to {n}."
+    # Enforce strictness when no TFR metadata is available
+    if n_epochs != n_meta and not (getattr(tfr, "metadata", None) is not None and pain_col in tfr.metadata.columns):
+        msg = (
+            f"Error: tfr epochs ({n_epochs}) != events rows ({n_meta}) and no matching pain column in TFR metadata. "
+            f"Cannot guarantee alignment; skipping contrasts."
+        )
         if logger:
-            logger.warning(msg)
+            logger.error(msg)
         else:
             print(msg)
+        return
 
     # Prefer labels from TFR metadata if available to ensure perfect alignment
-    if getattr(tfr, "metadata", None) is not None and "pain_binary_coded" in tfr.metadata.columns:
-        pain_vec = pd.to_numeric(tfr.metadata.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+    if getattr(tfr, "metadata", None) is not None and pain_col in tfr.metadata.columns:
+        pain_vec = pd.to_numeric(tfr.metadata.iloc[:n][pain_col], errors="coerce").fillna(0).astype(int).values
     else:
-        pain_vec = pd.to_numeric(events_df.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+        pain_vec = pd.to_numeric(events_df.iloc[:n][pain_col], errors="coerce").fillna(0).astype(int).values
     pain_mask = np.asarray(pain_vec == 1, dtype=bool)
     non_mask = np.asarray(pain_vec == 0, dtype=bool)
 
@@ -885,6 +1341,14 @@ def contrast_pain_nonpain(
         tmin_req, tmax_req = plateau_window
         tmask = (times >= float(tmin_req)) & (times < float(tmax_req))
         if not np.any(tmask):
+            if logger:
+                logger.warning(
+                    f"Plateau window [{tmin_req}, {tmax_req}] outside data range; using entire time span"
+                )
+            else:
+                print(
+                    f"Warning: Plateau window [{tmin_req}, {tmax_req}] outside data range; using entire time span"
+                )
             tmask = np.ones_like(times, dtype=bool)
         mu_pain = float(np.nanmean(arr_pain[:, tmask]))
         pct_pain = (10.0 ** (mu_pain) - 1.0) * 100.0
@@ -954,11 +1418,7 @@ def contrast_pain_nonpain(
     tmin_eff = float(max(times.min(), tmin_req))
     tmax_eff = float(min(times.max(), tmax_req))
     fmax_available = float(np.max(tfr_pain.freqs))
-    bands: Dict[str, Tuple[float, float]] = {
-        "alpha": BAND_BOUNDS["alpha"],
-        "beta": BAND_BOUNDS["beta"],
-        "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
-    }
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
     tmin, tmax = tmin_eff, tmax_eff
 
     # Final counts after potential reslicing
@@ -989,7 +1449,7 @@ def contrast_pain_nonpain(
                 axes[r, c].axis('off')
             continue
         diff_data = pain_data - non_data
-        # Scalp-averaged values for compact annotation (log10 ratio units)
+        # Scalp-averaged values for compact annotation (logratio and percent change) - EEG only
         pain_mu = float(np.nanmean(pain_data))
         non_mu = float(np.nanmean(non_data))
         diff_mu = float(np.nanmean(diff_data))
@@ -1166,16 +1626,9 @@ def contrast_maxmin_temperature(
     tmax_eff = float(min(times.max(), tmax_req))
     tmin, tmax = tmin_eff, tmax_eff
 
-    # Bands (cap gamma by available max freq)
+    # Bands with consistent gamma limits across subjects
     fmax_available = float(np.max(tfr_max.freqs))
-    bands: Dict[str, Tuple[float, float]] = {
-        "alpha": BAND_BOUNDS["alpha"],
-        "beta": BAND_BOUNDS["beta"],
-        "gamma": (
-            BAND_BOUNDS["gamma"][0],
-            fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1],
-        ),
-    }
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
 
     # Grid like pain/non: [Max, Min, spacer, Max-Min]
     n_rows = len(bands)
@@ -1326,21 +1779,25 @@ def contrast_pain_nonpain_topomaps_rois(
     if not isinstance(tfr, mne.time_frequency.EpochsTFR):
         print("ROI topomap contrast requires EpochsTFR; skipping.")
         return
-    if events_df is None or "pain_binary_coded" not in events_df.columns:
-        print("Events with 'pain_binary_coded' required for ROI topomap contrasts; skipping.")
+    pain_col = _find_pain_binary_column(events_df)
+    if pain_col is None:
+        print(f"Events with pain binary column {PAIN_BINARY_COLUMNS} required for ROI topomap contrasts; skipping.")
         return
 
     n_epochs = tfr.data.shape[0]
     n_meta = len(events_df)
     n = min(n_epochs, n_meta)
-    if n_epochs != n_meta:
-        print(f"ROI topomaps: tfr epochs ({n_epochs}) != events rows ({n_meta}); trimming to {n}.")
+    if n_epochs != n_meta and not (getattr(tfr, "metadata", None) is not None and pain_col in tfr.metadata.columns):
+        print(
+            f"ROI topomaps: tfr epochs ({n_epochs}) != events rows ({n_meta}) and no matching pain column in TFR metadata; skipping."
+        )
+        return
 
     # Prefer labels from TFR metadata if available
-    if getattr(tfr, "metadata", None) is not None and "pain_binary_coded" in tfr.metadata.columns:
-        pain_vec = pd.to_numeric(tfr.metadata.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+    if getattr(tfr, "metadata", None) is not None and pain_col in tfr.metadata.columns:
+        pain_vec = pd.to_numeric(tfr.metadata.iloc[:n][pain_col], errors="coerce").fillna(0).astype(int).values
     else:
-        pain_vec = pd.to_numeric(events_df.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+        pain_vec = pd.to_numeric(events_df.iloc[:n][pain_col], errors="coerce").fillna(0).astype(int).values
     pain_mask = np.asarray(pain_vec == 1, dtype=bool)
     non_mask = np.asarray(pain_vec == 0, dtype=bool)
     print(f"ROI topomaps pain/non-pain counts (n={n}): pain={int(pain_mask.sum())}, non-pain={int(non_mask.sum())}.")
@@ -1361,11 +1818,15 @@ def contrast_pain_nonpain_topomaps_rois(
     tfr_non = tfr_sub[non_mask].average()
 
     fmax_available = float(np.max(tfr_pain.freqs))
-    bands: Dict[str, Tuple[float, float]] = {
-        "alpha": BAND_BOUNDS["alpha"],
-        "beta": BAND_BOUNDS["beta"],
-        "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
-    }
+    bands: Dict[str, Tuple[float, float]] = {}
+    if "theta" in BAND_BOUNDS:
+        bands["theta"] = BAND_BOUNDS["theta"]
+    bands["alpha"] = BAND_BOUNDS["alpha"]
+    bands["beta"] = BAND_BOUNDS["beta"]
+    bands["gamma"] = (
+        BAND_BOUNDS["gamma"][0],
+        fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1],
+    )
     times = np.asarray(tfr_pain.times)
     tmin_req, tmax_req = plateau_window
     tmin_eff = float(max(times.min(), tmin_req))
@@ -1615,11 +2076,7 @@ def plot_rois_all_trials(
         # Also save band-limited TFRs per ROI
         try:
             fmax_available = float(np.max(tfr_avg.freqs))
-            bands: Dict[str, Tuple[float, float]] = {
-                "alpha": BAND_BOUNDS["alpha"],
-                "beta": BAND_BOUNDS["beta"],
-                "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
-            }
+            bands = _get_consistent_bands(max_freq_available=fmax_available)
             for band, (fmin, fmax) in bands.items():
                 fmax_eff = min(fmax, fmax_available)
                 if fmin >= fmax_eff:
@@ -1645,16 +2102,16 @@ def plot_rois_all_trials(
                 print(msg)
 
 
-def plot_topomaps_rois_all_trials(
+def plot_topomaps_bands_all_trials(
     tfr: "mne.time_frequency.EpochsTFR | mne.time_frequency.AverageTFR",
-    roi_map: Dict[str, list[str]],
     out_dir: Path,
     baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
     plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
 ) -> None:
-    """Consolidated topomaps for all trials averaged, baseline-corrected.
+    """Consolidated topomaps for all trials averaged, baseline-corrected by frequency bands.
 
-    Creates a single topomap grid showing frequency bands over a specified plateau window.
+    Creates a single topomap grid showing full-scalp topomaps for different frequency bands 
+    over a specified plateau window.
     """
     tfr_all = tfr.copy()
     _apply_baseline_safe(tfr_all, baseline=baseline, mode="logratio")
@@ -1664,16 +2121,15 @@ def plot_topomaps_rois_all_trials(
         tfr_avg = tfr_all
 
     fmax_available = float(np.max(tfr_avg.freqs))
-    bands: Dict[str, Tuple[float, float]] = {
-        "alpha": BAND_BOUNDS["alpha"],
-        "beta": BAND_BOUNDS["beta"],
-        "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
-    }
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
     times = np.asarray(tfr_avg.times)
     tmin_req, tmax_req = plateau_window
     tmin = float(max(times.min(), tmin_req))
     tmax = float(min(times.max(), tmax_req))
 
+    # tfr_avg is already baseline-corrected from line 1998, so just use it directly
+    tfr_corrected = tfr_avg
+    
     # Create single consolidated plot
     n_rows = len(bands)
     fig, axes = plt.subplots(n_rows, 1, figsize=(4.0, 3.5 * n_rows), squeeze=False)
@@ -1682,7 +2138,7 @@ def plot_topomaps_rois_all_trials(
         if fmin >= fmax_eff:
             axes[r, 0].axis('off')
             continue
-        data = _average_tfr_band(tfr_avg, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax)
+        data = _average_tfr_band(tfr_corrected, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax)
         if data is None:
             axes[r, 0].axis('off')
             continue
@@ -1700,11 +2156,29 @@ def plot_topomaps_rois_all_trials(
             )
         except Exception:
             _plot_topomap_on_ax(axes[r, 0], data, tfr_avg.info, vmin=vmin, vmax=vmax)
+        # Annotate scalp-mean over the plotted window (logratio and percent change) - EEG only
+        try:
+            eeg_picks = mne.pick_types(tfr_avg.info, eeg=True, exclude=[])
+            mu = float(np.nanmean(data[eeg_picks]))  # EEG channels only
+            pct = (10.0 ** (mu) - 1.0) * 100.0
+            axes[r, 0].text(
+                0.5,
+                1.02,
+                f"\u0394\u03bc={mu:.3f} ({pct:+.0f}%)",
+                transform=axes[r, 0].transAxes,
+                ha="center",
+                va="top",
+                fontsize=9,
+            )
+        except Exception:
+            pass
         axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
         try:
             sm = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=TOPO_CMAP)
             sm.set_array([])
-            cbar = fig.colorbar(sm, ax=axes[r, 0], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            cbar = fig.colorbar(
+                sm, ax=axes[r, 0], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
+            )
             try:
                 cbar.set_label("log10(power/baseline)")
             except Exception:
@@ -1766,13 +2240,9 @@ def plot_topomap_grid_baseline_temps(
     tmin = float(max(times_corr.min(), tmin_req))
     tmax = float(min(times_corr.max(), tmax_req))
 
-    # Bands with gamma capped by available max frequency
+    # Bands with consistent gamma limits across subjects
     fmax_available = float(np.max(tfr_avg_all_corr.freqs))
-    bands: Dict[str, Tuple[float, float]] = {
-        "alpha": BAND_BOUNDS["alpha"],
-        "beta": BAND_BOUNDS["beta"],
-        "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
-    }
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
 
     # Build Δ condition averages from baseline-corrected TFR: All trials + temps
     cond_tfrs: list[tuple[str, "mne.time_frequency.AverageTFR", int, float]] = []
@@ -1849,7 +2319,7 @@ def plot_topomap_grid_baseline_temps(
             except Exception:
                 _plot_topomap_on_ax(ax, data, tfr_cond.info, vmin=-diff_abs, vmax=+diff_abs)
             mu = float(np.nanmean(data))
-            pct = (10.0 ** (mu / 10.0) - 1.0) * 100.0
+            pct = (10.0 ** (mu) - 1.0) * 100.0
             ax.text(0.5, 1.02, f"\u0394\u03bc={mu:.3f} ({pct:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
             if r == 0:
                 ax.set_title(f"{label} (n={n_cond})", fontsize=9, pad=4, y=1.04)
@@ -1878,15 +2348,297 @@ def plot_topomap_grid_baseline_temps(
         pass
     _save_fig(fig, out_dir, "topomap_grid_bands_alltrials_plus_temperatures_baseline_logratio.png", formats=["png", "svg"])
 
+def plot_pain_nonpain_temporal_topomaps(
+    tfr: "mne.time_frequency.EpochsTFR",
+    events_df: Optional[pd.DataFrame],
+    out_dir: Path,
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
+    window_size: float = 2.0,
+    freq_band: Optional[Tuple[float, float]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Create temporal topomap grid: pain vs non-pain across 2-second windows.
+    
+    Creates a figure with 3 rows:
+    - Row 1: Pain condition topomaps for each 2-second window
+    - Row 2: Non-pain condition topomaps for each 2-second window  
+    - Row 3: Difference (pain - non-pain) topomaps for each window
+    
+    Args:
+        tfr: EpochsTFR object containing trial-level data
+        events_df: Events dataframe with pain/non-pain labels
+        out_dir: Output directory for saving figures
+        baseline: Baseline correction window
+        window_size: Size of temporal windows in seconds (default 2.0)
+        freq_band: Optional frequency band (fmin, fmax). If None, averages all frequencies
+        logger: Optional logger for messages
+    """
+    if not isinstance(tfr, mne.time_frequency.EpochsTFR):
+        msg = "Temporal topomaps require EpochsTFR (trial-level data). Skipping."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return
+            
+    pain_col = _find_pain_binary_column(events_df)
+    if pain_col is None:
+        msg = f"Events with pain binary column {PAIN_BINARY_COLUMNS} required for temporal topomaps; skipping."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return
+
+    n_epochs = tfr.data.shape[0]
+    n_meta = len(events_df)
+    n = min(n_epochs, n_meta)
+    
+    # Get pain/non-pain masks
+    if getattr(tfr, "metadata", None) is not None and pain_col in tfr.metadata.columns:
+        pain_vec = pd.to_numeric(tfr.metadata.iloc[:n][pain_col], errors="coerce").fillna(0).astype(int).values
+    else:
+        pain_vec = pd.to_numeric(events_df.iloc[:n][pain_col], errors="coerce").fillna(0).astype(int).values
+    
+    pain_mask = np.asarray(pain_vec == 1, dtype=bool)
+    non_mask = np.asarray(pain_vec == 0, dtype=bool)
+    
+    if pain_mask.sum() == 0 or non_mask.sum() == 0:
+        msg = "One of the groups has zero trials; skipping temporal topomaps."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return
+
+    msg = f"Temporal topomaps: pain={int(pain_mask.sum())}, non-pain={int(non_mask.sum())} trials."
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
+    
+    # Subset and baseline-correct
+    tfr_sub = tfr.copy()[:n]
+    if len(pain_mask) != len(tfr_sub):
+        n2 = min(len(tfr_sub), len(pain_mask))
+        tfr_sub = tfr_sub[:n2]
+        pain_mask = pain_mask[:n2]
+        non_mask = non_mask[:n2]
+    
+    _apply_baseline_safe(tfr_sub, baseline=baseline, mode="logratio", logger=logger)
+    
+    # Split into pain/non-pain
+    tfr_pain = tfr_sub[pain_mask].average()
+    tfr_non = tfr_sub[non_mask].average()
+    
+    # Define temporal windows - always use 5 equal windows spanning the configured plateau interval
+    times = np.asarray(tfr_pain.times)
+    tmin_req, tmax_req = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX)
+    tmin_clip = float(max(times.min(), tmin_req))
+    tmax_clip = float(min(times.max(), tmax_req))
+    if not np.isfinite(tmin_clip) or not np.isfinite(tmax_clip) or (tmax_clip <= tmin_clip):
+        msg = f"No valid plateau interval within data range; skipping temporal topomaps (requested [{tmin_req}, {tmax_req}] s, available [{times.min():.2f}, {times.max():.2f}] s)."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return
+    # Build 5 equal windows across [tmin_clip, tmax_clip]
+    n_windows = 5
+    edges = np.linspace(tmin_clip, tmax_clip, n_windows + 1)
+    window_starts = edges[:-1]
+    window_ends = edges[1:]
+    window_size_eff = float((tmax_clip - tmin_clip) / n_windows)
+    msg = f"Creating temporal topomaps over plateau [{tmin_clip:.2f}, {tmax_clip:.2f}] s using {n_windows} windows (~{window_size_eff:.2f}s each)."
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
+    
+    # Get frequency bands for per-band analysis
+    fmax_available = float(np.max(tfr_pain.freqs))
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
+    
+    # Create temporal topomaps for each frequency band
+    for band_name, (fmin, fmax) in bands.items():
+        fmax_eff = min(fmax, fmax_available)
+        if fmin >= fmax_eff:
+            continue
+            
+        freq_label = f"{band_name} ({fmin:.0f}-{fmax_eff:.0f}Hz)"
+        
+        # Extract data for each temporal window in this frequency band
+        pain_data_windows = []
+        non_data_windows = []
+        diff_data_windows = []
+        
+        for tmin_win, tmax_win in zip(window_starts, window_ends):
+            # Average over frequency band and time window
+            pain_data = _average_tfr_band(tfr_pain, fmin=fmin, fmax=fmax_eff, tmin=tmin_win, tmax=tmax_win)
+            non_data = _average_tfr_band(tfr_non, fmin=fmin, fmax=fmax_eff, tmin=tmin_win, tmax=tmax_win)
+            
+            if pain_data is not None and non_data is not None:
+                diff_data = pain_data - non_data
+                pain_data_windows.append(pain_data)
+                non_data_windows.append(non_data)
+                diff_data_windows.append(diff_data)
+            else:
+                pain_data_windows.append(None)
+                non_data_windows.append(None)
+                diff_data_windows.append(None)
+        
+        # Determine consistent scaling across all windows and conditions
+        all_data = [d for d in pain_data_windows + non_data_windows if d is not None]
+        diff_data_valid = [d for d in diff_data_windows if d is not None]
+        
+        if len(all_data) == 0:
+            msg = f"No valid data found for {band_name} temporal topomaps; skipping this band."
+            if logger:
+                logger.warning(msg)
+            else:
+                print(msg)
+            continue
+        
+        # Symmetric scaling for pain/non-pain conditions
+        vabs_cond = _robust_sym_vlim(all_data)
+        # Symmetric scaling for difference
+        vabs_diff = _robust_sym_vlim(diff_data_valid) if len(diff_data_valid) > 0 else vabs_cond
+        
+        # Create figure: 3 rows (pain, non-pain, difference) x n_windows columns
+        fig, axes = plt.subplots(
+            3, n_windows,
+            figsize=(3.0 * n_windows, 9.0),
+            squeeze=False,
+            gridspec_kw={"hspace": 0.25, "wspace": 0.3}
+        )
+        
+        row_labels = [f"Pain (n={int(pain_mask.sum())})", f"Non-pain (n={int(non_mask.sum())})", "Pain - Non"]
+        
+        for col, (tmin_win, tmax_win) in enumerate(zip(window_starts, window_ends)):
+            # Column title - positioned higher
+            axes[0, col].set_title(f"{tmin_win:.1f}-{tmax_win:.1f}s", fontsize=10, pad=25)
+            
+            # Row 0: Pain condition
+            pain_data = pain_data_windows[col]
+            if pain_data is not None:
+                try:
+                    _plot_topomap_on_ax(
+                        axes[0, col], pain_data, tfr_pain.info,
+                        vmin=-vabs_cond, vmax=+vabs_cond
+                    )
+                    # Add mean value with percentage change above topomap
+                    mu = float(np.nanmean(pain_data))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    axes[0, col].text(0.5, 1.08, f"μ={mu:.3f} ({pct:+.0f}%)", 
+                                    transform=axes[0, col].transAxes, ha="center", va="bottom", fontsize=8)
+                except Exception as e:
+                    axes[0, col].axis('off')
+                    if logger:
+                        logger.warning(f"Pain topomap failed for window {col}: {e}")
+            else:
+                axes[0, col].axis('off')
+            
+            # Row 1: Non-pain condition  
+            non_data = non_data_windows[col]
+            if non_data is not None:
+                try:
+                    _plot_topomap_on_ax(
+                        axes[1, col], non_data, tfr_non.info,
+                        vmin=-vabs_cond, vmax=+vabs_cond
+                    )
+                    # Add mean value with percentage change above topomap
+                    mu = float(np.nanmean(non_data))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    axes[1, col].text(0.5, 1.08, f"μ={mu:.3f} ({pct:+.0f}%)", 
+                                    transform=axes[1, col].transAxes, ha="center", va="bottom", fontsize=8)
+                except Exception as e:
+                    axes[1, col].axis('off')
+                    if logger:
+                        logger.warning(f"Non-pain topomap failed for window {col}: {e}")
+            else:
+                axes[1, col].axis('off')
+            
+            # Row 2: Difference (pain - non-pain)
+            diff_data = diff_data_windows[col]
+            if diff_data is not None:
+                try:
+                    _plot_topomap_on_ax(
+                        axes[2, col], diff_data, tfr_pain.info,
+                        vmin=-vabs_diff, vmax=+vabs_diff
+                    )
+                    # Add mean difference value with percentage change above topomap
+                    mu = float(np.nanmean(diff_data))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    axes[2, col].text(0.5, 1.08, f"Δμ={mu:.3f} ({pct:+.1f}%)", 
+                                    transform=axes[2, col].transAxes, ha="center", va="bottom", fontsize=8)
+                except Exception as e:
+                    axes[2, col].axis('off')
+                    if logger:
+                        logger.warning(f"Difference topomap failed for window {col}: {e}")
+            else:
+                axes[2, col].axis('off')
+        
+        # Row labels
+        for row, label in enumerate(row_labels):
+            axes[row, 0].set_ylabel(label, fontsize=11, labelpad=10)
+        
+        # Add colorbars
+        try:
+            # Colorbar for pain/non-pain conditions (rows 0-1)
+            sm_cond = ScalarMappable(
+                norm=mcolors.TwoSlopeNorm(vmin=-vabs_cond, vcenter=0.0, vmax=vabs_cond),
+                cmap=TOPO_CMAP
+            )
+            sm_cond.set_array([])
+            cbar_cond = fig.colorbar(
+                sm_cond, ax=axes[:2, :].ravel().tolist(),
+                fraction=0.03, pad=0.02, shrink=0.8, aspect=20
+            )
+            cbar_cond.set_label("log10(power/baseline)", fontsize=10)
+            
+            # Colorbar for difference (row 2)
+            sm_diff = ScalarMappable(
+                norm=mcolors.TwoSlopeNorm(vmin=-vabs_diff, vcenter=0.0, vmax=vabs_diff),
+                cmap=TOPO_CMAP
+            )
+            sm_diff.set_array([])
+            cbar_diff = fig.colorbar(
+                sm_diff, ax=axes[2, :].ravel().tolist(),
+                fraction=0.03, pad=0.02, shrink=0.8, aspect=20
+            )
+            cbar_diff.set_label("log10(power/baseline) difference", fontsize=10)
+        except Exception as e:
+            if logger:
+                logger.warning(f"Colorbar creation failed: {e}")
+        
+        # Overall title - positioned higher to avoid overlap
+        try:
+            fig.suptitle(
+                f"Temporal topomaps: Pain vs Non-pain - {freq_label} (plateau {tmin_clip:.1f}–{tmax_clip:.1f}s; 5 windows)\n"
+                f"log10(power/baseline), vlim ±{vabs_cond:.2f} (conditions), ±{vabs_diff:.2f} (difference)",
+                fontsize=12, y=1.08
+            )
+        except Exception:
+            pass
+        
+        # Save figure
+        band_suffix = band_name.lower()
+        filename = (
+            f"temporal_topomaps_pain_vs_nonpain_{band_suffix}_plateau_{tmin_clip:.0f}-{tmax_clip:.0f}s_5windows.png"
+        )
+        _save_fig(fig, out_dir, filename, formats=["png", "svg"], logger=logger)
+
+
 def contrast_pain_nonpain_rois(
     roi_tfrs: Dict[str, mne.time_frequency.EpochsTFR],
     events_df: Optional[pd.DataFrame],
     out_dir: Path,
-    baseline: Tuple[Optional[float], Optional[float]] = (None, 0.0),
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
 ) -> None:
     """Pain vs non-pain contrasts per ROI (plots ROI-averaged TFRs)."""
-    if events_df is None or "pain_binary_coded" not in events_df.columns:
-        print("Events with 'pain_binary_coded' required for ROI contrasts; skipping.")
+    pain_col = _find_pain_binary_column(events_df)
+    if pain_col is None:
+        print(f"Events with pain binary column {PAIN_BINARY_COLUMNS} required for ROI contrasts; skipping.")
         return
 
     for roi, tfr in roi_tfrs.items():
@@ -1897,10 +2649,10 @@ def contrast_pain_nonpain_rois(
             if n_epochs != n_meta:
                 print(f"ROI {roi}: trimming to {n} epochs to match events.")
 
-            if getattr(tfr, "metadata", None) is not None and "pain_binary_coded" in tfr.metadata.columns:
-                pain_vec = pd.to_numeric(tfr.metadata.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+            if getattr(tfr, "metadata", None) is not None and pain_col in tfr.metadata.columns:
+                pain_vec = pd.to_numeric(tfr.metadata.iloc[:n][pain_col], errors="coerce").fillna(0).astype(int).values
             else:
-                pain_vec = pd.to_numeric(events_df.iloc[:n]["pain_binary_coded"], errors="coerce").fillna(0).astype(int).values
+                pain_vec = pd.to_numeric(events_df.iloc[:n][pain_col], errors="coerce").fillna(0).astype(int).values
             pain_mask = np.asarray(pain_vec == 1, dtype=bool)
             non_mask = np.asarray(pain_vec == 0, dtype=bool)
             if pain_mask.sum() == 0 or non_mask.sum() == 0:
@@ -1956,11 +2708,7 @@ def contrast_pain_nonpain_rois(
             # Also save band-limited TFRs for pain/non-pain/diff
             try:
                 fmax_available = float(np.max(tfr_pain.freqs))
-                bands: Dict[str, Tuple[float, float]] = {
-                    "alpha": BAND_BOUNDS["alpha"],
-                    "beta": BAND_BOUNDS["beta"],
-                    "gamma": (BAND_BOUNDS["gamma"][0], fmax_available if BAND_BOUNDS["gamma"][1] is None else BAND_BOUNDS["gamma"][1]),
-                }
+                bands = _get_consistent_bands(max_freq_available=fmax_available)
                 for band, (fmin, fmax) in bands.items():
                     fmax_eff = min(fmax, fmax_available)
                     if fmin >= fmax_eff:
@@ -2001,13 +2749,9 @@ def contrast_pain_nonpain_rois(
             print(f"ROI {roi} contrast failed: {e}")
 
 
-def process_subject(
-    subject: str = "001",
-    task: str = DEFAULT_TASK,
-    plateau_tmin: float = DEFAULT_PLATEAU_TMIN,
-    plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
-    temperature_strategy: str = DEFAULT_TEMPERATURE_STRATEGY,
-) -> Optional[mne.time_frequency.AverageTFR]:
+def main(subject: str = "001", task: str = DEFAULT_TASK,
+         plateau_tmin: float = DEFAULT_PLATEAU_TMIN, plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
+         temperature_strategy: str = DEFAULT_TEMPERATURE_STRATEGY) -> None:
     logger = _setup_logging(subject)
     logger.info(f"=== Time-frequency analysis: sub-{subject}, task-{task} ===")
     plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / "02_time_frequency_analysis"
@@ -2042,12 +2786,11 @@ def process_subject(
                     events_df = events_aligned
                     epochs.metadata = events_df.copy()
                     aligned = True
-                    if len(events_df) != len(epochs):
-                        msg = "Aligned metadata using epochs.selection."
-                        if logger:
-                            logger.info(msg)
-                        else:
-                            print(msg)
+                    msg = f"SUCCESS: Aligned metadata using epochs.selection (epochs={len(epochs)}, events={len(events_df)})"
+                    if logger:
+                        logger.info(msg)
+                    else:
+                        print(msg)
             except Exception as e:
                 msg = f"Selection-based alignment failed: {e}"
                 if logger:
@@ -2064,7 +2807,7 @@ def process_subject(
                     events_df = events_aligned.reset_index()
                     epochs.metadata = events_df.copy()
                     aligned = True
-                    msg = "Aligned metadata using 'sample' column to epochs.events."
+                    msg = f"SUCCESS: Aligned metadata using 'sample' column (epochs={len(epochs)}, events={len(events_df)})"
                     if logger:
                         logger.info(msg)
                     else:
@@ -2079,22 +2822,41 @@ def process_subject(
         if not aligned:
             n = min(len(events_df), len(epochs))
             if len(events_df) != len(epochs):
-                msg = f"Warning: events rows ({len(events_df)}) != epochs ({len(epochs)}); trimming to {n}."
+                msg = (
+                    f"Epochs ({len(epochs)}) and events ({len(events_df)}) length mismatch (cannot prove alignment)."
+                )
                 if logger:
-                    logger.warning(msg)
+                    logger.error(msg)
                 else:
-                    print(msg)
+                    print(f"Error: {msg}")
+                if not ALLOW_MISALIGNED_TRIM:
+                    fail_msg = (
+                        "Set time_frequency_analysis.allow_misaligned_trim=true in config to trim and proceed."
+                    )
+                    if logger:
+                        logger.error(fail_msg)
+                    else:
+                        print(f"Error: {fail_msg}")
+                    sys.exit(1)
+                # Proceed with trimming only if explicitly allowed
+                warn2 = (
+                    f"FALLBACK (trim to n={n}): behavioral alignment may be unreliable — verify event filtering and epoch selection."
+                )
+                if logger:
+                    logger.warning(warn2)
+                else:
+                    print(f"Warning: {warn2}")
             if len(epochs) != n:
                 epochs = epochs[:n]
             events_df = events_df.iloc[:n].reset_index(drop=True)
             try:
                 epochs.metadata = events_df.copy()
             except Exception as e:
-                msg = f"Warning: failed to attach metadata to epochs: {e}"
+                msg = f"CRITICAL: Failed to attach metadata to epochs: {e} - contrasts will be skipped"
                 if logger:
-                    logger.warning(msg)
+                    logger.error(msg)
                 else:
-                    print(msg)
+                    print(f"Error: {msg}")
     else:
         msg = "Warning: events.tsv missing; contrasts will be skipped if needed."
         if logger:
@@ -2105,7 +2867,9 @@ def process_subject(
     # Compute per-trial TFR using Morlet wavelets
     # Frequencies covering alpha/beta/gamma using CONFIG
     freqs = np.logspace(np.log10(FREQ_MIN), np.log10(FREQ_MAX), N_FREQS)
-    n_cycles = freqs * N_CYCLES_FACTOR  # proportional cycles per frequency
+    # Use adaptive n_cycles with a minimum floor for better low-frequency resolution
+    # (consistent with our diagnostics and common practice)
+    n_cycles = compute_adaptive_n_cycles(freqs, cycles_factor=N_CYCLES_FACTOR, min_cycles=3.0)
     msg = "Computing per-trial TFR (Morlet)..."
     if logger:
         logger.info(msg)
@@ -2119,8 +2883,9 @@ def process_subject(
         return_itc=False,
         average=False,
         decim=TFR_DECIM,
-        picks=TFR_PICKS,
         n_jobs=-1,
+        picks=TFR_PICKS,
+        verbose=False,
     )
     # power is EpochsTFR
     msg = f"Computed TFR: type={type(power).__name__}, n_epochs={power.data.shape[0]}, n_freqs={len(power.freqs)}"
@@ -2131,7 +2896,7 @@ def process_subject(
 
     # Diagnostics: raw Cz and baseline vs plateau QC on un-baselined TFR
     try:
-        plot_cz_all_trials_raw(power, plots_dir, logger=logger)
+        plot_cz_all_trials_raw(power, plots_dir, logger)
     except Exception as e:
         if logger:
             logger.warning(f"Raw Cz plot failed: {e}")
@@ -2151,17 +2916,27 @@ def process_subject(
         else:
             print(f"QC baseline/plateau failed: {e}")
 
-    # Baseline correct a copy for group-level averaging
-    power_copy = power.copy()
-    _apply_baseline_safe(power_copy, baseline=BASELINE, logger=logger)
-    tfr_avg = power_copy.average()
-
     # Optionally run pooled (no temperature discrimination)
     if temperature_strategy in ("pooled", "both"):
         # All trials, Cz TFR (baseline-corrected using pre-stim interval)
         plot_cz_all_trials(power, plots_dir, baseline=BASELINE)
 
-        # Contrasts and topomaps (only if we have events)
+        # DIAGNOSTIC: Baseline correction investigation
+        diagnostic_baseline_correction_methods(
+            tfr=power,
+            out_dir=plots_dir,
+            baseline=BASELINE,
+            plateau_window=(plateau_tmin, plateau_tmax),
+            logger=logger,
+        )
+        
+        diagnostic_alternative_baselines(
+            tfr=power,
+            out_dir=plots_dir,
+            logger=logger,
+        )
+
+        # Pain vs Non-pain (if available)
         contrast_pain_nonpain(
             tfr=power,
             events_df=events_df,
@@ -2170,6 +2945,25 @@ def process_subject(
             plateau_window=(plateau_tmin, plateau_tmax),
             logger=logger,
         )
+
+        # Contrasts and topomaps (handled above if events are available)
+
+        # Temporal topomaps: pain vs non-pain across 2-second windows (per frequency band)
+        try:
+            plot_pain_nonpain_temporal_topomaps(
+                tfr=power,
+                events_df=events_df,
+                out_dir=plots_dir,
+                baseline=BASELINE,
+                window_size=2.0,
+                logger=logger,
+            )
+        except Exception as e:
+            msg = f"Temporal topomaps failed: {e}"
+            if logger:
+                logger.error(msg)
+            else:
+                print(msg)
 
         # Per-ROI analysis: compute ROI EpochsTFRs from channel-averaged epochs
         msg = "Building ROIs and computing ROI TFRs (pooled)..."
@@ -2190,8 +2984,8 @@ def process_subject(
             plot_rois_all_trials(roi_tfrs, plots_dir, baseline=BASELINE)
             # Per-ROI contrasts
             contrast_pain_nonpain_rois(roi_tfrs, events_df, plots_dir, baseline=BASELINE)
-            # Per-ROI topomaps (all trials)
-            plot_topomaps_rois_all_trials(power, roi_map, plots_dir, baseline=BASELINE, plateau_window=(plateau_tmin, plateau_tmax))
+            # Full-scalp topomaps by frequency bands (all trials)
+            plot_topomaps_bands_all_trials(power, plots_dir, baseline=BASELINE, plateau_window=(plateau_tmin, plateau_tmax))
             # Per-ROI topomap contrasts
             contrast_pain_nonpain_topomaps_rois(power, events_df, roi_map, plots_dir, baseline=BASELINE, plateau_window=(plateau_tmin, plateau_tmax))
 
@@ -2320,7 +3114,7 @@ def process_subject(
                         roi_tfrs_t = compute_roi_tfrs(epochs_t, freqs=freqs, n_cycles=n_cycles, roi_map=roi_map_all)
                         plot_rois_all_trials(roi_tfrs_t, plots_dir_t, baseline=BASELINE)
                         contrast_pain_nonpain_rois(roi_tfrs_t, events_t, plots_dir_t, baseline=BASELINE)
-                        plot_topomaps_rois_all_trials(power_t, roi_map_all, plots_dir_t, baseline=BASELINE, plateau_window=(plateau_tmin, plateau_tmax))
+                        plot_topomaps_bands_all_trials(power_t, plots_dir_t, baseline=BASELINE, plateau_window=(plateau_tmin, plateau_tmax))
                         contrast_pain_nonpain_topomaps_rois(power_t, events_t, roi_map_all, plots_dir_t, baseline=BASELINE, plateau_window=(plateau_tmin, plateau_tmax))
 
     msg = "Done."
@@ -2328,93 +3122,16 @@ def process_subject(
         logger.info(msg)
     else:
         print(msg)
-    return tfr_avg
-
-
-def aggregate_group_level(
-    tfrs: List[mne.time_frequency.AverageTFR],
-    plateau_tmin: float = DEFAULT_PLATEAU_TMIN,
-    plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
-) -> None:
-    """Compute grand-average TFRs across subjects and save group plots."""
-    if not tfrs:
-        return
-    out_dir = DERIV_ROOT / "group" / "eeg" / "plots" / "02_time_frequency_analysis"
-    _ensure_dir(out_dir)
-    grand = mne.grand_average(tfrs)
-    cz = _pick_central_channel(grand.info, preferred="Cz")
-    try:
-        fig = grand.plot(picks=cz, show=False)
-        _save_fig(fig, out_dir, f"group_tfr_{cz}.png")
-    except Exception:
-        pass
-    for band, (fmin, fmax) in BAND_BOUNDS.items():
-        try:
-            tfr_band = grand.copy().crop(fmin=fmin, fmax=fmax, tmin=plateau_tmin, tmax=plateau_tmax)
-            evk = tfr_band.average()
-            evk_mean = mne.EvokedArray(evk.data.mean(axis=1, keepdims=True), evk.info, tmin=0)
-            fig = evk_mean.plot_topomap(times=0, show=False)
-            _save_fig(fig, out_dir, f"group_topomap_{band}.png")
-        except Exception:
-            continue
-
-
-def main(
-    subjects: Optional[List[str]] = None,
-    task: str = DEFAULT_TASK,
-    plateau_tmin: float = DEFAULT_PLATEAU_TMIN,
-    plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
-    temperature_strategy: str = DEFAULT_TEMPERATURE_STRATEGY,
-    do_group: bool = False,
-) -> None:
-    if subjects is None or subjects == ["all"]:
-        subjects = SUBJECTS
-    tfrs: List[mne.time_frequency.AverageTFR] = []
-    for sub in subjects:
-        tfr_avg = process_subject(
-            subject=sub,
-            task=task,
-            plateau_tmin=plateau_tmin,
-            plateau_tmax=plateau_tmax,
-            temperature_strategy=temperature_strategy,
-        )
-        if tfr_avg is not None:
-            tfrs.append(tfr_avg)
-    if do_group or len(tfrs) > 1:
-        aggregate_group_level(tfrs, plateau_tmin=plateau_tmin, plateau_tmax=plateau_tmax)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Time-frequency analysis")
-    parser.add_argument(
-        "--subjects",
-        nargs="*",
-        default=None,
-        help="Subject IDs (e.g., 001 002) or 'all'",
-    )
-    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label")
-    parser.add_argument("--plateau-tmin", type=float, default=DEFAULT_PLATEAU_TMIN)
-    parser.add_argument("--plateau-tmax", type=float, default=DEFAULT_PLATEAU_TMAX)
-    parser.add_argument(
-        "--temperature-strategy",
-        type=str,
-        default=DEFAULT_TEMPERATURE_STRATEGY,
-        help="'pooled', 'per', or 'both'",
-    )
-    parser.add_argument(
-        "--do-group",
-        action="store_true",
-        help="Force grand-average TFR even for a single subject (default when multiple subjects)",
-    )
+    parser = argparse.ArgumentParser(description="Time-frequency analysis for one subject")
+    parser.add_argument("--subject", "-s", type=str, required=True, help="BIDS subject label without 'sub-' prefix (e.g., 001)")
+    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label (default from config)")
+    parser.add_argument("--plateau_tmin", type=float, default=DEFAULT_PLATEAU_TMIN, help="Plateau window start time in seconds (for topomaps and summaries)")
+    parser.add_argument("--plateau_tmax", type=float, default=DEFAULT_PLATEAU_TMAX, help="Plateau window end time in seconds (for topomaps and summaries)")
     args = parser.parse_args()
 
-    main(
-        subjects=args.subjects,
-        task=args.task,
-        plateau_tmin=args.plateau_tmin,
-        plateau_tmax=args.plateau_tmax,
-        temperature_strategy=args.temperature_strategy,
-        do_group=args.do_group,
-    )
+    main(subject=args.subject, task=args.task, plateau_tmin=args.plateau_tmin, plateau_tmax=args.plateau_tmax)
