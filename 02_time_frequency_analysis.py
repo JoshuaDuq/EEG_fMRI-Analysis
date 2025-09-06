@@ -987,6 +987,8 @@ def diagnostic_alternative_baselines(
                 continue
             # Plot raw power trace - scalp averaged
             raw_data = tfr_avg.data[eeg_picks, :, :].mean(axis=0)  # Average across EEG channels
+            # Frequency mask for current band
+            fmask = (freqs >= fmin) & (freqs <= fmax_eff)
             band_power = raw_data[fmask, :].mean(axis=0)
             
             axes[band_idx, 0].plot(times, band_power, 'k-', alpha=0.8, label='Raw power')
@@ -1021,6 +1023,7 @@ def diagnostic_alternative_baselines(
                     _apply_baseline_safe(tfr_test, baseline=(b_start, b_end), mode="logratio", logger=None)
                     tfr_test_avg = tfr_test.average()  # Then average
                     corrected_data = tfr_test_avg.data[eeg_picks, :, :].mean(axis=0)  # Scalp average
+                    # Use the same band frequency mask
                     band_corrected = corrected_data[fmask, :].mean(axis=0)
                     
                     axes[band_idx, 1].plot(times, band_corrected, color=colors[i], alpha=0.8,
