@@ -263,7 +263,8 @@ def _group_stats_dir() -> Path:
 
 
 def _group_plots_dir() -> Path:
-    return DERIV_ROOT / "group" / "eeg" / "plots"
+    # Keep plots organized under a script-specific subfolder (mirrors subject-level)
+    return DERIV_ROOT / "group" / "eeg" / "plots" / "04_behavior_feature_analysis"
 
 
 def _load_features_and_targets(subject: str, task: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], pd.Series, mne.Info]:
@@ -4783,7 +4784,7 @@ def main(
         if not subjects:
             raise ValueError(f"No subjects with features found in {DERIV_ROOT}")
     elif subjects is None or len(subjects) == 0:
-        raise ValueError("No subjects specified. Use --subjects or --all-subjects.")
+        raise ValueError("No subjects specified. Use --group all|A,B,C, or --subject (can repeat), or --all-subjects.")
     if not group_only:
         for sub in subjects:
             process_subject(
@@ -4803,10 +4804,35 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG feature correlations")
-    subj_group = parser.add_mutually_exclusive_group(required=True)
-    subj_group.add_argument("--subjects", nargs="*", help="Subject IDs to process (e.g., 001 002)")
-    subj_group.add_argument("--all-subjects", action="store_true", help="Process all subjects with available features")
+    parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG feature correlations (single or multiple subjects)")
+
+    # Subject selection (mutually exclusive): --group, --subject(s), --all-subjects
+    sel = parser.add_mutually_exclusive_group(required=False)
+    sel.add_argument(
+        "--group", type=str,
+        help=(
+            "Group to process: 'all' or comma/space-separated subject labels without 'sub-' "
+            "(e.g., '0001,0002,0003')."
+        ),
+    )
+    sel.add_argument(
+        "--subject", "-s", type=str, action="append",
+        help=(
+            "BIDS subject label(s) without 'sub-' prefix (e.g., 0001). "
+            "Can be specified multiple times."
+        ),
+    )
+    sel.add_argument(
+        "--all-subjects", action="store_true",
+        help="Process all available subjects with features and targets",
+    )
+
+    # Deprecated alias (kept for backward compatibility). Used only if other selectors absent.
+    parser.add_argument(
+        "--subjects", nargs="*", default=None,
+        help="[Deprecated] Subject IDs list. Prefer --subject repeated or --group."
+    )
+
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
     parser.add_argument(
         "--bootstrap",
@@ -4820,18 +4846,68 @@ if __name__ == "__main__":
         default=42,
         help="Random seed for reproducible bootstrap and permutation tests",
     )
+
     args = parser.parse_args()
 
-    main(
-        args.subjects,
-        task=args.task,
-        use_spearman=USE_SPEARMAN_DEFAULT,
-        partial_covars=PARTIAL_COVARS_DEFAULT,
-        bootstrap=args.bootstrap,
-        n_perm=N_PERM_DEFAULT,
-        do_group=DO_GROUP_DEFAULT,
-        group_only=GROUP_ONLY_DEFAULT,
-        build_reports=BUILD_REPORTS_DEFAULT,
-        rng_seed=args.rng_seed,
-        all_subjects=args.all_subjects,
-    )
+    # Resolve subjects according to 01/02 pattern
+    subjects: Optional[List[str]] = None
+    if args.group is not None:
+        g = args.group.strip()
+        if g.lower() in {"all", "*", "@all"}:
+            subjects = _collect_subject_ids_with_features(Path(DERIV_ROOT))
+        else:
+            cand = [s.strip() for s in g.replace(";", ",").replace(" ", ",").split(",") if s.strip()]
+            subjects = []
+            for s in cand:
+                feats = _features_dir(s)
+                if (feats / "features_eeg_direct.tsv").exists() and (feats / "target_vas_ratings.tsv").exists():
+                    subjects.append(s)
+                else:
+                    print(f"Warning: --group subject '{s}' has no features/targets; skipping")
+    elif args.all_subjects:
+        subjects = _collect_subject_ids_with_features(Path(DERIV_ROOT))
+    elif args.subject:
+        # De-duplicate while preserving order
+        _seen = set()
+        subjects = []
+        for s in args.subject:
+            if s not in _seen:
+                _seen.add(s)
+                subjects.append(s)
+    elif args.subjects:
+        # Deprecated alias fallback
+        subjects = list(dict.fromkeys(args.subjects))
+
+    if subjects is None or len(subjects) == 0:
+        print("No subjects provided. Use --group all|A,B,C, or --subject (repeatable), or --all-subjects.")
+        sys.exit(2)
+
+    # Auto-enable group aggregation when multiple subjects provided (mirrors 02)
+    if len(subjects) == 1:
+        main(
+            subjects,
+            task=args.task,
+            use_spearman=USE_SPEARMAN_DEFAULT,
+            partial_covars=PARTIAL_COVARS_DEFAULT,
+            bootstrap=args.bootstrap,
+            n_perm=N_PERM_DEFAULT,
+            do_group=False,
+            group_only=False,
+            build_reports=BUILD_REPORTS_DEFAULT,
+            rng_seed=args.rng_seed,
+            all_subjects=False,
+        )
+    else:
+        main(
+            subjects,
+            task=args.task,
+            use_spearman=USE_SPEARMAN_DEFAULT,
+            partial_covars=PARTIAL_COVARS_DEFAULT,
+            bootstrap=args.bootstrap,
+            n_perm=N_PERM_DEFAULT,
+            do_group=True,
+            group_only=GROUP_ONLY_DEFAULT,
+            build_reports=BUILD_REPORTS_DEFAULT,
+            rng_seed=args.rng_seed,
+            all_subjects=False,
+        )
