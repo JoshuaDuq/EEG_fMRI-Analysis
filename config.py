@@ -21,7 +21,7 @@ deriv_root = os.path.join(bids_root, "derivatives")
 config_validation = "warn"
 # Subjects to analyze. If `'all'`, include all subjects.
 # Otherwise, a list of subject IDs.
-subjects = ["0000"]
+subjects = "all"
 
 ##################################
 # Pyprep bad channels detection
@@ -73,7 +73,7 @@ task_is_rest = False
 
 # The channel types to consider.
 ch_types = ["eeg"]
-# Specify EOG channels to use, or create virtual EOG channels.
+# Specify EOG channels to use (prefer using BIDS channels.tsv typing). Leave empty to avoid mislabeling EEG as EOG.
 eog_channels = ["Fp1", "Fp2"]
 # The EEG reference to use. If `average`, will use the average reference,
 eeg_reference = "average"
@@ -95,7 +95,7 @@ raw_resample_sfreq = 500
 # Also add additional conditions for the 10, 20, 40 Hz and CNHz time locked on the onset of the svr
 conditions = ["Trig_therm/T  1"]
 epochs_tmin = -5
-epochs_tmax = 10
+epochs_tmax = 10.5
 
 find_breaks = False
 
