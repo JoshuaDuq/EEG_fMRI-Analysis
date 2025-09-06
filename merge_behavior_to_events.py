@@ -14,7 +14,12 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 # Load centralized configuration
-from config_loader import EEGConfig
+try:  # support both `python -m eeg_pipeline.merge_behavior_to_events` and import
+    from .config_loader import EEGConfig
+    from .alignment_utils import trim_behavioral_to_events_strict
+except Exception:  # pragma: no cover
+    from config_loader import EEGConfig
+    from alignment_utils import trim_behavioral_to_events_strict
 
 config = EEGConfig()
 
@@ -96,7 +101,7 @@ def merge_one_subject_events(
     Target selection:
     - If `event_types` (exact matches) and/or `event_prefixes` (startswith) are provided, select rows whose
       normalized `trial_type` equals any `event_types` OR startswith any `event_prefixes`.
-    - If neither is provided, defaults to prefix ['Stim_on'] for backward compatibility.
+    - If neither is provided, defaults to prefix ['Trig_therm/T  1'] for backward compatibility.
 
     Returns True on success, False if no merge performed.
     """
@@ -150,7 +155,7 @@ def merge_one_subject_events(
         _norm_trial_type(t) for t in event_types if str(t).strip() != ""
     ]
     if not prefixes and not types:
-        prefixes = ["Stim_on"]  # default behavior
+        prefixes = ["Trig_therm/T  1"]  # default behavior
 
     mask = pd.Series(False, index=ev_df.index)
     if prefixes:
@@ -173,19 +178,22 @@ def merge_one_subject_events(
     n_ev = len(target_idx)
     n_beh = len(beh_df)
 
-    if n_ev != n_beh:
-        run_txt = f"run-{run_num} " if run_num is not None else ""
-        print(
-            f"[warn] Count mismatch for sub-{sub_label} {run_txt}: target events = {n_ev}, behavior rows = {n_beh}. Will trim to min length and continue."
-        )
-    n = min(n_ev, n_beh)
-    if n == 0:
+    if n_ev == 0:
         print(f"[warn] Nothing to merge for sub-{sub_label} (n=0)")
         return False
 
-    # Subset to aligned lengths
+    # Strictly trim behavioral if longer; error if shorter than target events
+    ev_target_df = ev_df.iloc[target_idx].copy()
+    try:
+        beh_sub = trim_behavioral_to_events_strict(beh_df, ev_target_df)
+    except ValueError as e:
+        run_txt = f"run-{run_num} " if run_num is not None else ""
+        print(f"[error] Behavioral/events mismatch for sub-{sub_label} {run_txt}: {e}")
+        return False
+
+    # Subset event target rows to match trimmed behavioral length
+    n = len(beh_sub)
     ev_target_rows = target_idx[:n]
-    beh_sub = beh_df.iloc[:n].reset_index(drop=True)
 
     # Add/overwrite behavioral columns onto targeted event rows
     for col in beh_sub.columns:
@@ -318,7 +326,7 @@ def main():
         default=None,
         help=(
             "Repeatable. Keep only events whose normalized trial_type startswith any provided prefix. "
-            "Examples: --event_prefix Stim_on --event_prefix 'Trig_therm/T'"
+            "Examples: --event_prefix Trig_therm/T  1 --event_prefix 'Trig_therm/T  1'"
         ),
     )
     parser.add_argument(
