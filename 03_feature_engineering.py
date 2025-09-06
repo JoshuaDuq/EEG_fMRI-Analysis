@@ -11,6 +11,7 @@ import mne
 from mne_bids import BIDSPath
 import glob
 import matplotlib.pyplot as plt
+import math
  
 
 # ==========================
@@ -1124,6 +1125,456 @@ def _get_available_subjects() -> List[str]:
     return subs
 
 
+def _group_plots_dir() -> Path:
+    return DERIV_ROOT / "group" / "eeg" / "plots" / "03_feature_engineering"
+
+
+def _group_stats_dir() -> Path:
+    return DERIV_ROOT / "group" / "eeg" / "stats"
+
+
+def _setup_group_logging() -> logging.Logger:
+    logger = logging.getLogger("feature_engineering_group")
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    # File
+    log_dir = DERIV_ROOT / "group" / "eeg" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / LOG_FILE_NAME
+    fh = logging.FileHandler(log_file, mode='w')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    return logger
+
+
+def _fisher_z(r: float) -> float:
+    r = float(np.clip(r, -0.999999, 0.999999))
+    return float(np.arctanh(r))
+
+
+def _fisher_z_to_r(z: float) -> float:
+    return float(np.tanh(z))
+
+
+def aggregate_group_level(subjects: List[str], task: str = TASK) -> None:
+    """Aggregate feature-engineering outputs across subjects and generate group plots.
+
+    - Group channel power heatmap (bands x channels) from per-subject means
+    - Across-subject band power distributions
+    - Group inter-band spatial power correlation (Fisher-averaged)
+    """
+    logger = _setup_group_logging()
+    gplots = _group_plots_dir()
+    gstats = _group_stats_dir()
+    _ensure_dir(gplots)
+    _ensure_dir(gstats)
+
+    # Collect per-subject power DataFrames
+    subj_pow: dict[str, pd.DataFrame] = {}
+    for s in subjects:
+        p = DERIV_ROOT / f"sub-{s}" / "eeg" / "features" / "features_eeg_direct.tsv"
+        try:
+            if p.exists():
+                df = pd.read_csv(p, sep="\t")
+                subj_pow[s] = df
+            else:
+                logger.warning(f"Missing features for sub-{s}: {p}")
+        except Exception as e:
+            logger.warning(f"Failed reading features for sub-{s}: {e}")
+
+    if len(subj_pow) < 2:
+        logger.warning("Group aggregation requires at least 2 subjects with features; skipping group plots.")
+        return
+
+    bands = list(POWER_BANDS)
+
+    # 1) Group channel power heatmap (mean across subjects of per-subject channel means)
+    try:
+        # Determine union of channels per band across all subjects
+        band_channels: dict[str, List[str]] = {}
+        for b in bands:
+            ch_union: set[str] = set()
+            for s, df in subj_pow.items():
+                cols = [c for c in df.columns if c.startswith(f"pow_{b}_")]
+                ch_union.update([c.replace(f"pow_{b}_", "") for c in cols])
+            band_channels[b] = sorted(ch_union)
+
+        # Compute per-band channel means across subjects
+        heat_rows: List[np.ndarray] = []
+        stats_rows: List[dict] = []
+        # For column order, use channels present in most bands; fallback to alphabetical per-band
+        # We will align per-band independently for the heatmap (x-axis labels vary if needed)
+
+        # To keep a consistent x-axis, find channels common to all bands, else use union across bands
+        all_ch_union: List[str] = sorted(set().union(*band_channels.values())) if band_channels else []
+
+        # Build heatmap on the union; allow NaNs where data missing
+        for b in bands:
+            ch_list = list(all_ch_union)
+            subj_means_per_ch: List[List[float]] = []  # subjects x channels
+            for s, df in subj_pow.items():
+                # Per-subject per-channel mean across trials for this band
+                vals = []
+                for ch in ch_list:
+                    col = f"pow_{b}_{ch}"
+                    if col in df.columns:
+                        vals.append(float(pd.to_numeric(df[col], errors="coerce").mean()))
+                    else:
+                        vals.append(np.nan)
+                subj_means_per_ch.append(vals)
+            arr = np.asarray(subj_means_per_ch, dtype=float)
+            mean_across_subj = np.nanmean(arr, axis=0)
+            heat_rows.append(mean_across_subj)
+            # Stats rows
+            n_eff = np.sum(np.isfinite(arr), axis=0)
+            std_across_subj = np.nanstd(arr, axis=0, ddof=1)
+            for j, ch in enumerate(ch_list):
+                stats_rows.append({
+                    "band": b,
+                    "channel": ch,
+                    "mean": float(mean_across_subj[j]) if np.isfinite(mean_across_subj[j]) else np.nan,
+                    "std": float(std_across_subj[j]) if np.isfinite(std_across_subj[j]) else np.nan,
+                    "n_subjects": int(n_eff[j]),
+                })
+
+        heat = np.vstack(heat_rows) if heat_rows else np.zeros((0, 0))
+        if heat.size > 0:
+            fig, ax = plt.subplots(figsize=(max(12, len(all_ch_union) * 0.4), max(6, len(bands) * 0.8)))
+            im = ax.imshow(heat, cmap='RdBu_r', aspect='auto')
+            ax.set_xticks(range(len(all_ch_union)))
+            ax.set_xticklabels(all_ch_union, rotation=45, ha='right')
+            ax.set_yticks(range(len(bands)))
+            ax.set_yticklabels([b.capitalize() for b in bands])
+            ax.set_title("Group Mean Power per Channel and Band\nlog10(power/baseline)")
+            ax.set_xlabel("Channel")
+            ax.set_ylabel("Frequency Band")
+            plt.colorbar(im, ax=ax, label='log10(power/baseline)', shrink=0.8)
+            plt.tight_layout()
+            _save_fig(fig, gplots / "group_channel_power_heatmap")
+        # Save stats table
+        pd.DataFrame(stats_rows).to_csv(gstats / "group_channel_power_means.tsv", sep="\t", index=False)
+        logger.info("Saved group channel power heatmap and stats.")
+    except Exception as e:
+        logger.warning(f"Group channel heatmap failed: {e}")
+
+    # 2) Across-subject band power distributions (mean per subject per band)
+    try:
+        recs: List[dict] = []
+        for b in bands:
+            for s, df in subj_pow.items():
+                cols = [c for c in df.columns if c.startswith(f"pow_{b}_")]
+                if not cols:
+                    continue
+                vals = pd.to_numeric(df[cols].stack(), errors="coerce").to_numpy(dtype=float)
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    continue
+                recs.append({
+                    "subject": s,
+                    "band": b,
+                    "mean_power": float(np.mean(vals)),
+                })
+        dfm = pd.DataFrame(recs)
+        if not dfm.empty:
+            # Plot bar (mean across subjects) with scatter of subject means and 95% CI
+            bands_present = [b for b in bands if b in set(dfm["band"])]
+            means = []
+            ci_l = []
+            ci_h = []
+            ns = []
+            for b in bands_present:
+                v = dfm[dfm["band"] == b]["mean_power"].to_numpy(dtype=float)
+                v = v[np.isfinite(v)]
+                mu = float(np.mean(v)) if v.size else np.nan
+                se = float(np.std(v, ddof=1) / math.sqrt(len(v))) if len(v) > 1 else np.nan
+                delta = 1.96 * se if np.isfinite(se) else np.nan
+                means.append(mu)
+                ci_l.append(mu - delta if np.isfinite(delta) else np.nan)
+                ci_h.append(mu + delta if np.isfinite(delta) else np.nan)
+                ns.append(len(v))
+            fig, ax = plt.subplots(figsize=(8, 4))
+            x = np.arange(len(bands_present))
+            ax.bar(x, means, color='steelblue', alpha=0.8)
+            # Error bars
+            yerr = np.array([[mu - lo if np.isfinite(mu) and np.isfinite(lo) else 0 for lo, mu in zip(ci_l, means)],
+                             [hi - mu if np.isfinite(mu) and np.isfinite(hi) else 0 for hi, mu in zip(ci_h, means)]])
+            ax.errorbar(x, means, yerr=yerr, fmt='none', ecolor='k', capsize=3)
+            # Scatter points per subject with jitter
+            for i, b in enumerate(bands_present):
+                vals = dfm[dfm["band"] == b]["mean_power"].to_numpy(dtype=float)
+                jitter = (np.random.rand(len(vals)) - 0.5) * 0.2
+                ax.scatter(np.full_like(vals, i, dtype=float) + jitter, vals, color='k', s=12, alpha=0.6)
+            ax.set_xticks(x)
+            ax.set_xticklabels([bp.capitalize() for bp in bands_present])
+            ax.set_ylabel('Mean log10(power/baseline) across subjects')
+            ax.set_title('Group Band Power Summary (subject means, 95% CI)')
+            ax.axhline(0, color='k', linewidth=0.8)
+            plt.tight_layout()
+            _save_fig(fig, gplots / "group_power_distributions_per_band_across_subjects")
+            # Save stats
+            out = pd.DataFrame({
+                "band": bands_present,
+                "group_mean": means,
+                "ci_low": ci_l,
+                "ci_high": ci_h,
+                "n_subjects": ns,
+            })
+            out.to_csv(gstats / "group_band_power_subject_means.tsv", sep="\t", index=False)
+            logger.info("Saved group band power distributions and stats.")
+    except Exception as e:
+        logger.warning(f"Group band power distributions failed: {e}")
+
+    # 3) Group inter-band spatial power correlation (per-subject channel means -> Fisher-avg)
+    try:
+        band_names = list(FEATURES_FREQ_BANDS.keys())
+        m = len(band_names)
+        # Collect per-subject correlation matrices
+        per_subject_corrs: List[np.ndarray] = []
+        for s, df in subj_pow.items():
+            # Build per-band channel mean dictionaries (channel -> mean)
+            band_vecs: dict[str, dict[str, float]] = {}
+            for b in band_names:
+                cols = [c for c in df.columns if c.startswith(f"pow_{b}_")]
+                if not cols:
+                    continue
+                ser = df[cols].apply(pd.to_numeric, errors="coerce").mean(axis=0)
+                # Map channel name -> mean
+                ch_means = {c.replace(f"pow_{b}_", ""): float(v) for c, v in ser.items() if np.isfinite(v)}
+                if ch_means:
+                    band_vecs[b] = ch_means
+            if len(band_vecs) < 2:
+                continue
+            # Create correlation matrix across bands using intersection of channels
+            corr_mat = np.eye(m, dtype=float)
+            for i, bi in enumerate(band_names):
+                for j, bj in enumerate(band_names):
+                    if j <= i:
+                        continue
+                    di = band_vecs.get(bi)
+                    dj = band_vecs.get(bj)
+                    if di is None or dj is None:
+                        corr = np.nan
+                    else:
+                        common = sorted(set(di.keys()) & set(dj.keys()))
+                        if len(common) < 2:
+                            corr = np.nan
+                        else:
+                            vi = np.array([di[ch] for ch in common], dtype=float)
+                            vj = np.array([dj[ch] for ch in common], dtype=float)
+                            # Guard against zero variance
+                            if np.std(vi) < 1e-12 or np.std(vj) < 1e-12:
+                                corr = np.nan
+                            else:
+                                corr = float(np.corrcoef(vi, vj)[0, 1])
+                    corr_mat[i, j] = corr
+                    corr_mat[j, i] = corr
+            per_subject_corrs.append(corr_mat)
+
+        if len(per_subject_corrs) >= 2:
+            arr = np.stack(per_subject_corrs, axis=0)  # (n_subj, m, m)
+            # Fisher-average off-diagonals
+            group_corr = np.eye(m, dtype=float)
+            for i in range(m):
+                for j in range(m):
+                    if i == j:
+                        group_corr[i, j] = 1.0
+                        continue
+                    rvals = arr[:, i, j]
+                    rvals = rvals[np.isfinite(rvals)]
+                    if rvals.size == 0:
+                        group_corr[i, j] = np.nan
+                    else:
+                        z = np.arctanh(np.clip(rvals, -0.999999, 0.999999))
+                        zbar = float(np.mean(z))
+                        group_corr[i, j] = float(np.tanh(zbar))
+
+            fig, ax = plt.subplots(figsize=(8, 6))
+            im = ax.imshow(group_corr, cmap='RdBu_r', vmin=-1, vmax=1)
+            ax.set_xticks(range(m))
+            ax.set_yticks(range(m))
+            ax.set_xticklabels([b.capitalize() for b in band_names], rotation=45, ha='right')
+            ax.set_yticklabels([b.capitalize() for b in band_names])
+            for i in range(m):
+                for j in range(m):
+                    if np.isfinite(group_corr[i, j]):
+                        ax.text(j, i, f"{group_corr[i, j]:.2f}", ha='center', va='center',
+                                color=('white' if abs(group_corr[i, j]) > 0.5 else 'black'))
+            ax.set_title('Group Inter Band Spatial Power Correlation')
+            ax.set_xlabel('Frequency Band')
+            ax.set_ylabel('Frequency Band')
+            plt.colorbar(im, ax=ax, label='Correlation (r)')
+            plt.tight_layout()
+            _save_fig(fig, gplots / "group_inter_band_spatial_power_correlation")
+
+            # Save stats (upper triangle)
+            rows = []
+            for i in range(m):
+                for j in range(i + 1, m):
+                    rvals = np.array([cm[i, j] for cm in per_subject_corrs], dtype=float)
+                    rvals = rvals[np.isfinite(rvals)]
+                    if rvals.size == 0:
+                        continue
+                    z = np.arctanh(np.clip(rvals, -0.999999, 0.999999))
+                    zbar = float(np.mean(z))
+                    se = float(np.std(z, ddof=1) / math.sqrt(len(z))) if len(z) > 1 else np.nan
+                    ci_l = float(np.tanh(zbar - 1.96 * se)) if np.isfinite(se) else np.nan
+                    ci_h = float(np.tanh(zbar + 1.96 * se)) if np.isfinite(se) else np.nan
+                    rows.append({
+                        "band_i": band_names[i],
+                        "band_j": band_names[j],
+                        "r_group": float(np.tanh(zbar)),
+                        "r_ci_low": ci_l,
+                        "r_ci_high": ci_h,
+                        "n_subjects": int(len(rvals)),
+                    })
+            if rows:
+                pd.DataFrame(rows).to_csv(gstats / "group_inter_band_correlation.tsv", sep="\t", index=False)
+                logger.info("Saved group inter-band correlation heatmap and stats.")
+    except Exception as e:
+        logger.warning(f"Group inter-band correlation failed: {e}")
+
+    # 4) Group band power time courses (prefer saved TFR; else compute on the fly)
+    try:
+        # Helper to compute AverageTFR for a subject
+        def _compute_avg_tfr_for_subject(subj: str) -> Optional["mne.time_frequency.AverageTFR"]:
+            try:
+                epo_path = _find_clean_epochs_path(subj, task)
+                if epo_path is None or not epo_path.exists():
+                    return None
+                epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+                tfr_ep = _compute_tfr(epochs)
+                # Baseline-correct to logratio consistently with per-subject processing
+                try:
+                    times = np.asarray(tfr_ep.times)
+                    b_start, b_end, _ = _validate_baseline_indices(times, TFR_BASELINE, MIN_BASELINE_SAMPLES)
+                    tfr_ep.apply_baseline(baseline=(b_start, b_end), mode="logratio")
+                except Exception:
+                    pass
+                return tfr_ep.average()
+            except Exception:
+                return None
+
+        # Gather per-subject AverageTFR (baseline logratio) if available on disk
+        tfr_list = []
+        missing_subjects: List[str] = []
+        for s in subjects:
+            tfr_path = _find_tfr_path(s, task)
+            if tfr_path is None or not tfr_path.exists():
+                missing_subjects.append(s)
+                continue
+            try:
+                read = getattr(mne.time_frequency, "read_tfrs", None)
+                if read is None:
+                    missing_subjects.append(s)
+                    continue
+                tfrs = read(str(tfr_path))
+                if isinstance(tfrs, list) and len(tfrs) > 0:
+                    t = tfrs[0]
+                    # If data has 4 dims, it's likely EpochsTFR; average it
+                    try:
+                        data = getattr(t, "data", None)
+                        if data is not None and getattr(data, "ndim", 0) == 4:
+                            t = t.average()
+                    except Exception:
+                        pass
+                    tfr_list.append(t)
+                else:
+                    missing_subjects.append(s)
+            except Exception:
+                missing_subjects.append(s)
+
+        # If not enough saved TFRs, try computing on the fly for missing subjects
+        if len(tfr_list) < 2 and missing_subjects:
+            computed = 0
+            for s in missing_subjects:
+                tavg = _compute_avg_tfr_for_subject(s)
+                if tavg is not None:
+                    tfr_list.append(tavg)
+                    computed += 1
+            if computed > 0:
+                logger.info(f"Computed AverageTFR on the fly for {computed} subjects (no saved TFR found)")
+
+        if len(tfr_list) >= 2:
+            # Reference time grid from first subject; restrict to common time window
+            ref = tfr_list[0]
+            tmin = max(float(min(t.times[0] for t in tfr_list)), float(ref.times[0]))
+            tmax = min(float(max(t.times[-1] for t in tfr_list)), float(ref.times[-1]))
+            ref_mask = (ref.times >= tmin) & (ref.times <= tmax)
+            tref = ref.times[ref_mask]
+
+            # Compute per-band time courses per subject (avg across channels and freqs)
+            band_tc: dict[str, List[np.ndarray]] = {b: [] for b in bands}
+            for t in tfr_list:
+                # Build series on this subject's time grid, then interpolate to tref
+                for b in bands:
+                    if b not in FEATURES_FREQ_BANDS:
+                        continue
+                    fmin, fmax = FEATURES_FREQ_BANDS[b]
+                    fmask = (t.freqs >= fmin) & (t.freqs <= fmax)
+                    if fmask.sum() == 0:
+                        continue
+                    # Mean across channels and frequencies
+                    series = np.nanmean(t.data[:, fmask, :], axis=(0, 1))  # (time,)
+                    # Interp to tref
+                    # Clip to subject's available time window
+                    s_mask = (t.times >= tmin) & (t.times <= tmax)
+                    if s_mask.sum() < 2:
+                        continue
+                    ts = t.times[s_mask]
+                    ys = series[s_mask]
+                    # Guard against all-nan
+                    if not np.any(np.isfinite(ys)):
+                        continue
+                    # Fill NaNs by linear interpolation on finite subset
+                    finite_mask = np.isfinite(ys)
+                    if finite_mask.sum() >= 2:
+                        ys = np.interp(ts, ts[finite_mask], ys[finite_mask])
+                    # Interpolate to tref
+                    yref = np.interp(tref, ts, ys)
+                    band_tc[b].append(yref)
+
+            # Plot mean with 95% CI per band
+            have_any = any(len(v) >= 2 for v in band_tc.values())
+            if have_any:
+                nrows = int(math.ceil(len(bands) / 2))
+                ncols = 2 if len(bands) > 1 else 1
+                fig, axes = plt.subplots(nrows, ncols, figsize=(12, 3.2 * nrows), sharex=True)
+                axes = np.atleast_1d(axes).ravel()
+                for i, b in enumerate(bands):
+                    ax = axes[i]
+                    series_list = band_tc.get(b, [])
+                    if len(series_list) < 2:
+                        ax.set_visible(False)
+                        continue
+                    arr = np.vstack(series_list)
+                    mu = np.nanmean(arr, axis=0)
+                    se = np.nanstd(arr, axis=0, ddof=1) / np.sqrt(arr.shape[0])
+                    ci = 1.96 * se
+                    ax.plot(tref, mu, color=_get_band_color(b), label=f"{b}")
+                    ax.fill_between(tref, mu - ci, mu + ci, color=_get_band_color(b), alpha=0.2)
+                    ax.axvspan(-5, 0, alpha=0.1, color='gray')
+                    ax.axvline(0, color='k', linestyle='--', linewidth=0.8)
+                    ax.set_title(f"{b.capitalize()} (group mean ±95% CI)")
+                    ax.set_ylabel("log10(power/baseline)")
+                    ax.grid(True, alpha=0.3)
+                axes[-1].set_xlabel("Time (s)")
+                fig.suptitle("Group Band Power Time Courses")
+                fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+                _save_fig(fig, gplots / "group_band_power_time_courses")
+                logger.info("Saved group band power time courses.")
+        else:
+            logger.info("Skipping group band power time courses: need at least 2 subjects with TFR (saved or computed).")
+    except Exception as e:
+        logger.warning(f"Group band power time courses failed: {e}")
+
+
 def main(subjects: Optional[List[str]] = None, task: str = TASK, all_subjects: bool = False):
     # Enforce CLI-provided subjects; allow --all-subjects to scan DERIV_ROOT
     if all_subjects:
@@ -1131,19 +1582,75 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, all_subjects: b
         if not subjects:
             raise ValueError(f"No subjects with cleaned epochs found in {DERIV_ROOT}")
     elif subjects is None or len(subjects) == 0:
-        raise ValueError("No subjects specified. Use --subjects or --all-subjects.")
+        raise ValueError("No subjects specified. Use --group all|A,B,C, or --subject (repeatable), or --all-subjects.")
     for sub in subjects:
         process_subject(sub, task)
+    # Perform group aggregation if multiple subjects
+    if len(subjects) >= 2:
+        aggregate_group_level(subjects, task)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="EEG feature engineering: power + connectivity")
-    subj_group = parser.add_mutually_exclusive_group(required=True)
-    subj_group.add_argument("--subjects", nargs="*", help="Subject IDs to process (e.g., 001 002)")
-    subj_group.add_argument("--all-subjects", action="store_true", help="Process all available subjects with cleaned epochs")
+    parser = argparse.ArgumentParser(description="EEG feature engineering: power + connectivity (single or multiple subjects)")
+
+    sel = parser.add_mutually_exclusive_group(required=False)
+    sel.add_argument(
+        "--group", type=str,
+        help=(
+            "Group to process: 'all' or comma/space-separated subject labels without 'sub-' "
+            "(e.g., '0001,0002,0003')."
+        ),
+    )
+    sel.add_argument(
+        "--subject", "-s", type=str, action="append",
+        help=(
+            "BIDS subject label(s) without 'sub-' prefix (e.g., 0001). "
+            "Can be specified multiple times."
+        ),
+    )
+    sel.add_argument(
+        "--all-subjects", action="store_true",
+        help="Process all available subjects with cleaned epochs",
+    )
+    # Deprecated alias (kept for backward compatibility)
+    parser.add_argument("--subjects", nargs="*", default=None, help="[Deprecated] Subject IDs list. Prefer --subject or --group.")
+
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
     args = parser.parse_args()
 
-    main(subjects=args.subjects, task=args.task, all_subjects=args.all_subjects)
+    # Resolve subjects similar to 01/02
+    subjects: Optional[List[str]] = None
+    if args.group is not None:
+        g = args.group.strip()
+        if g.lower() in {"all", "*", "@all"}:
+            subjects = _get_available_subjects()
+        else:
+            cand = [s.strip() for s in g.replace(";", ",").replace(" ", ",").split(",") if s.strip()]
+            subjects = []
+            for s in cand:
+                try:
+                    if _find_clean_epochs_path(s, args.task) is not None:
+                        subjects.append(s)
+                    else:
+                        print(f"Warning: --group subject '{s}' has no cleaned epochs; skipping")
+                except Exception:
+                    pass
+    elif args.all_subjects:
+        subjects = _get_available_subjects()
+    elif args.subject:
+        _seen = set()
+        subjects = []
+        for s in args.subject:
+            if s not in _seen:
+                _seen.add(s)
+                subjects.append(s)
+    elif args.subjects:
+        subjects = list(dict.fromkeys(args.subjects))
+
+    if subjects is None or len(subjects) == 0:
+        print("No subjects provided. Use --group all|A,B,C, or --subject (repeatable), or --all-subjects.")
+        raise SystemExit(2)
+
+    main(subjects=subjects, task=args.task, all_subjects=False)
