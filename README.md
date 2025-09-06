@@ -8,7 +8,6 @@ This repository contains a comprehensive EEG analysis pipeline built on top of M
 - **Feature Engineering**: Extract ML-ready features from EEG power and connectivity
 - **Behavioral Analysis**: Correlate EEG features with behavioral measures using advanced statistical methods
 - **Pain Decoding**: State-of-the-art machine learning models with rigorous cross-validation and statistical validation
-- **Group-Level Support**: Core analysis scripts (01–04) accept multiple subjects and aggregate results to produce grand-average statistics and visualizations
 
 All scripts live in `eeg_pipeline/` and write outputs into a BIDS-style tree under `eeg_pipeline/bids_output/` and its `derivatives/` subfolder.
 
@@ -41,11 +40,11 @@ All scripts live in `eeg_pipeline/` and write outputs into a BIDS-style tree und
 Purpose: Convert BrainVision `.vhdr/.eeg/.vmrk` recordings found under `source_data/sub-*/eeg/` into a BIDS dataset under `bids_output/` using MNE-BIDS.
 
 Key behavior:
-- Filters annotations to keep specified event prefixes (default: "Stim_on", supports multiple prefixes)
+- Filters annotations to keep specified event prefixes (default: "Trig_therm", supports multiple prefixes)
 - Supports trimming EEG at first MRI volume trigger with `--trim_to_first_volume`
 - Optionally zero-bases annotation onsets
 - Writes BIDS subject-level folders and sidecars
-- Optionally merges behavior (TrialSummary.csv) into resulting events.tsv
+
 
 Usage (Windows PowerShell examples):
 
@@ -58,9 +57,6 @@ python eeg_pipeline/raw_to_bids.py --subjects 001 002 --overwrite
 
 # Customize montage and line frequency metadata
 python eeg_pipeline/raw_to_bids.py --montage easycap-M1 --line_freq 60
-
-# Also merge behavior into events after conversion
-python eeg_pipeline/raw_to_bids.py --merge_behavior
 
 # Zero-base kept annotation onsets (first kept onset becomes 0.0 s)
 python eeg_pipeline/raw_to_bids.py --zero_base_onsets
@@ -77,7 +73,6 @@ Arguments:
 - `--keep_all_annotations` (flag): Keep all annotations instead of filtering by prefix
 - `--trim_to_first_volume` (flag): Trim EEG recording at first MRI volume trigger
 - `--overwrite` (flag): Overwrite existing BIDS files
-- `--merge_behavior` (flag): Merge Psychopy TrialSummary.csv into events after conversion
 - `--zero_base_onsets` (flag): Zero-base kept annotation onsets
 
 Outputs:
@@ -93,10 +88,10 @@ Usage:
 
 ```powershell
 # Dry-run (no writes) to see which columns would be merged
-python eeg_pipeline/merge_behavior_to_events.py --dry_run
+python merge_behavior_to_events.py --dry_run
 
 # Perform merge for a custom BIDS root and source_data root
-python eeg_pipeline/merge_behavior_to_events.py --bids_root eeg_pipeline/bids_output --source_root eeg_pipeline/source_data --task thermalactive
+python merge_behavior_to_events.py --bids_root eeg_pipeline/bids_output --source_root eeg_pipeline/source_data --task thermalactive
 ```
 
 Arguments:
@@ -110,7 +105,7 @@ Arguments:
 Notes:
 - Only rows matching specified event prefixes/types are updated with behavioral columns
 - Supports per-run TrialSummary matching (run-specific CSV selection based on BIDS run numbers)
-- Length mismatches are trimmed to the shorter length with a warning
+- Strict alignment: behavioral rows are trimmed only if behavioral has extra rows; if behavioral is shorter than targeted events, the merge is aborted with an error.
 
 **Combined per-subject events (new):**
 - After per-run merges, the script writes a combined file per subject at `sub-<ID>/eeg/sub-<ID>_task-<task>_events.tsv`.
@@ -408,8 +403,6 @@ Arguments:
 - `--group` (flag): Also aggregate group-level results across subjects.
 - `--group-only` (flag): Only run group-level aggregation, skip per-subject analysis.
 - `--report` (flag): Build per-subject MNE HTML report.
-
-Group-level runs merge per-subject ROI power correlations for both pain ratings and stimulus temperature, and summarize connectivity ROI statistics across participants with FDR correction.
 
 **Detailed Analysis Pipeline:**
 
@@ -1152,10 +1145,10 @@ Below are detailed workflow examples with precise commands, expected outputs, an
 
 ```powershell
 # 1) Convert BrainVision to BIDS with flexible event filtering
-# Expected: Creates BIDS dataset in bids_output/, merges behavior if --merge_behavior used
-python eeg_pipeline/raw_to_bids.py --merge_behavior --overwrite
+# Expected: Creates BIDS dataset in bids_output/
+python eeg_pipeline/raw_to_bids.py --overwrite
 
-# 2) (Optional) Standalone behavior merge with per-run support
+# 2) Merge behavioral data into events with per-run support
 # Expected: Updates events.tsv files with behavioral columns, creates combined per-subject events.tsv
 python eeg_pipeline/merge_behavior_to_events.py
 
@@ -1344,11 +1337,11 @@ python eeg_pipeline/05_decode_pain_experience.py --subjects 001 002 --n_jobs 2 -
 - **Multiple event prefixes**: Use multiple `--event_prefix` flags for complex event structures
 - **MRI volume trimming**: `--trim_to_first_volume` requires "Volume" annotations in the data
 - **Montage template mismatch**: Check that your EEG system matches the `easycap-M1` or `standard_1005` templates
-- **Line noise frequency**: Ensure `zapline_fline` matches your local power grid frequency (60 Hz in North America, 50 Hz elsewhere)
+- **Line noise frequency**: Ensure `--line_freq` matches your local power grid frequency (60 Hz in North America, 50 Hz elsewhere)
 
 #### Behavioral Merging (`merge_behavior_to_events.py`)
 - **Per-run CSV matching**: Ensure PsychoPy CSV files follow `run<N>` naming convention
-- **Column alignment**: Length mismatches between events and behavioral data are automatically trimmed
+- **Strict alignment**: Behavioral rows are trimmed only if behavioral has extra rows; if behavioral is shorter than targeted events, the merge is aborted with an error.
 - **Event type selection**: Use `--event_prefix` and `--event_type` for targeted merging
 - **Run number extraction**: Scripts extract run numbers from BIDS filenames (e.g., `sub-001_task-thermalactive_run-01_events.tsv`)
 
