@@ -103,13 +103,21 @@ class EEGConfig:
         self.setup_matplotlib()
     
     def __getattr__(self, key: str) -> Any:
-        """Delegate attribute access to the nested config."""
+        """Delegate attribute access to the nested config.
+
+        For convenience and robustness, return an empty namespace for common
+        optional sections that may be omitted from the YAML (e.g., 'visualization').
+        This avoids AttributeError in code paths that probe for these sections
+        before falling back to defaults.
+        """
         if key.startswith('_'):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
-        
+
         if key not in self._data:
+            if key in {"visualization", "output", "logging"}:
+                return _NestedDict({})
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
-        
+
         value = self._data[key]
         if isinstance(value, dict):
             return _NestedDict(value)
@@ -294,8 +302,10 @@ def get_legacy_constants(config: EEGConfig) -> Dict[str, Any]:
         "TASK": config.task,
         
         # Frequency bands
-        "FEATURES_FREQ_BANDS": config.frequency_bands,
-        "POWER_BANDS_TO_USE": config.get("power.bands_to_use", ["alpha", "beta", "gamma"]),
+        # Prefer new per-script bands, fall back to legacy top-level if present
+        "FEATURES_FREQ_BANDS": (config.get("time_frequency_analysis.bands") or config.frequency_bands),
+        # Default now includes theta to ensure analyses and plots cover it
+        "POWER_BANDS_TO_USE": config.get("power.bands_to_use", ["theta", "alpha", "beta", "gamma"]),
         
         # Event columns
         "PSYCH_TEMP_COLUMNS": config.get("event_columns.temperature", []),
@@ -303,12 +313,12 @@ def get_legacy_constants(config: EEGConfig) -> Dict[str, Any]:
         "PAIN_BINARY_COLUMNS": config.get("event_columns.pain_binary", []),
         
         # Analysis windows
-        "PLATEAU_WINDOW": tuple(config.get("power.plateau_window", [3.0, 10.5])),
-        "BASELINE": tuple(config.get("power.baseline_window", [-2.0, 0.0])),
+        "PLATEAU_WINDOW": tuple(config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])),
+        "BASELINE": tuple(config.get("time_frequency_analysis.baseline_window", [-2.0, 0.0])),
         
         # Visualization
-        "FIG_DPI": config.get("visualization.dpi", 300),
-        "SAVE_FORMATS": tuple(config.get("visualization.save_formats", ["png", "svg"])),
+        "FIG_DPI": config.get("output.fig_dpi", 300),
+        "SAVE_FORMATS": tuple(config.get("output.save_formats", ["png"])),
         "BAND_COLORS": config.get("visualization.band_colors", {}),
         
         # Advanced visualization parameters
@@ -340,26 +350,26 @@ def get_legacy_constants(config: EEGConfig) -> Dict[str, Any]:
         "LOG_FILE_NAME": config.get("logging.file_names.behavior_analysis", "04_behavior_feature_analysis.log"),
         
         # ERP analysis
-        "ERP_PICKS": config.get("analysis.erp.picks", "eeg"),
+        "ERP_PICKS": config.get("foundational_analysis.erp.picks", "eeg"),
         "PAIN_COLUMNS": config.get("event_columns.pain_binary", []),
         "TEMPERATURE_COLUMNS": config.get("event_columns.temperature", []),
         
         # Time-frequency analysis  
-        "DEFAULT_TEMPERATURE_STRATEGY": config.get("analysis.time_frequency.default_temperature_strategy", "pooled"),
-        "DEFAULT_PLATEAU_TMIN": config.get("analysis.time_frequency.default_plateau_tmin", 0.0),
-        "DEFAULT_PLATEAU_TMAX": config.get("analysis.time_frequency.default_plateau_tmax", 10.5),
+        "DEFAULT_TEMPERATURE_STRATEGY": config.get("time_frequency_analysis.temperature_strategy", "pooled"),
+        "DEFAULT_PLATEAU_TMIN": config.get("time_frequency_analysis.plateau_window", [3.0,10.0])[0],
+        "DEFAULT_PLATEAU_TMAX": config.get("time_frequency_analysis.plateau_window", [3.0,10.0])[1],
         
         # Raw-to-BIDS
-        "DEFAULT_MONTAGE": config.get("analysis.raw_to_bids.default_montage", "easycap-M1"),
-        "DEFAULT_LINE_FREQ": config.get("analysis.raw_to_bids.default_line_freq", 60.0),
+        "DEFAULT_MONTAGE": config.get("raw_to_bids.default_montage", "easycap-M1"),
+        "DEFAULT_LINE_FREQ": config.get("raw_to_bids.default_line_freq", 60.0),
         
         # TFR settings
         "CUSTOM_TFR_FREQS": np.arange(*config.get("tfr.custom_freqs", [1, 101, 1])),
-        "CUSTOM_TFR_DECIM": config.get("tfr.decim", 4),
+        "CUSTOM_TFR_DECIM": config.get("time_frequency_analysis.tfr.decim", 4),
         
         # Feature extraction
-        "PLATEAU_START": config.get("power.plateau_window", [3.0, 10.5])[0],
-        "PLATEAU_END": config.get("power.plateau_window", [3.0, 10.5])[1],
+        "PLATEAU_START": config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])[0],
+        "PLATEAU_END": config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])[1],
         "TARGET_COLUMNS": config.get("event_columns.rating", []),
-        "POWER_BANDS": config.get("power.bands_to_use", ["alpha", "beta", "gamma"]),
+        "POWER_BANDS": config.get("power.bands_to_use", ["theta", "alpha", "beta", "gamma"]),
     }
