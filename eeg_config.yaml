@@ -1,132 +1,119 @@
-# EEG Pipeline Configuration
-# Centralized configuration for the entire EEG analysis pipeline
-# Edit this file to modify parameters without changing source code
+# EEG Pipeline Configuration (organized per script)
 
-# Core project settings
 project:
-  root: "."  # Project root directory (will be resolved to absolute path)
+  root: "."
   task: "thermalactive"
-  subjects: ["0000"]  # List of subject IDs to process by default
+  subjects: ["000"]
   bids_root: "eeg_pipeline/bids_output"
   source_root: "eeg_pipeline/source_data"
-  
-# Paths (relative to project root)
+
 paths:
-  project_root: "."  # Will be resolved dynamically
+  project_root: "."
   bids_root: "eeg_pipeline/bids_output"
   deriv_root: "eeg_pipeline/bids_output/derivatives"
   source_data: "eeg_pipeline/source_data"
-  
-# Frequency bands for analysis (matches features_freq_bands from config.py)
-frequency_bands:
-  theta: [4.0, 7.9]    # 4.0 to (8.0 - 0.1) 
-  alpha: [8.0, 12.9]   # 8.0 to (13.0 - 0.1)
-  beta: [13.0, 30.0]   # 13.0 to 30.0
-  gamma: [30.1, 80.0]  # (30.0 + 0.1) to 80.0
-  
-# Power analysis settings
-power:
-  bands_to_use: ["theta", "alpha", "beta", "gamma"]  # Subset of frequency_bands for power features
-  plateau_window: [0.0, 10.0]  # Time window for plateau analysis (seconds)
-  baseline_window: [-2.0, -1.0]  # Baseline window (seconds) - conservative, avoiding anticipatory activity
-  
-# Event column mappings for behavioral data
+
 event_columns:
   temperature: ["stimulus_temp", "stimulus_temperature", "temp", "temperature"]
   rating: ["vas_final_coded_rating", "vas_final_rating", "vas_rating", "pain_intensity", "pain_rating", "rating"]
   pain_binary: ["pain_binary_coded", "pain_binary", "pain"]
-  
-# Time-frequency analysis settings (matches custom_tfr config from config.py)
-tfr:
-  custom_freqs: [1, 101, 1]  # [start, stop, step] for np.arange - matches custom_tfr_freqs
-  n_cycles_factor: 3.0  # Divide frequencies by this for n_cycles - matches custom_tfr_n_cycles calculation
-  decim: 4  # Matches custom_tfr_decim
-  crop_time: false  # Matches custom_tfr_crop
-  return_itc: false  # Matches custom_tfr_return_itc
-  interpolate_bads: true  # Matches custom_tfr_interpolate_bads
-  average_epochs: false  # Matches custom_tfr_average
-  return_average: false  # Matches custom_tfr_return_average
 
-# Preprocessing pipeline settings
-preprocessing:
-  # General
-  n_jobs: -1
-  task_is_rest: false
-  ch_types: ["eeg"]
-  eog_channels: ["Fp1", "Fp2"]
-  eeg_reference: "average"
-  eeg_template_montage: "easycap-M1"
-  random_state: 42
-  
-  # Filtering
-  l_freq: 1.0
-  h_freq: 100
-  zapline_fline: 60.0
-  notch_freq: null  # Set to 60.0 to enable notch filtering
-  
-  # Resampling
-  raw_resample_sfreq: 500
-  
-  # Epoching
-  conditions: ["Trig_therm/T  1"]
-  epochs_tmin: -5
-  epochs_tmax: 10
-  baseline: True  # null means no baseline correction
-  find_breaks: false
-  
-  # Artifact rejection
-  spatial_filter: "ica"
-  ica_reject:
-    eeg: 500e-6
-  ica_algorithm: "extended_infomax"
-  ica_l_freq: 1.0
-  reject: "autoreject_local"
-  
-  # PyPrep bad channel detection
-  pyprep:
-    enabled: true
-    ransac: false
-    repeats: 3
-    average_reref: false
-    file_extension: ".vhdr"
-    l_pass: 100
-    notch: 60.0
-    delete_breaks: false
-    breaks_min_length: 20
-    t_start_after_previous: 10
-    t_stop_before_next: 2
-    consider_previous_bads: false
-    rename_anot_dict: null
-    overwrite_chans_tsv: true
-    n_jobs: -1
-    
-  # ICALabel
-  icalabel:
-    enabled: true
-    prob_threshold: 0.7
-    labels_to_keep: ["brain", "other"]
-    n_jobs: -1
+foundational_analysis:
+  erp:
+    picks: "eeg"
+    combine: "gfp"
+    include_tmax_in_crop: false
+    default_crop_tmin: null
+    default_crop_tmax: null
+    pain_color: "crimson"
+    nonpain_color: "navy"
+    plots_subdir: "01_foundational_analysis"
+    counts_file_name: "counts_pain.tsv"
+    output_files:
+      pain_gfp: "erp_pain_binary_gfp.png"
+      pain_butterfly: "erp_pain_binary_butterfly.png"
+      temp_gfp: "erp_by_temperature_gfp.png"
+      temp_butterfly: "erp_by_temperature_butterfly.png"
+      temp_butterfly_template: "erp_by_temperature_butterfly_{label}.png"
 
-# Feature extraction settings
-features:
-  enabled: true
-  freq_res: 0.1  # Hz
-  psd_freqmax: 100
-  psd_freqmin: 1
-  somato_chans: ["C3", "C4", "Cz"]
-  compute_sourcespace_features: true
-  n_jobs: -1
-  
-  # Source space
-  sourcecoords_file: "eeg_pipeline/source_data/Schaefer2018/Schaefer2018_100Parcels_7Networks_order_FSLMNI152_2mm.Centroid_RAS.csv"
+time_frequency_analysis:
+  baseline_window: [-5.0, -0.01]
+  plateau_window: [3.0, 10.5]
+  # Output units for baseline-corrected TFR values derived from log ratios.
+  # Options:
+  #   - "logratio": plain log10(power/baseline)
+  #   - "dB": 10*log10(power/baseline)
+  output_units: "dB"
+  tfr:
+    freq_min: 1.0
+    freq_max: 100.0
+    n_freqs: 40
+    n_cycles_factor: 2.0
+    decim: 4
+    picks: "eeg"
+  bands:
+    theta: [4.0, 7.9]
+    alpha: [8.0, 12.9]
+    beta: [13.0, 30.0]
+    gamma: [30.1, 80.0]
+  rois:
+    Frontal: ["^(Fpz|Fp[12]|AFz|AF[3-8]|Fz|F[1-8])$"]
+    Central: ["^(Cz|C[1-6])$"]
+    Parietal: ["^(Pz|P[1-8])$"]
+    Occipital: ["^(Oz|O[12]|POz|PO[3-8])$"]
+    Temporal: ["^(T7|T8|TP7|TP8|FT7|FT8)$"]
+    Sensorimotor:
+      - "^(FC[234]|FCz)$"
+      - "^(C[234]|Cz)$"
+      - "^(CP[234]|CPz)$"
+  roi_mask_params:
+    marker: 'o'
+    markerfacecolor: 'w'
+    markeredgecolor: 'k'
+    linewidth: 0.5
+    markersize: 4
+  min_baseline_samples: 5
 
-# Machine learning / decoding settings
+feature_engineering:
+  min_baseline_samples: 5
+  tfr_spectrogram_vlim: null
+  save_tfr_with_sidecar: false
+
+raw_to_bids:
+  default_montage: "easycap-M1"
+  default_line_freq: 60.0
+
+behavior_analysis:
+  # Time-frequency heatmap defaults
+  time_frequency_heatmap:
+    time_resolution: 0.1
+    freq_resolution: 2.0
+    time_window: [0.0, 10.5]
+    freq_range: [4.0, 80.0]
+    alpha: 0.05
+    roi_selection: null
+    n_cycles_factor: 2.0
+    decim: 4
+    min_valid_points: 5
+  # Spline smoothing for diagnostics
+  spline:
+    smoothing_factor: 0.3
+    min_smoothing: 1.0
+    max_iter: 50
+    tolerance: 1e-3
+  # Statistics defaults
+  statistics:
+    bootstrap_n: 1000
+    min_correlation_samples: 10
+    fdr_alpha: 0.05
+  predictors:
+    top_n: 20
+  visualization:
+    smoothing_sigma: 2.0
+
 decoding:
-  # Cross-validation
   cv:
     inner_splits: 5
-    
-  # Model configurations
   models:
     elasticnet:
       max_iter: 200000
@@ -135,41 +122,31 @@ decoding:
       grid:
         alpha: [1e-3, 1e-2, 1e-1, 1, 10, 100]
         l1_ratio: [0.2, 0.5, 0.8]
-        
     random_forest:
       n_estimators: 500
-      estimator_n_jobs: -1  # Set to 1 to avoid nested parallelism
+      estimator_n_jobs: -1
       bootstrap: true
       grid:
         max_depth: [null, 8, 16, 32]
         max_features: ["sqrt", 0.2, 0.5, 1.0]
         min_samples_leaf: [1, 5, 10]
-        
     temperature_only:
       ridge_alpha_grid: [0.0, 1e-3, 1e-2, 1e-1, 1, 10]
-      
-  # Analysis parameters
   analysis:
     n_perm_quick: 1000
     n_perm_refit: 500
     rf_perm_importance_repeats: 20
     bootstrap_n: 1000
-    
-    # Riemannian geometry settings
     riemann:
-      plateau_window: [0.0, 10.0]
+      plateau_window: [3.0, 10.5]
       bands: [[1.0, 4.0], [4.0, 8.0], [8.0, 13.0], [13.0, 30.0], [30.0, 45.0]]
       sliding_window:
         window_len: 0.75
         step: 0.25
-        
-  # Feature flags
   flags:
     run_within_subject_kfold: true
     run_riemann: true
     run_shap: true
-    
-  # Output file naming patterns
   paths:
     results_subdir: "decoding"
     plots_subdir: "plots"
@@ -220,61 +197,6 @@ decoding:
       riemann_bands: "summary_riemann_bands.json"
       riemann_sliding_window: "riemann_sliding_window.json"
 
-# Visualization settings
-visualization:
-  # Figure settings
-  dpi: 300
-  save_formats: ["png"]
-  # Save parameters
-  pad_inches: 0.02
-  bbox_inches: "tight"
-  
-  # Plot styling
-  montage: "standard_1005"  # EEG montage for topoplots
-  coef_agg: "abs"
-  band_colors:
-    theta: "#4C72B0"
-    alpha: "#1f77b4"
-    beta: "#ff7f0e"
-    gamma: "#d62728"
-  
-  # Advanced plotting parameters for specialized functions
-  advanced:
-    # TFR spectrogram plotting defaults
-    tfr_spectro:
-      fontsize: 8
-      dpi: 1200
-      extension: "svg"
-      bbox_inches: "tight"
-      transparent: true
-      default_figsize: [2, 1]
-    
-    # TFR topomap plotting defaults  
-    tfr_topomap:
-      fontsize: 10
-      dpi: 800
-      extension: "png"
-      bbox_inches: "tight"
-      transparent: true
-      default_figsize: [1.5, 1.5]
-    
-    # General plotting figure sizes
-    connectivity_matrix_figsize: [20, 20]
-    alpha_peak_figsize: [10, 5]
-    scatter_plot_figsize: [6, 6]
-    coef_topomap_figsize: [4.2, 4.0]
-    paired_metric_figsize: [10, 4]
-    histogram_figsize: [6, 4]
-    bar_plot_figsize: [8, 5]
-    subject_id_decode_figsize: [3, 4]
-    correlation_matrix_figsize: [5, 5]
-    ranking_heatmap_figsize: [10, 6]
-    shap_summary_figsize: [8, 6]
-    shap_dependence_figsize: [6, 4]
-    behavior_scatter_figsize: [4.5, 3.5]
-    roi_scatter_figsize: [6, 3.2]
-
-# Statistics and correlation settings
 statistics:
   use_spearman_default: true
   partial_covars_default: null
@@ -283,14 +205,12 @@ statistics:
   group_only_default: false
   build_reports_default: true
 
-# Random seed and reproducibility settings
 random:
-  seed: 42  # Global random seed for reproducibility
+  seed: 42
   bootstrap_default: 0
 
-# Logging configuration
 logging:
-  type: "file"  # "file" or "console"
+  type: "file"
   level: "INFO"
   file_names:
     foundational: "01_foundational_analysis.log"
@@ -299,123 +219,9 @@ logging:
     behavior_analysis: "04_behavior_feature_analysis.log"
     decoding: "05_decode_pain_experience.log"
 
-# Analysis-specific settings
-analysis:
-  # ERP analysis settings
-  erp:
-    picks: "eeg"  # Channel types for ERP averaging
-    combine: "gfp"  # Method to combine channels ("gfp" or null for butterfly)
-    include_tmax_in_crop: false
-    default_crop_tmin: null
-    default_crop_tmax: null
-    pain_color: "crimson"
-    nonpain_color: "navy"
-    plots_subdir: "01_foundational_analysis"
-    counts_file_name: "counts_pain.tsv"
-    output_files:
-      pain_gfp: "erp_pain_binary_gfp.png"
-      pain_butterfly: "erp_pain_binary_butterfly.png"
-      temp_gfp: "erp_by_temperature_gfp.png"
-      temp_butterfly: "erp_by_temperature_butterfly.png"
-      temp_butterfly_template: "erp_by_temperature_butterfly_{label}.png"
-    
-  # Time-frequency analysis
-  time_frequency:
-    default_temperature_strategy: "pooled"  # "pooled", "per", "both"
-    baseline_window: [-2.0, -1.0]  # TFR baseline window (conservative, avoiding anticipatory activity)
-    default_plateau_tmin: 0.0
-    default_plateau_tmax: 10.0
-    # TFR computation
-    freq_min: 1.0
-    freq_max: 100.0
-    n_freqs: 40
-    n_cycles_factor: 3.0  # n_cycles = freqs * factor (increased for better spectral resolution)
-    tfr_decim: 4
-    tfr_picks: "eeg"
-    # Band bounds
-    band_bounds:
-      theta: [4.0, 7.9]    # 4.0 to (8.0 - 0.1) 
-      alpha: [8.0, 12.9]   # 8.0 to (13.0 - 0.1)
-      beta: [13.0, 30.0]   # 13.0 to 30.0
-      gamma: [30.1, 80.0]  # (30.0 + 0.1) to 80.0
-    # Topomap styling
-    topo_contours: 6
-    topo_cmap: "RdBu_r"
-    colorbar_fraction: 0.03
-    colorbar_pad: 0.02
-    roi_mask_params:
-      marker: 'o'
-      markerfacecolor: 'w'
-      markeredgecolor: 'k'
-      linewidth: 0.5
-      markersize: 4
-    # Sensor-space ROI definitions and baseline requirements
-    min_baseline_samples: 5  # Minimum samples required in baseline window
-    rois:
-      Frontal: ["^(Fpz|Fp[12]|AFz|AF[3-8]|Fz|F[1-8])$"]
-      Central: ["^(Cz|C[1-6])$"]
-      Parietal: ["^(Pz|P[1-8])$"]
-      Occipital: ["^(Oz|O[12]|POz|PO[3-8])$"]
-      Temporal: ["^(T7|T8|TP7|TP8|FT7|FT8)$"]
-      Sensorimotor:
-        - "^(FC[234]|FCz)$"
-        - "^(C[234]|Cz)$"
-        - "^(CP[234]|CPz)$"
-    # Default CLI parameters
-    n_perm_default: 0
-    do_group_default: false
-    group_only_default: false
-    build_reports_default: false
-    
-  # Raw-to-BIDS conversion
-  raw_to_bids:
-    default_montage: "easycap-M1"
-    default_line_freq: 60.0
-
-  # Feature engineering analysis settings
-  feature_engineering:
-    min_baseline_samples: 5  # Minimum samples required in baseline window
-    tfr_spectrogram_vlim: null  # Optional override for TFR spectrogram limits
-
-  # Behavior analysis settings (04_behavior_feature_analysis.py)
-  behavior_analysis:
-    # Time-frequency correlation heatmap parameters
-    time_frequency_heatmap:
-      time_resolution: 0.1  # Time bin size in seconds
-      freq_resolution: 2.0  # Frequency bin size in Hz
-      time_window: [-0.5, 10.0]  # Time window relative to event onset (seconds)
-      freq_range: [4.0, 80.0]  # Frequency range in Hz
-      alpha: 0.05  # Significance threshold for FDR correction
-      roi_selection: null  # ROI name or null for all channels
-      n_cycles_factor: 3.0  # Divide frequencies by this for adaptive n_cycles
-      decim: 4  # Decimation factor for TFR computation
-      min_valid_points: 5  # Minimum valid data points for correlation
-      
-    # Advanced visualization parameters
-    visualization:
-      figsize_heatmap: [16, 12]  # Figure size for heatmaps
-      correlation_vmin: -0.6  # Min correlation for color scale
-      correlation_vmax: 0.6   # Max correlation for color scale
-      significance_alpha: 0.7  # Alpha for significance overlay
-      
-    # Spline smoothing parameters
-    spline:
-      smoothing_factor: 0.3  # Smoothing parameter (fraction of data length)
-      min_smoothing: 1.0     # Minimum smoothing factor
-      max_iter: 50           # Maximum iterations for spline fitting
-      tolerance: 1e-3        # Convergence tolerance
-      
-    # Statistical parameters
-    statistics:
-      bootstrap_n: 1000      # Number of bootstrap samples
-      min_correlation_samples: 10  # Minimum samples for correlation
-      fdr_alpha: 0.05       # FDR correction threshold
-
-# Environment settings
 environment:
-  # Thread limits to avoid oversubscription
   thread_limits:
     OMP_NUM_THREADS: "1"
-    MKL_NUM_THREADS: "1" 
+    MKL_NUM_THREADS: "1"
     OPENBLAS_NUM_THREADS: "1"
     NUMEXPR_NUM_THREADS: "1"
