@@ -6,7 +6,6 @@ import inspect
 from pathlib import Path
 from typing import List, Optional, Tuple
 import numpy as np
-import pandas as pd
 import mne
 from mne_bids import BIDSPath, write_raw_bids, make_dataset_description
 
@@ -18,7 +17,10 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 # Load centralized configuration
-from config_loader import load_config, get_legacy_constants
+try:  # support both `python -m eeg_pipeline.raw_to_bids` and direct execution
+    from .config_loader import load_config, get_legacy_constants
+except Exception:  # pragma: no cover
+    from config_loader import load_config, get_legacy_constants
 
 config = load_config()
 _constants = get_legacy_constants(config)
@@ -26,8 +28,9 @@ _constants = get_legacy_constants(config)
 PROJECT_ROOT = _constants["PROJECT_ROOT"]
 BIDS_ROOT = _constants["BIDS_ROOT"]
 TASK = _constants["TASK"]
-MONTAGE_NAME = _constants["DEFAULT_MONTAGE"]
-LINE_FREQ = _constants["DEFAULT_LINE_FREQ"]
+# Prefer new per-script section; fall back to legacy constants
+MONTAGE_NAME = config.get("raw_to_bids.default_montage", _constants.get("DEFAULT_MONTAGE", "easycap-M1"))
+LINE_FREQ = float(config.get("raw_to_bids.default_line_freq", _constants.get("DEFAULT_LINE_FREQ", 60.0)))
 
 
 def find_brainvision_vhdrs(source_root: Path) -> List[Path]:
@@ -80,7 +83,6 @@ def convert_one(
     montage_name: Optional[str],
     line_freq: Optional[float],
     overwrite: bool = False,
-    merge_behavior: bool = False,
     zero_base_onsets: bool = False,
     trim_to_first_volume: bool = False,
     event_prefixes: Optional[List[str]] = None,
@@ -104,6 +106,12 @@ def convert_one(
         # Fallback: position in sorted list
         all_runs = sorted(vhdr_path.parent.glob("*.vhdr"))
         run_idx = all_runs.index(vhdr_path) + 1 if len(all_runs) > 1 else None
+        if run_idx is not None:
+            print(
+                f"Warning: No explicit run found in filename '{vhdr_path.name}'. "
+                f"Inferring run={run_idx} by alphabetical order among {len(all_runs)} files. "
+                f"Prefer 'run-01' style filenames to guarantee correct run IDs."
+            )
 
     raw = mne.io.read_raw_brainvision(vhdr_path, preload=False, verbose=False)
 
@@ -185,6 +193,11 @@ def convert_one(
             raw.set_annotations(new_anns)
         else:
             # No matches found: clear annotations so nothing gets written
+            print(
+                "Warning: No annotations matched provided prefixes. "
+                f"Prefixes={norm_prefixes}. Found {len(anns)} annotations but will drop all, resulting in no events.tsv. "
+                "Use --keep_all_annotations or adjust --event_prefix to keep the desired events."
+            )
             raw.set_annotations(mne.Annotations([], [], [], orig_time=anns.orig_time))
 
     bids_path = BIDSPath(
@@ -216,44 +229,6 @@ def convert_one(
         **kwargs,
     )
 
-    # Post-process: merge behavioral TrialSummary.csv onto Trig_therm/T 1 events if requested
-    if merge_behavior:
-        try:
-            # Locate events.tsv using BIDSPath utilities
-            ebp = bids_path.copy()
-            ebp.update(suffix="events", extension=".tsv")
-            events_tsv_path = ebp.fpath
-
-            if events_tsv_path and events_tsv_path.exists():
-                # Psychopy data assumed under sibling folder 'Psychopy_Data' of the subject source folder
-                subj_source_dir = vhdr_path.parent.parent  # .../sub-XXX
-                psychopy_dir = subj_source_dir / "Psychopy_Data"
-                csvs = sorted(psychopy_dir.glob("*TrialSummary.csv")) if psychopy_dir.exists() else []
-                if csvs:
-                    behav_df = pd.read_csv(csvs[0])
-                    ev_df = pd.read_csv(events_tsv_path, sep="\t")
-
-                    # Keep only Trig_therm/T 1 rows (in case upstream didn't filter)
-                    def _norm(s: str) -> str:
-                        return re.sub(r"\s+", " ", str(s)).strip()
-
-                    ev_df = ev_df[ev_df["trial_type"].map(_norm) == "Trig_therm/T 1"].reset_index(drop=True)
-
-                    # Align lengths, warn on mismatch
-                    if len(behav_df) != len(ev_df):
-                        print(f"Warning: Trig_therm/T 1 events ({len(ev_df)}) != behavioral rows ({len(behav_df)}). Columns will be trimmed to min length.")
-                    n = min(len(behav_df), len(ev_df))
-                    if n > 0:
-                        behav_sub = behav_df.iloc[:n].reset_index(drop=True)
-                        ev_df = ev_df.iloc[:n].reset_index(drop=True)
-                        # Add behavioral columns
-                        for col in behav_sub.columns:
-                            ev_df[col] = behav_sub[col].values
-                        ev_df.to_csv(events_tsv_path, sep="\t", index=False)
-                # else: no behavioral CSV; skip silently
-        except Exception as e:
-            print(f"Warning: behavioral merge failed for {bids_path}: {e}")
-
     return bids_path
 
 
@@ -266,7 +241,6 @@ def main():
     parser.add_argument("--montage", type=str, default=MONTAGE_NAME, help="Standard montage name to set on raw (e.g., easycap-M1). Use '' to skip.")
     parser.add_argument("--line_freq", type=float, default=LINE_FREQ, help="Line noise frequency (Hz) metadata for sidecar.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing BIDS files")
-    parser.add_argument("--merge_behavior", action="store_true", help="Merge Psychopy TrialSummary.csv into events.tsv (disabled by default)")
     parser.add_argument("--zero_base_onsets", action="store_true", help="Zero-base kept annotation onsets so events start at 0.0")
     parser.add_argument(
         "--trim_to_first_volume",
@@ -282,8 +256,8 @@ def main():
         default=None,
         help=(
             "Keep only annotations whose normalized label starts with this prefix. "
-            "Repeat this flag to keep multiple prefixes, e.g., --event_prefix Trig_therm/T 1 --event_prefix Reward_on. "
-            "If omitted, defaults to Trig_therm/T 1. Use --keep_all_annotations to keep all annotations."
+            "Repeat to keep multiple prefixes, e.g., --event_prefix Trig_therm --event_prefix Reward_on. "
+            "If omitted, defaults to Trig_therm. Use --keep_all_annotations to keep all annotations."
         ),
     )
     parser.add_argument("--keep_all_annotations", action="store_true", help="If set, do not filter annotations at all; write whatever exists.")
@@ -321,7 +295,6 @@ def main():
                 montage_name=montage_name,
                 line_freq=args.line_freq,
                 overwrite=args.overwrite,
-                merge_behavior=args.merge_behavior,
                 zero_base_onsets=args.zero_base_onsets,
                 trim_to_first_volume=args.trim_to_first_volume,
                 event_prefixes=args.event_prefix,
