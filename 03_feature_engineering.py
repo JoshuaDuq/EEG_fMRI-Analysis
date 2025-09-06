@@ -11,14 +11,14 @@ import mne
 from mne_bids import BIDSPath
 import glob
 import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
+ 
 
 # ==========================
 # CONFIG
 # Load centralized configuration from YAML
 # ==========================
 from config_loader import load_config, get_legacy_constants
+from alignment_utils import align_events_to_epochs_strict, validate_alignment
 
 # Load configuration
 config = load_config()
@@ -33,25 +33,33 @@ SUBJECTS = _constants["SUBJECTS"]
 TASK = _constants["TASK"]
 FEATURES_FREQ_BANDS = _constants["FEATURES_FREQ_BANDS"]
 CUSTOM_TFR_FREQS = _constants["CUSTOM_TFR_FREQS"]
-CUSTOM_TFR_N_CYCLES = CUSTOM_TFR_FREQS / 3.0
+# Import TFR utilities for improved n_cycles calculation
+from tfr_utils import compute_adaptive_n_cycles, log_tfr_resolution
+
+cycles_factor = float(config.get("time_frequency_analysis.tfr.n_cycles_factor", 2.0))
+# Use improved n_cycles calculation with minimum floor, consistent with 02
+CUSTOM_TFR_N_CYCLES = compute_adaptive_n_cycles(CUSTOM_TFR_FREQS, cycles_factor=cycles_factor, min_cycles=3.0)
 CUSTOM_TFR_DECIM = _constants["CUSTOM_TFR_DECIM"]
 DEFAULT_TASK = TASK
 POWER_BANDS = _constants["POWER_BANDS"]
-PLATEAU_START = _constants["PLATEAU_START"]
-PLATEAU_END = _constants["PLATEAU_END"]
+_plateau = config.get("time_frequency_analysis.plateau_window", [3.0, 10.5])
+PLATEAU_START = float(_plateau[0])
+PLATEAU_END = float(_plateau[1])
 TARGET_COLUMNS = _constants["TARGET_COLUMNS"]
 
 # Minimum number of samples required in the baseline window
-MIN_BASELINE_SAMPLES = config.analysis.feature_engineering.min_baseline_samples
+MIN_BASELINE_SAMPLES = int(config.get("feature_engineering.min_baseline_samples", 5))
 # Baseline window for TFR computations (start, end) in seconds
-TFR_BASELINE = tuple(config.analysis.time_frequency.baseline_window)
+TFR_BASELINE = tuple(config.get("time_frequency_analysis.baseline_window", [-5.0, -0.01]))
 
-LOG_FILE_NAME = config.logging.file_names.feature_engineering  # Name of the log file for this script
+# Robust logging file name with fallback
+LOG_FILE_NAME = config.get(
+    "logging.file_names.feature_engineering", "03_feature_engineering.log"
+)  # Name of the log file for this script
 
 # Optional override for TFR spectrogram color limits (positive value)
-TFR_SPECTROGRAM_VLIM = config.get(
-    "analysis.feature_engineering.tfr_spectrogram_vlim", None
-)
+TFR_SPECTROGRAM_VLIM = config.get("feature_engineering.tfr_spectrogram_vlim", None)
+SAVE_TFR_WITH_SIDECAR = bool(config.get("feature_engineering.save_tfr_with_sidecar", False))
 
 
 # -----------------------------------------------------------------------------
@@ -109,8 +117,9 @@ def _validate_baseline_indices(
         b_start = float(times.min())
     if b_end is None:
         b_end = 0.0
-    if b_end >= 0:
-        raise ValueError("Baseline window must end before 0 s")
+    # Allow baseline ending exactly at 0.0 s (common convention)
+    if b_end > 0:
+        raise ValueError("Baseline window must end at or before 0 s")
     mask = (times >= b_start) & (times < b_end)
     if mask.sum() < min_samples:
         raise ValueError(
@@ -173,6 +182,44 @@ def _find_tfr_path(subject: str, task: str) -> Optional[Path]:
         for c in sorted(subj_dir.rglob(f"sub-{subject}_task-{task}*_epo-tfr.h5")):
             return c
     return None
+
+
+def _save_tfr_with_sidecar(
+    tfr, out_path: Path, baseline_window: Tuple[float, float], mode: str = "logratio", logger: Optional[logging.Logger] = None
+) -> None:
+    """Save TFR to H5 with a JSON sidecar annotating baseline status.
+
+    Parameters
+    ----------
+    tfr : mne.time_frequency.EpochsTFR | AverageTFR
+        TFR object to save
+    out_path : Path
+        Path to H5 output
+    baseline_window : (float, float)
+        Baseline window applied (start, end)
+    mode : str
+        Baseline mode string (e.g., 'logratio')
+    """
+    try:
+        _ensure_dir(out_path.parent)
+        # Save TFR
+        tfr.save(str(out_path), overwrite=True)
+        # Sidecar
+        sidecar = {
+            "baseline_applied": True,
+            "baseline_mode": mode,
+            "baseline_window": [float(baseline_window[0]), float(baseline_window[1])],
+            "created_by": "03_feature_engineering.py",
+            "comment": getattr(tfr, "comment", None),
+        }
+        import json
+        with open(out_path.with_suffix(".json"), "w", encoding="utf-8") as f:
+            json.dump(sidecar, f, indent=2)
+        if logger:
+            logger.info(f"Saved TFR and sidecar: {out_path} (+ .json)")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to save TFR with sidecar to {out_path}: {e}")
 
 
 def _load_events_df(subject: str, task: str, logger: Optional[logging.Logger] = None) -> Optional[pd.DataFrame]:
@@ -245,6 +292,7 @@ def _compute_tfr(
     freqs: np.ndarray = None,
     n_cycles: np.ndarray = None,
     decim: int = None,
+    logger: Optional[logging.Logger] = None,
 ) -> "mne.time_frequency.EpochsTFR":
     """Compute EpochsTFR from cleaned epochs using Morlet wavelets (trial-level)."""
     if freqs is None:
@@ -253,6 +301,10 @@ def _compute_tfr(
         n_cycles = CUSTOM_TFR_N_CYCLES
     if decim is None:
         decim = CUSTOM_TFR_DECIM
+
+    # Log TFR resolution for diagnostics
+    if logger is not None:
+        log_tfr_resolution(freqs, n_cycles, epochs.info['sfreq'], logger)
 
     power = mne.time_frequency.tfr_morlet(
         epochs,
@@ -281,32 +333,12 @@ def _pick_target_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def _align_events_to_epochs(events_df: Optional[pd.DataFrame], epochs: mne.Epochs) -> Optional[pd.DataFrame]:
-    if events_df is None:
-        return None
-    aligned = False
-    sel = getattr(epochs, "selection", None)
-    if sel is not None and len(sel) == len(epochs):
-        try:
-            if len(events_df) > int(np.max(sel)):
-                out = events_df.iloc[sel].reset_index(drop=True)
-                aligned = True
-                return out
-        except Exception:
-            pass
-    if "sample" in events_df.columns and isinstance(getattr(epochs, "events", None), np.ndarray):
-        try:
-            samples = epochs.events[:, 0]
-            out = events_df.set_index("sample").reindex(samples)
-            if len(out) == len(epochs) and not out.isna().all(axis=1).any():
-                return out.reset_index()
-        except Exception:
-            pass
-    # Fallback: naive trim
-    n = min(len(events_df), len(epochs))
-    if n == 0:
-        return None
-    return events_df.iloc[:n].reset_index(drop=True)
+# Import strict alignment utilities
+from alignment_utils import align_events_to_epochs_strict
+
+def _align_events_to_epochs(events_df: Optional[pd.DataFrame], epochs: mne.Epochs, logger: Optional[logging.Logger] = None) -> Optional[pd.DataFrame]:
+    """Align events to epochs using strict alignment - no unsafe fallbacks."""
+    return align_events_to_epochs_strict(events_df, epochs, logger)
 
 
 def _time_mask(times: np.ndarray, tmin: float, tmax: float) -> np.ndarray:
@@ -418,14 +450,18 @@ def _load_labels(subj_dir: Path, subject: str, task: str) -> Optional[np.ndarray
 def _save_fig(fig, save_path: Path, formats=None, dpi=300):
     """Save figure in multiple formats with consistent settings."""
     if formats is None:
-        formats = config.visualization.save_formats
+        formats = config.get("output.save_formats", ["png"])  # minimal control
     
     _ensure_dir(save_path.parent)
     
+    pad_inches = float(config.get("output.pad_inches", 0.02))
     for fmt in formats:
         path_with_ext = save_path.with_suffix(f'.{fmt}')
-        fig.savefig(path_with_ext, dpi=dpi, bbox_inches='tight', 
-                   pad_inches=config.visualization.pad_inches)
+        fig.savefig(path_with_ext, dpi=dpi, bbox_inches='tight', pad_inches=pad_inches)
+
+def _get_band_color(band: str) -> str:
+    """Return a consistent color for a band, with safe fallback."""
+    return str(config.get(f"visualization.band_colors.{band}", "#1f77b4"))
 
 
 
@@ -462,7 +498,7 @@ def plot_power_distributions(pow_df: pd.DataFrame, bands: List[str], subject: st
                                      showmeans=True, showmedians=True)
             
             # Styling
-            band_color = getattr(config.visualization.band_colors, band, '#1f77b4') if hasattr(config.visualization, 'band_colors') else '#1f77b4'
+            band_color = _get_band_color(band)
             for pc in parts['bodies']:
                 pc.set_facecolor(band_color)
                 pc.set_alpha(0.7)
@@ -493,57 +529,6 @@ def plot_power_distributions(pow_df: pd.DataFrame, bands: List[str], subject: st
         
     except Exception as e:
         logger.error(f"Failed to create power distributions: {e}")
-        if 'fig' in locals():
-            plt.close(fig)
-
-
-def plot_power_distributions_group(
-    pow_df: pd.DataFrame, bands: List[str], save_dir: Path
-) -> None:
-    """Violin plots of band power pooled across all subjects and trials."""
-    logger = logging.getLogger("group_power_distributions")
-    try:
-        n_bands = len(bands)
-        n_cols = 2
-        n_rows = (n_bands + n_cols - 1) // n_cols
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4 * n_rows))
-        if n_bands == 1:
-            axes = [axes]
-        elif n_rows == 1:
-            axes = axes.reshape(1, -1)
-        axes = axes.flatten()
-
-        for i, band in enumerate(bands):
-            band_cols = [c for c in pow_df.columns if c.startswith(f"pow_{band}_")]
-            if not band_cols:
-                continue
-            band_data = pow_df[band_cols].to_numpy().ravel()
-            band_data = band_data[~np.isnan(band_data)]
-            if band_data.size == 0:
-                continue
-            parts = axes[i].violinplot([band_data], positions=[1], showmeans=True, showmedians=True)
-            band_color = (
-                getattr(config.visualization.band_colors, band, "#1f77b4")
-                if hasattr(config.visualization, "band_colors")
-                else "#1f77b4"
-            )
-            for pc in parts["bodies"]:
-                pc.set_facecolor(band_color)
-                pc.set_alpha(0.7)
-            axes[i].axhline(0, color="red", linestyle="--", alpha=0.7)
-            axes[i].set_title(f"{band.capitalize()} Power Distribution")
-            axes[i].set_ylabel("log10(power/baseline)")
-            axes[i].set_xticks([])
-            axes[i].grid(True, alpha=0.3)
-
-        for j in range(len(bands), len(axes)):
-            axes[j].set_visible(False)
-        fig.suptitle("Band power distributions (all subjects)")
-        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-        _save_fig(fig, save_dir / "group_power_distributions_per_band")
-        plt.close(fig)
-    except Exception as e:
-        logger.error(f"Failed to create group power distributions: {e}")
         if 'fig' in locals():
             plt.close(fig)
 
@@ -583,7 +568,9 @@ def plot_channel_power_heatmap(pow_df: pd.DataFrame, bands: List[str], subject: 
         ax.set_yticks(range(len(valid_bands)))
         ax.set_yticklabels([b.capitalize() for b in valid_bands])
         ax.set_title(f'Mean Power per Channel and Band\nlog10(power/baseline)')
-
+        ax.set_xlabel('Channel')
+        ax.set_ylabel('Frequency Band')
+        
         # Add colorbar
         cbar = plt.colorbar(im, ax=ax, label='log10(power/baseline)', shrink=0.8)
         
@@ -612,7 +599,8 @@ def plot_tfr_spectrograms_roi(tfr, subject: str, save_dir: Path, logger: logging
     try:
         # Define ROI channels (central, frontal, parietal)
         roi_channels = ['Cz', 'C3', 'C4', 'Pz', 'Fz', 'Oz']
-        available_channels = [ch for ch in roi_channels if ch in tfr.ch_names]
+        ch_names = list(getattr(tfr, "ch_names", []) or tfr.info.get("ch_names", []))
+        available_channels = [ch for ch in roi_channels if ch in ch_names]
         
         if not available_channels:
             logger.warning("No ROI channels found in data")
@@ -639,8 +627,7 @@ def plot_tfr_spectrograms_roi(tfr, subject: str, save_dir: Path, logger: logging
                 show=False,
                 colorbar=True,
                 title=f'{ch} - log10(power/baseline)',
-                vmin=-vabs,
-                vmax=+vabs,
+                vlim=(-vabs, +vabs),
                 cmap='RdBu_r',
             )  # Symmetric around 0 for logratio
             
@@ -662,105 +649,13 @@ def plot_tfr_spectrograms_roi(tfr, subject: str, save_dir: Path, logger: logging
             plt.close(fig)
 
 
-def plot_baseline_vs_stimulus_power(tfr_raw, bands: List[str], subject: str, save_dir: Path, logger: logging.Logger):
-    """Compare raw power in baseline vs stimulus periods."""
-    try:
-        # Extract baseline strictly before stimulus onset
-        times = np.asarray(tfr_raw.times)
-        if not np.any(times < 0):
-            logger.warning("No baseline samples available before stimulus onset; skipping plot.")
-            return
-
-        baseline_start = max(-5.0, times.min())
-        baseline_end = np.max(times[times < 0])
-        baseline_tfr = tfr_raw.copy().crop(baseline_start, baseline_end)
-
-        # Verify sufficient baseline coverage
-        if baseline_tfr.times.size < MIN_BASELINE_SAMPLES:
-            logger.warning(
-                f"Baseline window has {baseline_tfr.times.size} samples; requires at least {MIN_BASELINE_SAMPLES}."
-            )
-            return
-
-        stimulus_tfr = tfr_raw.copy().crop(PLATEAU_START, PLATEAU_END)  # Stimulus window
-        
-        n_bands = len(bands)
-        n_cols = 2
-        n_rows = (n_bands + n_cols - 1) // n_cols
-        
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4*n_rows))
-        if n_bands == 1:
-            axes = [axes]
-        elif n_rows == 1:
-            axes = axes.reshape(1, -1)
-        axes = axes.flatten()
-        
-        for i, band in enumerate(bands):
-            if band not in FEATURES_FREQ_BANDS:
-                continue
-                
-            fmin, fmax = FEATURES_FREQ_BANDS[band]
-            
-            # Extract band power for both periods (average over freq and time)
-            # Use frequency masking instead of crop_freqs
-            fmask = _freq_mask(baseline_tfr.freqs, fmin, fmax)
-            baseline_power = baseline_tfr.data[:, :, fmask, :].mean(axis=(2,3))  # (trials, channels)
-            stimulus_power = stimulus_tfr.data[:, :, fmask, :].mean(axis=(2,3))
-            
-            # Average over channels for scatter plot
-            baseline_avg = baseline_power.mean(axis=1)
-            stimulus_avg = stimulus_power.mean(axis=1)
-            
-            # Create scatter plot
-            band_color = getattr(config.visualization.band_colors, band, '#1f77b4') if hasattr(config.visualization, 'band_colors') else '#1f77b4'
-            axes[i].scatter(baseline_avg, stimulus_avg, alpha=0.6, s=30, color=band_color)
-            
-            # Add unity line
-            min_val = min(baseline_avg.min(), stimulus_avg.min())
-            max_val = max(baseline_avg.max(), stimulus_avg.max())
-            axes[i].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.7, label='Unity')
-            
-            axes[i].set_xlabel('Baseline Power')
-            axes[i].set_ylabel('Stimulus Power') 
-            axes[i].set_title(f'{band.capitalize()} Band\nBaseline vs Stimulus')
-            axes[i].grid(True, alpha=0.3)
-            
-            # Add correlation and paired t-test
-            r, p_r = stats.pearsonr(baseline_avg, stimulus_avg)
-            t_stat, p_t = stats.ttest_rel(stimulus_avg, baseline_avg)
-            
-            stats_text = f'r={r:.3f} (p={p_r:.3f})\nt={t_stat:.2f} (p={p_t:.3f})'
-            axes[i].text(0.05, 0.95, stats_text, transform=axes[i].transAxes, 
-                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        
-        # Hide unused subplots
-        for j in range(len(bands), len(axes)):
-            axes[j].set_visible(False)
-            
-        plt.tight_layout()
-        _save_fig(fig, save_dir / f'sub-{subject}_baseline_vs_stimulus_power')
-        plt.close(fig)
-        logger.info(f"Saved baseline vs stimulus comparison: {save_dir / f'sub-{subject}_baseline_vs_stimulus_power.png'}")
-        
-    except Exception as e:
-        logger.error(f"Failed to create baseline vs stimulus plot: {e}")
-        if 'fig' in locals():
-            plt.close(fig)
-
-
-
-
 def plot_power_time_courses(tfr_raw, bands: List[str], subject: str, save_dir: Path, logger: logging.Logger):
-    """Plot power time courses showing how power evolves within trials for each frequency band."""
+    """Plot power time courses showing how power evolves within trials for each frequency band.
+    Each band gets its own separate figure."""
     try:
-        n_bands = len(bands)
-        fig, axes = plt.subplots(n_bands, 1, figsize=(12, 3*n_bands), sharex=True)
-        if n_bands == 1:
-            axes = [axes]
-        
         times = tfr_raw.times
         
-        for i, band in enumerate(bands):
+        for band in bands:
             # Get frequency range for this band
             if band not in FEATURES_FREQ_BANDS:
                 logger.warning(f"Band '{band}' not in config; skipping time course.")
@@ -773,33 +668,34 @@ def plot_power_time_courses(tfr_raw, bands: List[str], subject: str, save_dir: P
                 logger.warning(f"No frequencies found for {band} band ({fmin}-{fmax} Hz)")
                 continue
             
+            # Create separate figure for this band
+            fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+            
             # Average across frequencies and channels - fix indexing order
             # TFR data structure: (trials, channels, freqs, times)
-            band_power = tfr_raw.data[:, :, freq_mask, :].mean(axis=(0, 1, 2))  # Average across trials, channels, freqs
-            
-            # Convert to log scale
-            band_power_log = np.log10(band_power)
+            # For baseline-corrected TFRs (mode='logratio'), values are already log10(power/baseline).
+            # We therefore directly average and plot the logratio.
+            band_power_log = tfr_raw.data[:, :, freq_mask, :].mean(axis=(0, 1, 2))  # Average across trials, channels, freqs
             
             # Plot time course
-            axes[i].plot(times, band_power_log, linewidth=2, 
-                        color=getattr(config.visualization.band_colors, band, '#1f77b4') if hasattr(config.visualization, 'band_colors') else '#1f77b4')
+            ax.plot(times, band_power_log, linewidth=2, color=_get_band_color(band))
             
             # Add baseline period marker
-            axes[i].axvspan(-5, 0, alpha=0.2, color='gray', label='Baseline')
+            ax.axvspan(-5, 0, alpha=0.2, color='gray', label='Baseline')
             
             # Add stimulus period marker  
-            axes[i].axvspan(0, times[-1], alpha=0.2, color='orange', label='Stimulus')
+            ax.axvspan(0, times[-1], alpha=0.2, color='orange', label='Stimulus')
             
-            axes[i].set_ylabel(f'{band.capitalize()}\nlog10(Power)')
-            axes[i].set_title(f'{band.capitalize()} Band Power Time Course')
-            axes[i].grid(True, alpha=0.3)
-            axes[i].legend()
-        
-        axes[-1].set_xlabel('Time (s)')
-        plt.tight_layout()
-        _save_fig(fig, save_dir / f'sub-{subject}_power_time_courses')
-        plt.close(fig)
-        logger.info(f"Saved power time courses: {save_dir / f'sub-{subject}_power_time_courses.png'}")
+            ax.set_ylabel(f'log10(power/baseline)')
+            ax.set_xlabel('Time (s)')
+            ax.set_title(f'{band.capitalize()} Band Power Time Course')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            
+            plt.tight_layout()
+            _save_fig(fig, save_dir / f'sub-{subject}_power_time_course_{band}')
+            plt.close(fig)
+            logger.info(f"Saved {band} power time course: {save_dir / f'sub-{subject}_power_time_course_{band}.png'}")
         
     except Exception as e:
         logger.error(f"Failed to create power time courses: {e}")
@@ -807,52 +703,6 @@ def plot_power_time_courses(tfr_raw, bands: List[str], subject: str, save_dir: P
             plt.close(fig)
 
 
-def plot_channel_power_correlations(pow_df: pd.DataFrame, bands: List[str], subject: str, save_dir: Path, logger: logging.Logger):
-    """Plot correlation heatmap between channel powers within each frequency band."""
-    try:
-        n_bands = len(bands)
-        fig, axes = plt.subplots(1, n_bands, figsize=(5*n_bands, 4))
-        if n_bands == 1:
-            axes = [axes]
-        
-        for i, band in enumerate(bands):
-            # Get columns for this band
-            band_cols = [col for col in pow_df.columns if col.startswith(f'pow_{band}_')]
-            if len(band_cols) < 2:
-                logger.warning(f"Too few channels for {band} band correlation matrix")
-                axes[i].text(0.5, 0.5, f'Not enough\nchannels for {band}', 
-                           ha='center', va='center', transform=axes[i].transAxes)
-                axes[i].set_title(f'{band.capitalize()} Band')
-                continue
-            
-            # Compute correlation matrix
-            band_data = pow_df[band_cols]
-            corr_matrix = band_data.corr()
-            
-            # Clean channel names for display
-            clean_names = [col.replace(f'pow_{band}_', '') for col in band_cols]
-            
-            # Plot heatmap
-            im = axes[i].imshow(corr_matrix.values, cmap='RdBu_r', vmin=-1, vmax=1)
-            axes[i].set_xticks(range(len(clean_names)))
-            axes[i].set_yticks(range(len(clean_names)))
-            axes[i].set_xticklabels(clean_names, rotation=45, ha='right')
-            axes[i].set_yticklabels(clean_names)
-            axes[i].set_title(f'{band.capitalize()} Band\nChannel Correlations')
-            
-            # Add colorbar
-            cbar = plt.colorbar(im, ax=axes[i], shrink=0.8)
-            cbar.set_label('Correlation (r)')
-        
-        plt.tight_layout()
-        _save_fig(fig, save_dir / f'sub-{subject}_channel_power_correlations')
-        plt.close(fig)
-        logger.info(f"Saved channel power correlations: {save_dir / f'sub-{subject}_channel_power_correlations.png'}")
-        
-    except Exception as e:
-        logger.error(f"Failed to create channel power correlations: {e}")
-        if 'fig' in locals():
-            plt.close(fig)
 
 
 def plot_trial_power_variability(pow_df: pd.DataFrame, bands: List[str], subject: str, save_dir: Path, logger: logging.Logger):
@@ -875,7 +725,7 @@ def plot_trial_power_variability(pow_df: pd.DataFrame, bands: List[str], subject
             # Plot trial-by-trial variability
             trial_nums = range(1, len(band_power_trials) + 1)
             axes[i].plot(trial_nums, band_power_trials, 'o-', alpha=0.7, linewidth=1,
-                        color=getattr(config.visualization.band_colors, band, '#1f77b4') if hasattr(config.visualization, 'band_colors') else '#1f77b4')
+                        color=_get_band_color(band))
             
             # Add mean line
             mean_power = band_power_trials.mean()
@@ -905,17 +755,26 @@ def plot_trial_power_variability(pow_df: pd.DataFrame, bands: List[str], subject
             plt.close(fig)
 
 
-def plot_cross_frequency_coupling(tfr, subject: str, save_dir: Path, logger: logging.Logger):
-    """Plot cross-frequency coupling analysis showing relationships between frequency bands."""
+def plot_inter_band_spatial_power_correlation(tfr, subject: str, save_dir: Path, logger: logging.Logger):
+    """Plot inter_band_spatial_power_correlation showing relationships between frequency bands."""
     try:
         band_names = list(FEATURES_FREQ_BANDS.keys())
         n_bands = len(band_names)
         
-        # Create correlation matrix for cross-frequency coupling
+        # Create correlation matrix for Inter Band Spatial Power Correlation
         coupling_matrix = np.zeros((n_bands, n_bands))
         
-        # Average across time window for coupling analysis
-        tfr_windowed = tfr.copy().crop(PLATEAU_START, PLATEAU_END)
+        # Average across time window for inter_band_spatial_power_correlation (clip to available time range)
+        times = np.asarray(tfr.times)
+        tmin_clip = float(max(times.min(), PLATEAU_START))
+        tmax_clip = float(min(times.max(), PLATEAU_END))
+        if not np.isfinite(tmin_clip) or not np.isfinite(tmax_clip) or (tmax_clip <= tmin_clip):
+            logger.warning(
+                f"Skipping inter-band spatial power correlation: invalid plateau within data range "
+                f"(requested [{PLATEAU_START}, {PLATEAU_END}] s, available [{times.min():.2f}, {times.max():.2f}] s)"
+            )
+            return
+        tfr_windowed = tfr.copy().crop(tmin_clip, tmax_clip)
         tfr_avg = tfr_windowed.average()  # Average across trials
         
         for i, band1 in enumerate(band_names):
@@ -967,7 +826,7 @@ def plot_cross_frequency_coupling(tfr, subject: str, save_dir: Path, logger: log
                 text = ax.text(j, i, f'{coupling_matrix[i, j]:.2f}',
                              ha="center", va="center", color="black" if abs(coupling_matrix[i, j]) < 0.5 else "white")
         
-        ax.set_title('Cross-Frequency Coupling Matrix')
+        ax.set_title('Inter Band Spatial Power Correlation')
         ax.set_xlabel('Frequency Band')
         ax.set_ylabel('Frequency Band')
         
@@ -976,93 +835,16 @@ def plot_cross_frequency_coupling(tfr, subject: str, save_dir: Path, logger: log
         cbar.set_label('Correlation (r)')
         
         plt.tight_layout()
-        _save_fig(fig, save_dir / f'sub-{subject}_cross_frequency_coupling')
+        _save_fig(fig, save_dir / f'sub-{subject}_inter_band_spatial_power_correlation')
         plt.close(fig)
-        logger.info(f"Saved cross-frequency coupling: {save_dir / f'sub-{subject}_cross_frequency_coupling.png'}")
+        logger.info(f"Saved Inter Band Spatial Power Correlation: {save_dir / f'sub-{subject}_Inter Band Spatial Power Correlation.png'}")
         
     except Exception as e:
-        logger.error(f"Failed to create cross-frequency coupling: {e}")
+        logger.error(f"Failed to create Inter Band Spatial Power Correlation: {e}")
         if 'fig' in locals():
             plt.close(fig)
 
 
-def plot_spatial_power_gradients(tfr, bands: List[str], subject: str, save_dir: Path, logger: logging.Logger):
-    """Plot spatial power gradient maps showing directional patterns of activation."""
-    try:
-        n_bands = len(bands)
-        fig, axes = plt.subplots(2, n_bands, figsize=(4*n_bands, 8))
-        if n_bands == 1:
-            axes = axes.reshape(2, 1)
-        
-        # Average across time window
-        tfr_windowed = tfr.copy().crop(PLATEAU_START, PLATEAU_END)
-        tfr_avg = tfr_windowed.average()  # Average across trials
-        
-        for i, band in enumerate(bands):
-            if band not in FEATURES_FREQ_BANDS:
-                continue
-                
-            fmin, fmax = FEATURES_FREQ_BANDS[band]
-            freq_mask = (tfr_avg.freqs >= fmin) & (tfr_avg.freqs <= fmax)
-            
-            if not freq_mask.any():
-                continue
-            
-            # Extract band power (average across frequencies and time)
-            # TFR data structure after average(): (channels, freqs, times)
-            band_power = tfr_avg.data[:, freq_mask, :].mean(axis=(1, 2))
-            
-            # Get channel positions
-            pos = mne.find_layout(tfr_avg.info).pos[:len(tfr_avg.ch_names)]
-            
-            # Calculate spatial gradients
-            x_coords = pos[:, 0]
-            y_coords = pos[:, 1]
-            
-            # Compute gradients (simple finite differences)
-            # Sort channels by position for gradient calculation
-            x_sorted_idx = np.argsort(x_coords)
-            y_sorted_idx = np.argsort(y_coords)
-            
-            # X-gradient (left-right)
-            x_gradient = np.zeros_like(band_power)
-            for j in range(1, len(x_sorted_idx)-1):
-                idx = x_sorted_idx[j]
-                idx_left = x_sorted_idx[j-1]
-                idx_right = x_sorted_idx[j+1]
-                x_gradient[idx] = (band_power[idx_right] - band_power[idx_left]) / 2
-            
-            # Y-gradient (anterior-posterior)
-            y_gradient = np.zeros_like(band_power)
-            for j in range(1, len(y_sorted_idx)-1):
-                idx = y_sorted_idx[j]
-                idx_ant = y_sorted_idx[j-1]
-                idx_post = y_sorted_idx[j+1]
-                y_gradient[idx] = (band_power[idx_post] - band_power[idx_ant]) / 2
-            
-            # Plot X-gradient (lateral)
-            vlim_x = np.max(np.abs(x_gradient))
-            if vlim_x > 0:
-                mne.viz.plot_topomap(x_gradient, tfr_avg.info, axes=axes[0, i],
-                                   vlim=(-vlim_x, vlim_x), cmap='RdBu_r', show=False)
-            axes[0, i].set_title(f'{band.capitalize()}\nLateral Gradient')
-            
-            # Plot Y-gradient (anterior-posterior)  
-            vlim_y = np.max(np.abs(y_gradient))
-            if vlim_y > 0:
-                mne.viz.plot_topomap(y_gradient, tfr_avg.info, axes=axes[1, i],
-                                   vlim=(-vlim_y, vlim_y), cmap='RdBu_r', show=False)
-            axes[1, i].set_title(f'{band.capitalize()}\nAnt-Post Gradient')
-        
-        plt.tight_layout()
-        _save_fig(fig, save_dir / f'sub-{subject}_spatial_power_gradients')
-        plt.close(fig)
-        logger.info(f"Saved spatial power gradients: {save_dir / f'sub-{subject}_spatial_power_gradients.png'}")
-        
-    except Exception as e:
-        logger.error(f"Failed to create spatial power gradients: {e}")
-        if 'fig' in locals():
-            plt.close(fig)
 
 
 def _flatten_lower_triangles(conn_trials: np.ndarray, labels: Optional[np.ndarray], prefix: str) -> Tuple[pd.DataFrame, List[str]]:
@@ -1149,7 +931,13 @@ def process_subject(subject: str, task: str = TASK) -> None:
 
     # Load events and align
     events_df = _load_events_df(subject, task, logger)
-    aligned_events = _align_events_to_epochs(events_df, epochs)
+    try:
+        aligned_events = align_events_to_epochs_strict(events_df, epochs, logger)
+    except ValueError as e:
+        logger.error(f"Event alignment failed strictly: {e}")
+        return
+    if aligned_events is not None:
+        validate_alignment(aligned_events, epochs, logger)
     if aligned_events is None:
         logger.warning("No events available for targets; skipping subject.")
         return
@@ -1163,20 +951,29 @@ def process_subject(subject: str, task: str = TASK) -> None:
 
     # Compute TFR for power features (trial-level)
     tfr = _compute_tfr(epochs)
+    # Attach aligned metadata to TFR for downstream alignment (if lengths match)
+    try:
+        if aligned_events is not None and len(aligned_events) >= len(tfr):
+            tfr.metadata = aligned_events.iloc[: len(tfr)].reset_index(drop=True)
+    except Exception:
+        pass
     # Keep a copy of raw TFR before baseline correction for comparison plots
     tfr_raw = tfr.copy()
     
     # Normalize to pre-stimulus baseline as log10(power/baseline) for comparability
     try:
         times = np.asarray(tfr.times)
-        b_start, b_end, mask = _validate_baseline_indices(times, TFR_BASELINE, MIN_BASELINE_SAMPLES)
-        if b_end >= 0:
-            raise ValueError("Baseline window must end before 0 s")
-        if mask.sum() < MIN_BASELINE_SAMPLES:
-            raise ValueError(
-                f"Baseline window has {int(mask.sum())} samples; at least {MIN_BASELINE_SAMPLES} required"
-            )
+        b_start, b_end, _ = _validate_baseline_indices(times, TFR_BASELINE, MIN_BASELINE_SAMPLES)
         tfr.apply_baseline(baseline=(b_start, b_end), mode="logratio")
+        # Mark baseline status in the object comment for downstream checks
+        try:
+            tfr.comment = f"BASELINED:mode=logratio;win=({b_start:.3f},{b_end:.3f})"
+        except Exception:
+            pass
+        # Optionally save TFR with sidecar for downstream reuse
+        if SAVE_TFR_WITH_SIDECAR:
+            tfr_out = DERIV_ROOT / f"sub-{subject}" / "eeg" / f"sub-{subject}_task-{task}_power_epo-tfr.h5"
+            _save_tfr_with_sidecar(tfr, tfr_out, (b_start, b_end), mode="logratio", logger=logger)
     except ValueError as e:
         logger.error(f"Baseline normalization skipped: {e}")
     except Exception as e:
@@ -1283,28 +1080,21 @@ def process_subject(subject: str, task: str = TASK) -> None:
         # 4. TFR spectrograms for ROI channels
         plot_tfr_spectrograms_roi(tfr, subject, plots_dir, logger)
         
-        # 5. Baseline vs stimulus power comparison (using raw TFR)
-        plot_baseline_vs_stimulus_power(tfr_raw, POWER_BANDS, subject, plots_dir, logger)
-        
         # 6. Power-behavior correlations (moved to 04_behavior_feature_analysis.py)
         # This visualization is now handled in the behavior analysis script
         
         # Additional visualization suggestions (uncomment and customize as needed):
         
-        # 7. Power time courses - shows how power evolves within trials
-        plot_power_time_courses(tfr_raw, POWER_BANDS, subject, plots_dir, logger)
+        # 7. Power time courses - shows how power evolves within trials (baseline-corrected)
+        plot_power_time_courses(tfr, POWER_BANDS, subject, plots_dir, logger)
         
-        # 8. Channel connectivity heatmap - correlations between channel powers
-        plot_channel_power_correlations(pow_df, POWER_BANDS, subject, plots_dir, logger)
         
         # 9. Trial-by-trial power variability - shows consistency across trials  
         plot_trial_power_variability(pow_df, POWER_BANDS, subject, plots_dir, logger)
         
-        # 10. Cross-frequency coupling analysis - relationships between bands
-        plot_cross_frequency_coupling(tfr, subject, plots_dir, logger)
+        # 10. Inter Band Spatial Power Correlation - relationships between bands
+        plot_inter_band_spatial_power_correlation(tfr, subject, plots_dir, logger)
         
-        # 11. Spatial power gradient maps - shows spatial patterns of activation
-        plot_spatial_power_gradients(tfr, POWER_BANDS, subject, plots_dir, logger)
         
         logger.info("Successfully generated all power visualizations")
         
@@ -1314,72 +1104,46 @@ def process_subject(subject: str, task: str = TASK) -> None:
     logger.info(
         f"Done: sub-{subject}, n_trials={n}, n_direct_features={pow_df.shape[1]}, "
         f"n_conn_features={(conn_df.shape[1] if conn_df is not None and len(conn_df) > 0 else 0)}, "
-        f"n_all_features={X_all.shape[1]} (power = log10(power/baseline [-5–0 s]))"
+        f"n_all_features={X_all.shape[1]} (power = log10(power/baseline))"
     )
 
 
-def aggregate_group_level(subjects: List[str], task: str = TASK) -> None:
-    """Concatenate per-subject feature matrices and save group-level summaries."""
-    group_dir = DERIV_ROOT / "group" / "eeg" / "features"
-    _ensure_dir(group_dir)
-    X_list: List[pd.DataFrame] = []
-    y_list: List[pd.DataFrame] = []
-    for sub in subjects:
-        fdir = DERIV_ROOT / f"sub-{sub}" / "eeg" / "features"
-        x_path = fdir / "features_all.tsv"
-        y_path = fdir / "target_vas_ratings.tsv"
-        if x_path.exists():
-            df = pd.read_csv(x_path, sep="\t")
-            df["subject"] = sub
-            X_list.append(df)
-        if y_path.exists():
-            dfy = pd.read_csv(y_path, sep="\t")
-            dfy["subject"] = sub
-            y_list.append(dfy)
-    if X_list:
-        Xg = pd.concat(X_list, ignore_index=True)
-        Xg.to_csv(group_dir / "features_all.tsv", sep="\t", index=False)
+def _get_available_subjects() -> List[str]:
+    """Find all subjects in DERIV_ROOT that have cleaned epochs available."""
+    subs: List[str] = []
+    root = Path(DERIV_ROOT)
+    if not root.exists():
+        return subs
+    for p in sorted(root.glob("sub-*/eeg")):
+        sub_id = p.parent.name.replace("sub-", "")
         try:
-            plot_power_distributions_group(Xg, POWER_BANDS, group_dir)
+            if _find_clean_epochs_path(sub_id, TASK) is not None:
+                subs.append(sub_id)
         except Exception:
-            pass
-        try:
-            corr = Xg.drop(columns=["subject"]).corr()
-            fig, ax = plt.subplots(figsize=(6, 5))
-            sns.heatmap(corr, ax=ax, cmap="viridis", center=0)
-            ax.set_title("Feature correlation (all subjects)")
-            _save_fig(fig, group_dir / "group_feature_correlation")
-        except Exception:
-            pass
-    if y_list:
-        yg = pd.concat(y_list, ignore_index=True)
-        yg.to_csv(group_dir / "target_vas_ratings.tsv", sep="\t", index=False)
+            continue
+    return subs
 
-def main(subjects: Optional[List[str]] = None, task: str = TASK, do_group: bool = False):
-    if subjects is None or subjects == ["all"]:
-        subjects = SUBJECTS
+
+def main(subjects: Optional[List[str]] = None, task: str = TASK, all_subjects: bool = False):
+    # Enforce CLI-provided subjects; allow --all-subjects to scan DERIV_ROOT
+    if all_subjects:
+        subjects = _get_available_subjects()
+        if not subjects:
+            raise ValueError(f"No subjects with cleaned epochs found in {DERIV_ROOT}")
+    elif subjects is None or len(subjects) == 0:
+        raise ValueError("No subjects specified. Use --subjects or --all-subjects.")
     for sub in subjects:
         process_subject(sub, task)
-    if do_group or len(subjects) > 1:
-        aggregate_group_level(subjects, task)
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="EEG feature engineering: power + connectivity")
+    subj_group = parser.add_mutually_exclusive_group(required=True)
+    subj_group.add_argument("--subjects", nargs="*", help="Subject IDs to process (e.g., 001 002)")
+    subj_group.add_argument("--all-subjects", action="store_true", help="Process all available subjects with cleaned epochs")
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
-    parser.add_argument(
-        "--subjects",
-        nargs="*",
-        default=None,
-        help="Subject IDs or 'all' for all configured subjects",
-    )
-    parser.add_argument(
-        "--do-group",
-        action="store_true",
-        help="Force concatenation even for a single subject (default when multiple subjects)",
-    )
     args = parser.parse_args()
 
-    main(subjects=args.subjects, task=args.task, do_group=args.do_group)
+    main(subjects=args.subjects, task=args.task, all_subjects=args.all_subjects)
