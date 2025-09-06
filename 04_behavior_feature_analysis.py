@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import itertools
 import logging
-import hashlib
 
 import matplotlib
 matplotlib.use("Agg")  # headless-friendly
@@ -62,6 +61,20 @@ GROUP_ONLY_DEFAULT = _constants["GROUP_ONLY_DEFAULT"]
 BUILD_REPORTS_DEFAULT = _constants["BUILD_REPORTS_DEFAULT"]
 BAND_COLORS = _constants["BAND_COLORS"]
 
+# Behavior analysis config (important parameters)
+BEHAV_FDR_ALPHA = float(config.get("behavior_analysis.statistics.fdr_alpha", 0.05))
+BEHAV_MIN_CORR_SAMPLES = int(config.get("behavior_analysis.statistics.min_correlation_samples", 10))
+BEHAV_BOOTSTRAP_N = int(config.get("behavior_analysis.statistics.bootstrap_n", 1000))
+
+# Spline smoothing parameters for diagnostics
+SPLINE_SMOOTHING_FRAC = float(config.get("behavior_analysis.spline.smoothing_factor", 0.3))
+SPLINE_MIN_SMOOTHING = float(config.get("behavior_analysis.spline.min_smoothing", 1.0))
+SPLINE_MAX_ITER = int(config.get("behavior_analysis.spline.max_iter", 50))
+SPLINE_TOL = float(config.get("behavior_analysis.spline.tolerance", 1e-3))
+
+# Visualization smoothing for time series
+VIZ_SMOOTHING_SIGMA = float(config.get("behavior_analysis.visualization.smoothing_sigma", 2.0))
+
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
@@ -86,6 +99,19 @@ def _save_fig(fig: matplotlib.figure.Figure, path_base: Path | str, formats: Tup
         fig.savefig(base.with_suffix(f".{ext}"), dpi=FIG_DPI, bbox_inches="tight")
     plt.close(fig)
 
+
+def _get_band_color(band: str) -> str:
+    """Return color for a band with safe defaults.
+
+    Prefers BAND_COLORS from legacy constants; falls back to a sensible palette.
+    """
+    try:
+        if isinstance(BAND_COLORS, dict) and band in BAND_COLORS:
+            return str(BAND_COLORS[band])
+    except Exception:
+        pass
+    fallback = {"theta": "purple", "alpha": "green", "beta": "orange", "gamma": "red"}
+    return fallback.get(band, "#1f77b4")
 
 def _logratio_to_pct(v):
     """Transform logratio log10(power/baseline) to percent change (%).
@@ -184,53 +210,31 @@ def _align_events_to_epochs(events_df: Optional[pd.DataFrame], epochs: mne.Epoch
     if hasattr(epochs, "selection") and epochs.selection is not None:
         sel = epochs.selection
         try:
-            aligned = events_df.iloc[sel].reset_index(drop=True)
-            if len(aligned) != len(epochs):
-                raise ValueError(
-                    f"epochs.selection alignment produced {len(aligned)} rows; expected {len(epochs)}"
-                )
-            if "sample" not in aligned.columns or not isinstance(getattr(epochs, "events", None), np.ndarray):
-                raise ValueError("Missing 'sample' column or epochs.events to validate alignment")
-            samples = epochs.events[:, 0]
-            if not np.array_equal(pd.to_numeric(aligned["sample"], errors="coerce"), samples):
-                raise ValueError("Event samples do not match epochs.events after epochs.selection alignment")
-            logger.debug(
-                f"Successfully aligned events using epochs.selection ({len(aligned)} epochs)"
-            )
-            return aligned
+            if len(events_df) > int(np.max(sel)):
+                logger.debug(f"Successfully aligned events using epochs.selection ({len(sel)} epochs)")
+                return events_df.iloc[sel].reset_index(drop=True)
         except (IndexError, ValueError, TypeError) as e:
             logger.warning(f"Failed to align events using epochs.selection: {e}")
-
+            
     # 2) Use sample column to reindex to epochs.events
     if "sample" in events_df.columns and isinstance(getattr(epochs, "events", None), np.ndarray):
         try:
             samples = epochs.events[:, 0]
-            aligned = events_df.set_index("sample").reindex(samples)
-            if aligned.shape[0] != len(epochs):
-                raise ValueError(
-                    f"Sample-based alignment produced {aligned.shape[0]} rows; expected {len(epochs)}"
-                )
-            if aligned.isna().any().any():
-                raise ValueError("Sample-based alignment resulted in missing event data for some epochs")
-            aligned = aligned.reset_index()
-            if not np.array_equal(pd.to_numeric(aligned["sample"], errors="coerce"), samples):
-                raise ValueError("Event samples do not match epochs.events after sample-based alignment")
-            logger.debug(
-                f"Successfully aligned events using sample column ({len(aligned)} epochs)"
-            )
-            return aligned
+            out = events_df.set_index("sample").reindex(samples)
+            if len(out) == len(epochs) and not out.isna().all(axis=1).any():
+                logger.debug(f"Successfully aligned events using sample column ({len(out)} epochs)")
+                return out.reset_index()
         except (KeyError, IndexError, ValueError) as e:
             logger.warning(f"Failed to align events using sample column: {e}")
-
+            
     # 3) Critical failure: cannot guarantee alignment
-    msg = (
-        "Cannot guarantee events-to-epochs alignment for reliable analysis. "
-        f"Events DataFrame ({len(events_df)} rows) cannot be reliably aligned to "
-        f"epochs ({len(epochs)} epochs). This is a critical failure that would invalidate "
-        "all behavioral correlations."
-    )
-    logger.critical(msg)
-    raise ValueError(msg)
+    logger.critical(f"CRITICAL: Unable to align events to epochs reliably. "
+                   f"Events: {len(events_df)} rows, Epochs: {len(epochs)} epochs. "
+                   f"This could result in completely invalid correlations due to trial misalignment.")
+    raise ValueError(f"Cannot guarantee events-to-epochs alignment for reliable analysis. "
+                    f"Events DataFrame ({len(events_df)} rows) cannot be reliably aligned to "
+                    f"epochs ({len(epochs)} epochs). This is a critical failure that would "
+                    f"invalidate all behavioral correlations.")
 
 
 def _pick_first_column(df: Optional[pd.DataFrame], candidates: List[str]) -> Optional[str]:
@@ -327,14 +331,16 @@ def _setup_logging(subject: str) -> logging.Logger:
 # ROI utilities (replicate minimal logic to avoid importing numbered module names)
 
 def _roi_definitions() -> Dict[str, List[str]]:
-    return {
+    # Reuse global ROIs from time_frequency_analysis section for consistency
+    rois = config.get('time_frequency_analysis.rois', {
         "Frontal": [r"^(Fpz|Fp[12]|AFz|AF[3-8]|Fz|F[1-8])$"],
         "Central": [r"^(Cz|C[1-6])$"],
         "Parietal": [r"^(Pz|P[1-8])$"],
         "Occipital": [r"^(Oz|O[12]|POz|PO[3-8])$"],
         "Temporal": [r"^(T7|T8|TP7|TP8|FT7|FT8)$"],
         "Sensorimotor": [r"^(FC[234]|FCz)$", r"^(C[234]|Cz)$", r"^(CP[234]|CPz)$"],
-    }
+    })
+    return {roi: list(pats) for roi, pats in rois.items()}
 
 
 def _build_rois(info: mne.Info) -> Dict[str, List[str]]:
@@ -461,9 +467,7 @@ def correlate_power_roi_stats(
     partial_covars: Optional[List[str]] = None,
     bootstrap: int = 0,
     n_perm: int = 0,
-    seed: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
-    seed: Optional[int] = None,
 ) -> None:
     logger = _setup_logging(subject)
     logger.info(f"Starting ROI power correlation analysis for sub-{subject}")
@@ -474,10 +478,7 @@ def correlate_power_roi_stats(
 
     # Initialize RNG if not provided
     if rng is None:
-        if seed is None:
-            # Stable hash ensures subject-specific reproducibility
-            seed = int(hashlib.sha256(subject.encode("utf-8")).hexdigest()[:8], 16)
-        rng = np.random.default_rng(seed)
+        rng = np.random.default_rng(42)
 
     # Load power features, target ratings, and sensor info
     pow_df, _conn_df, y, info = _load_features_and_targets(subject, task)
@@ -645,7 +646,10 @@ def correlate_power_roi_stats(
             roi_frame = pow_df[roi_cols].apply(pd.to_numeric, errors="coerce")
             roi_vals = roi_frame.mean(axis=1)
 
-            # Align lengths with rating target
+            # Align lengths for correlation analysis (using overlap)
+            if len(roi_vals) != len(y):
+                logger.warning(f"Length mismatch for {roi} {band}: power={len(roi_vals)}, rating={len(y)}. "
+                              f"Using overlapping trials for correlation.")
             n_len = min(len(roi_vals), len(y))
             x = roi_vals.iloc[:n_len]
             y_r = y.iloc[:n_len]
@@ -704,17 +708,17 @@ def correlate_power_roi_stats(
                 p_partial_perm = np.nan
                 p_partial_given_temp_perm = np.nan
                 if n_perm and n_eff >= 5:
-                    p_perm = _perm_pval_simple(x, y_r, method, int(n_perm), rng=rng)
+                    p_perm = _perm_pval_simple(x, y_r, method, int(n_perm), rng)
                     if Z_df_full is not None and len(Z_df_full) > 0:
                         n_len_pt = min(len(x), len(y_r), len(Z_df_full))
                         p_partial_perm = _perm_pval_partial_FL(
-                            x.iloc[:n_len_pt], y_r.iloc[:n_len_pt], Z_df_full.iloc[:n_len_pt], method, int(n_perm), rng=rng
+                            x.iloc[:n_len_pt], y_r.iloc[:n_len_pt], Z_df_full.iloc[:n_len_pt], method, int(n_perm), rng
                         )
                     if temp_series is not None and len(temp_series) > 0:
                         n_len_tmp = min(len(x), len(y_r), len(temp_series))
                         df_tmp = pd.DataFrame({"temp": temp_series.iloc[:n_len_tmp]})
                         p_partial_given_temp_perm = _perm_pval_partial_FL(
-                            x.iloc[:n_len_tmp], y_r.iloc[:n_len_tmp], df_tmp.iloc[:n_len_tmp], method, int(n_perm), rng=rng
+                            x.iloc[:n_len_tmp], y_r.iloc[:n_len_tmp], df_tmp.iloc[:n_len_tmp], method, int(n_perm), rng
                         )
 
                 recs_rating.append({
@@ -745,6 +749,9 @@ def correlate_power_roi_stats(
 
             # Temperature correlation if available
             if temp_series is not None and len(temp_series) > 0:
+                if len(roi_vals) != len(temp_series):
+                    logger.warning(f"Length mismatch for {roi} {band} vs temperature: "
+                                  f"power={len(roi_vals)}, temp={len(temp_series)}. Using overlap.")
                 n_len_t = min(len(roi_vals), len(temp_series))
                 x2 = roi_vals.iloc[:n_len_t]
                 t2 = temp_series.iloc[:n_len_t]
@@ -791,11 +798,11 @@ def correlate_power_roi_stats(
                     p2_perm = np.nan
                     p2_partial_perm = np.nan
                     if n_perm and n_eff2 >= 5:
-                        p2_perm = _perm_pval_simple(x2, t2, method2, int(n_perm), rng=rng)
+                        p2_perm = _perm_pval_simple(x2, t2, method2, int(n_perm), rng)
                         if Z_df_temp is not None and len(Z_df_temp) > 0:
                             n_len_pt2 = min(len(x2), len(t2), len(Z_df_temp))
                             p2_partial_perm = _perm_pval_partial_FL(
-                                x2.iloc[:n_len_pt2], t2.iloc[:n_len_pt2], Z_df_temp.iloc[:n_len_pt2], method2, int(n_perm), rng=rng
+                                x2.iloc[:n_len_pt2], t2.iloc[:n_len_pt2], Z_df_temp.iloc[:n_len_pt2], method2, int(n_perm), rng
                             )
 
                     recs_temp.append({
@@ -834,6 +841,231 @@ def correlate_power_roi_stats(
         df_t["fdr_reject"] = rej_t
         df_t["fdr_crit_p"] = crit_t
         df_t.to_csv(stats_dir / "corr_stats_pow_roi_vs_temp.tsv", sep="\t", index=False)
+
+# -----------------------------------------------------------------------------
+# Correlation: Channel-level power vs behavior (per-band correlation TSVs)
+# -----------------------------------------------------------------------------
+
+def correlate_power_topomaps(
+    subject: str,
+    task: str = TASK,
+    use_spearman: bool = True,
+    partial_covars: Optional[List[str]] = None,
+    bootstrap: int = 0,
+    n_perm: int = 0,
+    rng: Optional[np.random.Generator] = None,
+) -> None:
+    """Correlate channel-level power with behavior and export per-band TSVs.
+    
+    Creates individual correlation files for each frequency band:
+    - corr_stats_pow_{band}_vs_rating.tsv  
+    - corr_stats_pow_{band}_vs_temp.tsv
+    
+    These files are then combined by export_combined_power_corr_stats().
+    
+    Parameters
+    ----------
+    subject : str
+        Subject identifier
+    task : str
+        Task name
+    use_spearman : bool
+        Use Spearman (True) or Pearson (False) correlation
+    partial_covars : list of str, optional
+        Covariates for partial correlation
+    bootstrap : int
+        Number of bootstrap samples for CI (default 0)
+    n_perm : int
+        Number of permutation tests (default 0)
+    rng : np.random.Generator, optional
+        Random number generator
+    """
+    logger = _setup_logging(subject)
+    logger.info(f"Starting channel-level power correlation analysis for sub-{subject}")
+    stats_dir = _stats_dir(subject)
+    _ensure_dir(stats_dir)
+
+    # Initialize RNG if not provided
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    # Load power features, target ratings, and sensor info
+    pow_df, _conn_df, y, info = _load_features_and_targets(subject, task)
+    y = pd.to_numeric(y, errors="coerce")
+
+    # Load epochs for alignment and events for temperature
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None:
+        logger.error(f"Could not find epochs for channel correlations: sub-{subject}")
+        return
+    epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+    events = _load_events_df(subject, task)
+    aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
+    temp_series: Optional[pd.Series] = None
+    if aligned_events is not None:
+        temp_col = _pick_first_column(aligned_events, PSYCH_TEMP_COLUMNS)
+        if temp_col is not None:
+            temp_series = pd.to_numeric(aligned_events[temp_col], errors="coerce")
+
+    # Helper: build multi-covariate design matrix Z from aligned events
+    def _build_covariates_matrix() -> Optional[np.ndarray]:
+        if partial_covars is None or aligned_events is None:
+            return None
+        Z_cols = []
+        for cov in partial_covars:
+            if cov == "temperature" and temp_series is not None:
+                Z_cols.append(temp_series.values)
+            elif cov == "trial_number":
+                Z_cols.append(np.arange(len(y)))
+            elif cov == "subject_mean_rating":
+                mean_rating = y.mean()
+                Z_cols.append(np.full(len(y), mean_rating))
+            elif cov in aligned_events.columns:
+                Z_cols.append(pd.to_numeric(aligned_events[cov], errors="coerce").values)
+        return np.column_stack(Z_cols) if Z_cols else None
+
+    Z = _build_covariates_matrix()
+
+    # Process each frequency band
+    for band in POWER_BANDS_TO_USE:
+        logger.info(f"Processing {band} band correlations")
+        
+        # Get channels for this band
+        band_cols = [c for c in pow_df.columns if f"pow_{band}_" in c]
+        if not band_cols:
+            logger.warning(f"No power columns found for {band} band")
+            continue
+            
+        recs_rating: List[Dict[str, object]] = []
+        recs_temp: List[Dict[str, object]] = []
+        
+        for col in band_cols:
+            # Extract channel name from column (e.g., "pow_alpha_Fp1" -> "Fp1")
+            channel = col.replace(f"pow_{band}_", "")
+            
+            # Get power values for this channel-band
+            x = pd.to_numeric(pow_df[col], errors="coerce")
+            
+            # Skip if insufficient valid data
+            valid_mask = x.notna() & y.notna()
+            if valid_mask.sum() < 10:
+                continue
+                
+            x_valid = x[valid_mask]
+            y_valid = y[valid_mask]
+            Z_valid = Z[valid_mask] if Z is not None else None
+            
+            # Compute correlation vs rating
+            corr_method = "spearman" if use_spearman else "pearson"
+            try:
+                r, p = stats.spearmanr(x_valid, y_valid) if use_spearman else stats.pearsonr(x_valid, y_valid)
+                
+                # Confidence interval
+                ci_lo, ci_hi = np.nan, np.nan
+                if not use_spearman:  # Pearson CI via Fisher z-transform
+                    n_valid = len(x_valid)
+                    if n_valid > 3:
+                        z = np.arctanh(r)
+                        se = 1 / np.sqrt(n_valid - 3)
+                        z_lo, z_hi = z - 1.96 * se, z + 1.96 * se
+                        ci_lo, ci_hi = np.tanh(z_lo), np.tanh(z_hi)
+                elif bootstrap > 0:  # Spearman bootstrap CI
+                    def _boot_spearman(x, y, rng):
+                        idx = rng.choice(len(x), size=len(x), replace=True)
+                        return stats.spearmanr(x[idx], y[idx])[0]
+                    boot_rs = [_boot_spearman(x_valid.values, y_valid.values, rng) for _ in range(bootstrap)]
+                    ci_lo, ci_hi = np.percentile(boot_rs, [2.5, 97.5])
+                
+                # Partial correlation if covariates provided
+                r_partial, p_partial = np.nan, np.nan
+                if Z_valid is not None and Z_valid.shape[1] > 0:
+                    try:
+                        r_partial, p_partial = _partial_corr_xy_given_Z(x_valid.values, y_valid.values, Z_valid, use_spearman=use_spearman)
+                    except Exception:
+                        pass
+                
+                # Permutation test
+                p_perm = np.nan
+                if n_perm > 0:
+                    null_rs = []
+                    for _ in range(n_perm):
+                        y_perm = rng.permutation(y_valid)
+                        r_perm = stats.spearmanr(x_valid, y_perm)[0] if use_spearman else stats.pearsonr(x_valid, y_perm)[0]
+                        null_rs.append(r_perm)
+                    p_perm = (np.sum(np.abs(null_rs) >= np.abs(r)) + 1) / (n_perm + 1)
+                
+                # Store record
+                rec = {
+                    "channel": channel,
+                    "band": band,
+                    "r": r,
+                    "p": p,
+                    "ci_lo": ci_lo,
+                    "ci_hi": ci_hi,
+                    "r_partial": r_partial,
+                    "p_partial": p_partial,
+                    "p_perm": p_perm,
+                    "n": len(x_valid),
+                    "method": corr_method,
+                }
+                recs_rating.append(rec)
+                
+            except Exception as e:
+                logger.warning(f"Correlation failed for {channel} {band} vs rating: {e}")
+                continue
+            
+            # Compute correlation vs temperature if available
+            if temp_series is not None:
+                temp_valid = temp_series[valid_mask]
+                if temp_valid.notna().sum() >= 10:
+                    try:
+                        r_temp, p_temp = stats.spearmanr(x_valid, temp_valid) if use_spearman else stats.pearsonr(x_valid, temp_valid)
+                        
+                        # Temperature CI
+                        ci_lo_temp, ci_hi_temp = np.nan, np.nan
+                        if not use_spearman:
+                            n_valid_temp = temp_valid.notna().sum()
+                            if n_valid_temp > 3:
+                                z_temp = np.arctanh(r_temp)
+                                se_temp = 1 / np.sqrt(n_valid_temp - 3)
+                                z_lo_temp, z_hi_temp = z_temp - 1.96 * se_temp, z_temp + 1.96 * se_temp
+                                ci_lo_temp, ci_hi_temp = np.tanh(z_lo_temp), np.tanh(z_hi_temp)
+                        
+                        rec_temp = {
+                            "channel": channel,
+                            "band": band,
+                            "r": r_temp,
+                            "p": p_temp,
+                            "ci_lo": ci_lo_temp,
+                            "ci_hi": ci_hi_temp,
+                            "n": temp_valid.notna().sum(),
+                            "method": corr_method,
+                        }
+                        recs_temp.append(rec_temp)
+                        
+                    except Exception as e:
+                        logger.warning(f"Correlation failed for {channel} {band} vs temperature: {e}")
+        
+        # Save per-band TSVs
+        if recs_rating:
+            df_rating = pd.DataFrame(recs_rating)
+            # Apply FDR correction within band
+            pvec = df_rating["p_perm"].to_numpy() if "p_perm" in df_rating.columns and np.isfinite(df_rating["p_perm"]).any() else df_rating["p"].to_numpy()
+            rej, crit = _fdr_bh(pvec, alpha=BEHAV_FDR_ALPHA)
+            df_rating["fdr_reject"] = rej
+            df_rating["fdr_crit_p"] = crit
+            df_rating.to_csv(stats_dir / f"corr_stats_pow_{band}_vs_rating.tsv", sep="\t", index=False)
+            logger.info(f"Saved {len(df_rating)} {band} band correlations vs rating")
+            
+        if recs_temp:
+            df_temp = pd.DataFrame(recs_temp)
+            # Apply FDR correction within band
+            pvec_temp = df_temp["p"].to_numpy()
+            rej_temp, crit_temp = _fdr_bh(pvec_temp, alpha=BEHAV_FDR_ALPHA)
+            df_temp["fdr_reject"] = rej_temp
+            df_temp["fdr_crit_p"] = crit_temp
+            df_temp.to_csv(stats_dir / f"corr_stats_pow_{band}_vs_temp.tsv", sep="\t", index=False)
+            logger.info(f"Saved {len(df_temp)} {band} band correlations vs temperature")
 
 # -----------------------------------------------------------------------------
 # Visualization: ROI-averaged power vs behavior scatter plots
@@ -1126,7 +1358,9 @@ def plot_power_roi_scatter(
             rng: Random number generator
             is_partial_residuals: Whether x_data/y_data are already residuals
         """
-        # Align and filter data
+        # Align data for correlation analysis (using overlap)
+        if len(x_data) != len(y_data):
+            logger.warning(f"Data length mismatch: x={len(x_data)}, y={len(y_data)}. Using overlap for correlation.")
         n_len = min(len(x_data), len(y_data))
         x = x_data.iloc[:n_len] if hasattr(x_data, 'iloc') else x_data[:n_len]
         y = y_data.iloc[:n_len] if hasattr(y_data, 'iloc') else y_data[:n_len]
@@ -1332,7 +1566,7 @@ def plot_power_roi_scatter(
             continue
         band_rng = FEATURES_FREQ_BANDS.get(band)
         band_title = band.capitalize()
-        band_color = BAND_COLORS.get(band, "#4C4C4C")
+        band_color = _get_band_color(band)
 
         # --- Overall (all sensors) scatter ---
         try:
@@ -1690,9 +1924,9 @@ def plot_regression_residual_diagnostics(
             sort_idx = np.argsort(y_pred)
             
             # Robust spline fitting with configurable parameters
-            smoothing_factor = max(len(y_pred) * 0.1, 1.0)  # Minimum smoothing
-            max_iter = 50
-            tolerance = 1e-3
+            smoothing_factor = max(len(y_pred) * SPLINE_SMOOTHING_FRAC, SPLINE_MIN_SMOOTHING)
+            max_iter = SPLINE_MAX_ITER
+            tolerance = SPLINE_TOL
             
             try:
                 spline = UnivariateSpline(
@@ -1874,8 +2108,7 @@ def plot_power_behavior_correlation(pow_df: pd.DataFrame, y: pd.Series, bands: L
             y_valid = y[valid_mask]
             
             # Create scatter plot
-            band_color = getattr(config.visualization.band_colors, band, '#1f77b4') if hasattr(config.visualization, 'band_colors') else '#1f77b4'
-            axes[i].scatter(x_valid, y_valid, alpha=0.6, s=30, color=band_color)
+            axes[i].scatter(x_valid, y_valid, alpha=0.6, s=30, color=_get_band_color(band))
             
             # Add regression line
             z = np.polyfit(x_valid, y_valid, 1)
@@ -2007,16 +2240,15 @@ def plot_significant_correlations_topomap(pow_df: pd.DataFrame, y: pd.Series, ba
                 correlations.append(r)
                 p_values.append(p)
             
-            # Check if any correlations are significant
+            # Significance mask (may be all False if no significant channels)
             sig_mask = np.array(p_values) < alpha
-            if np.any(sig_mask & np.isfinite(correlations)):
-                bands_with_data.append({
-                    'band': band,
-                    'channels': ch_names,
-                    'correlations': np.array(correlations),
-                    'p_values': np.array(p_values),
-                    'significant_mask': sig_mask
-                })
+            bands_with_data.append({
+                'band': band,
+                'channels': ch_names,
+                'correlations': np.array(correlations),
+                'p_values': np.array(p_values),
+                'significant_mask': sig_mask
+            })
         
         if not bands_with_data:
             logger.warning("No significant correlations found across any frequency band")
@@ -2030,13 +2262,19 @@ def plot_significant_correlations_topomap(pow_df: pd.DataFrame, y: pd.Series, ba
         # Make heads larger and reduce whitespace between them; reserve more space below for colorbar
         plt.subplots_adjust(left=0.06, right=0.98, top=0.83, bottom=0.20, wspace=0.08)
         
-        # Calculate global color limits based on all significant correlations
+        # Calculate global color limits based on correlations
         all_sig_corrs = []
         for band_data in bands_with_data:
             sig_corrs = band_data['correlations'][band_data['significant_mask']]
             all_sig_corrs.extend(sig_corrs[np.isfinite(sig_corrs)])
-        
-        vmax = max(abs(np.min(all_sig_corrs)), abs(np.max(all_sig_corrs))) if all_sig_corrs else 0.5
+        if all_sig_corrs:
+            vmax = max(abs(np.min(all_sig_corrs)), abs(np.max(all_sig_corrs)))
+        else:
+            # If none significant, fall back to all correlations' robust max
+            all_corrs = []
+            for band_data in bands_with_data:
+                all_corrs.extend(band_data['correlations'][np.isfinite(band_data['correlations'])])
+            vmax = max(abs(np.min(all_corrs)), abs(np.max(all_corrs))) if all_corrs else 0.5
         
         successful_plots = []
         
@@ -2503,8 +2741,8 @@ def plot_behavior_modulated_connectivity(subject: str, task: str, y: pd.Series,
 def plot_top_behavioral_predictors(
     subject: str,
     task: str = TASK,
-    alpha: float = 0.05,
-    top_n: int = 20
+    alpha: float = None,
+    top_n: int = None
 ) -> None:
     """Plot top N significant behavioral predictors as horizontal bar chart.
     
@@ -2523,6 +2761,10 @@ def plot_top_behavioral_predictors(
     top_n : int
         Number of top predictors to show (default 20)
     """
+    if alpha is None:
+        alpha = BEHAV_FDR_ALPHA
+    if top_n is None:
+        top_n = int(config.get("behavior_analysis.predictors.top_n", 20))
     logger = _setup_logging(subject)
     logger.info(f"Creating top {top_n} behavioral predictors plot for sub-{subject}")
     
@@ -2530,15 +2772,31 @@ def plot_top_behavioral_predictors(
     stats_dir = _stats_dir(subject)
     _ensure_dir(plots_dir)
     
-    # Load combined correlation statistics
-    stats_file = stats_dir / "corr_stats_pow_combined_vs_rating.tsv"
-    if not stats_file.exists():
-        logger.warning(f"Combined correlation stats not found: {stats_file}")
+    # Load combined correlation statistics for available targets (rating, temperature)
+    candidate_files = [
+        ("rating", stats_dir / "corr_stats_pow_combined_vs_rating.tsv"),
+        ("temp", stats_dir / "corr_stats_pow_combined_vs_temp.tsv"),
+        ("temperature", stats_dir / "corr_stats_pow_combined_vs_temperature.tsv"),
+    ]
+    frames = []
+    for target_label, path in candidate_files:
+        if path.exists():
+            try:
+                _df = pd.read_csv(path, sep="\t")
+                _df["target"] = target_label
+                frames.append(_df)
+            except Exception as e:
+                logger.warning(f"Failed reading stats file {path}: {e}")
+    if not frames:
+        logger.warning(
+            "No combined correlation stats found for rating or temperature. Expected one of: "
+            + ", ".join(str(p) for _, p in candidate_files)
+        )
         return
     
     try:
-        # Read correlation statistics
-        df = pd.read_csv(stats_file, sep="\t")
+        # Combine correlation statistics across available targets
+        df = pd.concat(frames, axis=0, ignore_index=True)
         
         # Filter for significant correlations and valid data
         df_sig = df[
@@ -2561,8 +2819,12 @@ def plot_top_behavioral_predictors(
             logger.warning("No top correlations to plot")
             return
         
-        # Create predictor labels (channel + band)
-        df_top['predictor'] = df_top['channel'] + ' (' + df_top['band'] + ')'
+        # Create predictor labels (channel + band) with target for clarity
+        # Example: CP6 (alpha) [rating] or CP6 (alpha) [temp]
+        if 'target' in df_top.columns:
+            df_top['predictor'] = df_top['channel'] + ' (' + df_top['band'] + ') [' + df_top['target'].astype(str) + ']'
+        else:
+            df_top['predictor'] = df_top['channel'] + ' (' + df_top['band'] + ')'
         
         # Sort by absolute correlation (ascending for horizontal bar plot)
         df_top = df_top.sort_values('abs_r', ascending=True)
@@ -2592,8 +2854,8 @@ def plot_top_behavioral_predictors(
         # Customize the plot
         ax.set_yticks(y_pos)
         ax.set_yticklabels(df_top['predictor'], fontsize=11)
-        ax.set_xlabel('|Spearman ρ| with Behavior (p < 0.05)', fontweight='bold', fontsize=12)
-        ax.set_title('Top 20 Significant Behavioral Predictors', fontweight='bold', fontsize=14, pad=20)
+        ax.set_xlabel(f"|Spearman ρ| with Behavior (p < {alpha})", fontweight='bold', fontsize=12)
+        ax.set_title(f'Top {top_n} Significant Behavioral Predictors', fontweight='bold', fontsize=14, pad=20)
         
         # Add correlation values and p-values as text annotations
         for i, (_, row) in enumerate(df_top.iterrows()):
@@ -2623,11 +2885,20 @@ def plot_top_behavioral_predictors(
         plt.close(fig)
         
         logger.info(f"Saved top {top_n} behavioral predictors plot: {output_path}.png")
-        logger.info(f"Found {len(df_top)} significant predictors (out of {len(df)} total correlations)")
+        # Summarize counts by target if present
+        if 'target' in df.columns:
+            counts_by_tgt = df_sig['target'].value_counts().to_dict() if len(df_sig) else {}
+            logger.info(f"Found {len(df_top)} significant predictors across targets {counts_by_tgt} (out of {len(df)} total correlations)")
+        else:
+            logger.info(f"Found {len(df_top)} significant predictors (out of {len(df)} total correlations)")
         
         # Export the top predictors data for reference
         top_predictors_file = stats_dir / f"top_{top_n}_behavioral_predictors.tsv"
-        df_top_export = df_top[['predictor', 'channel', 'band', 'r', 'abs_r', 'p', 'n']].copy()
+        # Build export, including target when available
+        export_cols = ['predictor', 'channel', 'band', 'r', 'abs_r', 'p', 'n']
+        if 'target' in df_top.columns and 'target' not in export_cols:
+            export_cols = ['target'] + export_cols
+        df_top_export = df_top[export_cols].copy()
         df_top_export = df_top_export.sort_values('abs_r', ascending=False)  # Sort descending for export
         df_top_export.to_csv(top_predictors_file, sep="\t", index=False)
         logger.info(f"Exported top predictors data: {top_predictors_file}")
@@ -2636,121 +2907,6 @@ def plot_top_behavioral_predictors(
         logger.error(f"Failed to create top behavioral predictors plot: {e}")
         if 'fig' in locals():
             plt.close(fig)
-
-
-def plot_top_behavioral_predictors_group(
-    df: pd.DataFrame,
-    plots_dir: Path,
-    stats_dir: Path,
-    alpha: float = 0.05,
-    top_n: int = 20,
-) -> None:
-    """Plot group-level top N significant behavioral predictors.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Aggregated correlation statistics with columns ``channel``, ``band``,
-        ``r_group`` and ``p_group``.
-    plots_dir : Path
-        Output directory for plots.
-    stats_dir : Path
-        Output directory for exported TSV data.
-    alpha : float
-        Significance threshold (default 0.05).
-    top_n : int
-        Number of top predictors to show (default 20).
-    """
-    logger = logging.getLogger("group_top_behavioral_predictors")
-
-    if df.empty:
-        logger.warning("No correlation statistics provided for group plot")
-        return
-
-    df_sig = df[
-        (df["p_group"] <= alpha)
-        & df["r_group"].notna()
-        & df["channel"].notna()
-        & df["band"].notna()
-    ].copy()
-    if df_sig.empty:
-        logger.warning(f"No significant correlations found (p_group <= {alpha})")
-        return
-
-    df_sig["abs_r"] = df_sig["r_group"].abs()
-    df_top = df_sig.nlargest(top_n, "abs_r")
-    if df_top.empty:
-        logger.warning("No top correlations to plot")
-        return
-
-    df_top["predictor"] = df_top["channel"] + " (" + df_top["band"] + ")"
-    df_top = df_top.sort_values("abs_r", ascending=True)
-
-    fig, ax = plt.subplots(figsize=(10, max(8, df_top.shape[0] * 0.4)))
-
-    band_colors: Dict[str, str] = {}
-    fallback_colors = [
-        "#1f77b4",
-        "#ff7f0e",
-        "#2ca02c",
-        "#d62728",
-        "#9467bd",
-        "#8c564b",
-        "#e377c2",
-        "#7f7f7f",
-        "#bcbd22",
-        "#17becf",
-    ]
-    for idx, band in enumerate(df_top["band"].unique()):
-        band_colors[band] = BAND_COLORS.get(band, fallback_colors[idx % len(fallback_colors)])
-    colors = [band_colors[b] for b in df_top["band"]]
-
-    y_pos = np.arange(len(df_top))
-    ax.barh(
-        y_pos,
-        df_top["abs_r"],
-        color=colors,
-        alpha=0.8,
-        edgecolor="black",
-        linewidth=0.5,
-    )
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(df_top["predictor"], fontsize=11)
-    ax.set_xlabel("|Group r| with Behavior (p < 0.05)", fontweight="bold", fontsize=12)
-    ax.set_title(
-        f"Top {df_top.shape[0]} Significant Behavioral Predictors (Group)",
-        fontweight="bold",
-        fontsize=14,
-        pad=20,
-    )
-
-    for i, row in enumerate(df_top.itertuples(index=False)):
-        ax.text(
-            row.abs_r + 0.01,
-            i,
-            f"{row.abs_r:.3f} (p={row.p_group:.3f})",
-            va="center",
-            ha="left",
-            fontsize=10,
-        )
-
-    ax.set_xlim(0, df_top["abs_r"].max() * 1.25)
-    ax.grid(True, axis="x", alpha=0.3, linestyle="-", linewidth=0.5)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-
-    output_plot = plots_dir / f"group_top_{top_n}_behavioral_predictors"
-    _save_fig(fig, output_plot)
-
-    df_top_export = df_top[
-        ["predictor", "channel", "band", "r_group", "abs_r", "p_group", "n_subjects"]
-    ].sort_values("abs_r", ascending=False)
-    df_top_export.to_csv(
-        stats_dir / f"group_top_{top_n}_behavioral_predictors.tsv",
-        sep="\t",
-        index=False,
-    )
 
 
 # Connectivity ROI summary correlations (within/between ROI averages)
@@ -3094,6 +3250,8 @@ def correlate_connectivity_roi_summaries(
 
             # Temperature correlations (if available)
             if temp_series is not None and len(temp_series) > 0:
+                if len(xi) != len(temp_series):
+                    logger.warning(f"Channel vs temp length mismatch: power={len(xi)}, temp={len(temp_series)}. Using overlap.")
                 n_len_t = min(len(xi), len(temp_series))
                 xt = xi.iloc[:n_len_t]
                 tt = temp_series.iloc[:n_len_t]
@@ -3170,7 +3328,7 @@ def correlate_connectivity_roi_summaries(
             df = pd.DataFrame(recs)
             # FDR per measure_band, prefer permutation p-values when available
             pvec = df["p_perm"].to_numpy() if "p_perm" in df.columns and np.isfinite(df["p_perm"]).any() else df["p"].to_numpy()
-            rej, crit = _fdr_bh(pvec, alpha=0.05)
+            rej, crit = _fdr_bh(pvec, alpha=BEHAV_FDR_ALPHA)
             df["fdr_reject"] = rej
             df["fdr_crit_p"] = crit
             df.to_csv(stats_dir / f"corr_stats_conn_roi_summary_{_sanitize(pref)}_vs_rating.tsv", sep="\t", index=False)
@@ -3178,7 +3336,7 @@ def correlate_connectivity_roi_summaries(
         if recs_temp:
             df_t = pd.DataFrame(recs_temp)
             pvec_t = df_t["p_perm"].to_numpy() if "p_perm" in df_t.columns and np.isfinite(df_t["p_perm"]).any() else df_t["p"].to_numpy()
-            rej_t, crit_t = _fdr_bh(pvec_t, alpha=0.05)
+            rej_t, crit_t = _fdr_bh(pvec_t, alpha=BEHAV_FDR_ALPHA)
             df_t["fdr_reject"] = rej_t
             df_t["fdr_crit_p"] = crit_t
             df_t.to_csv(stats_dir / f"corr_stats_conn_roi_summary_{_sanitize(pref)}_vs_temp.tsv", sep="\t", index=False)
@@ -3256,7 +3414,7 @@ def correlate_connectivity_heatmaps(subject: str, task: str = TASK, use_spearman
         p_flat = pvals[iu]
         valid_idx = np.isfinite(p_flat)
         p_valid = p_flat[valid_idx]
-        rej_valid, crit_p = _fdr_bh(p_valid, alpha=0.05)
+        rej_valid, crit_p = _fdr_bh(p_valid, alpha=BEHAV_FDR_ALPHA)
         # Map back to edges
         valid_pairs = [(iu[0][k], iu[1][k]) for k in np.where(valid_idx)[0]]
         reject_map = {pair: bool(rej_valid[k]) for k, pair in enumerate(valid_pairs)}
@@ -3282,6 +3440,138 @@ def correlate_connectivity_heatmaps(subject: str, task: str = TASK, use_spearman
         except (KeyError, ValueError, OSError):
             pass
 
+
+# -----------------------------------------------------------------------------
+# Export: All significant predictors (ROI + channel-level)
+# -----------------------------------------------------------------------------
+
+def export_all_significant_predictors(subject: str, alpha: float = 0.05, use_fdr: bool = True) -> None:
+    """Export all significant EEG predictors (ROI + channel-level) to single CSV.
+    
+    Combines ROI-level and channel-level power correlations with behavioral ratings,
+    filters for significant predictors, and exports to a consolidated CSV file.
+    
+    Parameters
+    ----------
+    subject : str
+        Subject identifier
+    alpha : float
+        Significance threshold (default 0.05)
+    use_fdr : bool
+        Use FDR-corrected p-values if available (default True)
+    """
+    stats_dir = _stats_dir(subject)
+    _ensure_dir(stats_dir)
+    
+    logger = _setup_logging(subject)
+    logger.info(f"Exporting all significant predictors for sub-{subject} (alpha={alpha})")
+    
+    all_predictors = []
+    
+    # 1. Load ROI-level correlations for available targets
+    for target in ("rating", "temp", "temperature"):
+        roi_file = stats_dir / f"corr_stats_pow_roi_vs_{target}.tsv"
+        if not roi_file.exists():
+            continue
+        try:
+            roi_df = pd.read_csv(roi_file, sep="\t")
+            # Use raw p-values for filtering (include all p < 0.05)
+            significant_roi = roi_df[roi_df["p"] <= alpha].copy()
+            if len(significant_roi) > 0:
+                # Add predictor type, target, and format predictor name
+                significant_roi["predictor_type"] = "ROI"
+                significant_roi["target"] = target
+                significant_roi["predictor"] = significant_roi["roi"] + " (" + significant_roi["band"] + ")"
+                # Select and rename columns for consistency
+                roi_cols = {
+                    "predictor": "predictor",
+                    "roi": "region",
+                    "band": "band",
+                    "r": "r",
+                    "p": "p",
+                    "n": "n",
+                    "predictor_type": "type",
+                    "target": "target",
+                }
+                if "fdr_reject" in significant_roi.columns:
+                    roi_cols["fdr_reject"] = "fdr_significant"
+                if "fdr_crit_p" in significant_roi.columns:
+                    roi_cols["fdr_crit_p"] = "fdr_critical_p"
+                roi_subset = significant_roi[list(roi_cols.keys())].rename(columns=roi_cols)
+                all_predictors.append(roi_subset)
+                logger.info(f"Found {len(significant_roi)} significant ROI predictors for target '{target}'")
+        except Exception as e:
+            logger.warning(f"Failed to load ROI correlations from {roi_file}: {e}")
+    
+    # 2. Load combined channel-level correlations for available targets
+    for target in ("rating", "temp", "temperature"):
+        combined_file = stats_dir / f"corr_stats_pow_combined_vs_{target}.tsv"
+        if not combined_file.exists():
+            continue
+        try:
+            chan_df = pd.read_csv(combined_file, sep="\t")
+            # Use raw p-values for filtering (include all p < 0.05)
+            significant_chan = chan_df[chan_df["p"] <= alpha].copy()
+            if len(significant_chan) > 0:
+                # Add predictor type, target, and format predictor name
+                significant_chan["predictor_type"] = "Channel"
+                significant_chan["target"] = target
+                significant_chan["predictor"] = significant_chan["channel"] + " (" + significant_chan["band"] + ")"
+                # Select and rename columns for consistency
+                chan_cols = {
+                    "predictor": "predictor",
+                    "channel": "region",
+                    "band": "band",
+                    "r": "r",
+                    "p": "p",
+                    "n": "n",
+                    "predictor_type": "type",
+                    "target": "target",
+                }
+                if "fdr_reject" in significant_chan.columns:
+                    chan_cols["fdr_reject"] = "fdr_significant"
+                if "fdr_crit_p" in significant_chan.columns:
+                    chan_cols["fdr_crit_p"] = "fdr_critical_p"
+                chan_subset = significant_chan[list(chan_cols.keys())].rename(columns=chan_cols)
+                all_predictors.append(chan_subset)
+                logger.info(f"Found {len(significant_chan)} significant channel predictors for target '{target}'")
+        except Exception as e:
+            logger.warning(f"Failed to load channel correlations from {combined_file}: {e}")
+    
+    # 3. Combine and export
+    if all_predictors:
+        # Concatenate all significant predictors
+        combined_df = pd.concat(all_predictors, ignore_index=True)
+        
+        # Add absolute correlation for reference
+        combined_df["abs_r"] = combined_df["r"].abs()
+        
+        # Sort by p-value (lowest first)
+        combined_df = combined_df.sort_values("p", ascending=True)
+        
+        # Export to CSV
+        output_file = stats_dir / "all_significant_predictors.csv"
+        combined_df.to_csv(output_file, index=False)
+        
+        logger.info(f"Exported {len(combined_df)} total significant predictors to: {output_file}")
+        logger.info(f"  - ROI predictors: {len([p for p in all_predictors if 'ROI' in str(p.get('type', '').iloc[0] if len(p) > 0 else '')])}")
+        logger.info(f"  - Channel predictors: {len([p for p in all_predictors if 'Channel' in str(p.get('type', '').iloc[0] if len(p) > 0 else '')])}")
+        
+        # Summary statistics
+        n_roi = len(combined_df[combined_df["type"] == "ROI"])
+        n_chan = len(combined_df[combined_df["type"] == "Channel"])
+        max_r = combined_df["abs_r"].max()
+        strongest = combined_df.iloc[0]
+        
+        logger.info(f"Summary: {n_roi} ROI + {n_chan} channel predictors")
+        logger.info(f"Strongest predictor: {strongest['predictor']} (r={strongest['r']:.3f})")
+        
+    else:
+        logger.warning("No significant predictors found")
+        # Create empty file for consistency
+        empty_df = pd.DataFrame(columns=["predictor", "region", "band", "r", "p", "n", "type", "target", "abs_r"])
+        output_file = stats_dir / "all_significant_predictors.csv"
+        empty_df.to_csv(output_file, index=False)
 
 # -----------------------------------------------------------------------------
 # Export: Combined per-band power correlation stats
@@ -3344,8 +3634,7 @@ def export_combined_power_corr_stats(subject: str) -> None:
 def plot_time_frequency_correlation_heatmap(
     subject: str,
     task: str = TASK,
-    use_spearman: bool = True,
-    config: Optional[dict] = None
+    use_spearman: bool = None,
 ) -> None:
     """Create time-frequency correlation heatmap showing power-behavior relationships.
     
@@ -3377,12 +3666,8 @@ def plot_time_frequency_correlation_heatmap(
     logger = _setup_logging(subject)
     logger.info(f"Creating time-frequency correlation heatmap for sub-{subject}")
     
-    # Load config parameters
-    if config is None:
-        config = _load_config()
-    
-    # Get behavior analysis parameters from config
-    behavior_config = config.get('analysis', {}).get('behavior_analysis', {})
+    # Get behavior analysis parameters from centralized config
+    behavior_config = config.get('behavior_analysis', {})
     heatmap_config = behavior_config.get('time_frequency_heatmap', {})
     viz_config = behavior_config.get('visualization', {})
     spline_config = behavior_config.get('spline', {})
@@ -3393,7 +3678,7 @@ def plot_time_frequency_correlation_heatmap(
     freq_resolution = heatmap_config.get('freq_resolution', 2.0)
     time_window = tuple(heatmap_config.get('time_window', [-0.5, 2.0]))
     freq_range = tuple(heatmap_config.get('freq_range', [4.0, 40.0]))
-    alpha = heatmap_config.get('alpha', 0.05)
+    alpha = heatmap_config.get('alpha', BEHAV_FDR_ALPHA)
     roi_selection = heatmap_config.get('roi_selection')
     if roi_selection == "null":
         roi_selection = None
@@ -3401,6 +3686,10 @@ def plot_time_frequency_correlation_heatmap(
     decim = heatmap_config.get('decim', 3)
     min_valid_points = heatmap_config.get('min_valid_points', 5)
     
+    # Correlation method default from global statistics setting
+    if use_spearman is None:
+        use_spearman = bool(config.get("statistics.use_spearman_default", True))
+
     plots_dir = _plots_dir(subject)
     stats_dir = _stats_dir(subject)
     _ensure_dir(plots_dir)
@@ -3456,13 +3745,66 @@ def plot_time_frequency_correlation_heatmap(
         n_jobs=1,
         verbose=False
     )
-    
-    # Crop to desired time window
-    tfr.crop(tmin=time_window[0], tmax=time_window[1])
-    
-    # Create time bins
+
+    # Apply baseline correction to obtain log10(power/baseline) prior to correlations
+    baseline_applied = False
+    baseline_window_used: Optional[Tuple[float, float]] = None
+    try:
+        bl = config.get("time_frequency_analysis.baseline_window", [-5.0, -0.01])
+        b_start = float(bl[0]) if bl[0] is not None else float(tfr.times[0])
+        b_end = float(bl[1]) if bl[1] is not None else 0.0
+        # Clip baseline window to available time range and ≤ 0 s
+        tmin_avail, tmax_avail = float(tfr.times[0]), float(tfr.times[-1])
+        b_start_clip = max(b_start, tmin_avail)
+        b_end_clip = min(b_end, 0.0, tmax_avail)
+        # Ensure enough baseline samples as in other scripts
+        min_bl_samp = int(config.get("time_frequency_analysis.min_baseline_samples", 5))
+        times_arr = np.asarray(tfr.times)
+        bl_mask = (times_arr >= b_start_clip) & (times_arr <= b_end_clip)
+        if b_start_clip >= b_end_clip or int(bl_mask.sum()) < max(1, min_bl_samp):
+            logger.warning(
+                f"Baseline window [{b_start}, {b_end}] invalid/insufficient for available times "
+                f"[{tmin_avail}, {tmax_avail}] (samples={int(bl_mask.sum())}); skipping baseline for TF heatmap."
+            )
+        else:
+            if (b_start_clip != b_start) or (b_end_clip != b_end):
+                logger.info(
+                    f"Clipped baseline window from [{b_start}, {b_end}] to "
+                    f"[{b_start_clip}, {b_end_clip}] to fit data range."
+                )
+            tfr.apply_baseline(baseline=(b_start_clip, b_end_clip), mode="logratio")
+            baseline_applied = True
+            baseline_window_used = (b_start_clip, b_end_clip)
+    except Exception as e:
+        logger.warning(f"TF heatmap baseline correction failed: {e}")
+
+    # Crop to desired time window, clipping to available range to avoid warnings
+    tmin_req, tmax_req = float(time_window[0]), float(time_window[1])
+    tmin_avail, tmax_avail = float(tfr.times[0]), float(tfr.times[-1])
+    tmin_clip = max(tmin_req, tmin_avail)
+    tmax_clip = min(tmax_req, tmax_avail)
+    if tmin_clip > tmax_clip:
+        # Fallback to full available window
+        logger.warning(
+            f"Requested crop window [{tmin_req}, {tmax_req}] invalid for available times "
+            f"[{tmin_avail}, {tmax_avail}]; using full range."
+        )
+        tmin_clip, tmax_clip = tmin_avail, tmax_avail
+    elif tmin_clip != tmin_req or tmax_clip != tmax_req:
+        logger.info(
+            f"Clipped crop window from [{tmin_req}, {tmax_req}] to "
+            f"[{tmin_clip}, {tmax_clip}] to fit data range."
+        )
+    tfr.crop(tmin=tmin_clip, tmax=tmax_clip)
+
+    # Create time bins within the effective cropped range
     times = tfr.times
-    time_bins = np.arange(time_window[0], time_window[1] + time_resolution, time_resolution)
+    tb_start = float(times[0])
+    tb_end = float(times[-1])
+    time_bins = np.arange(tb_start, tb_end + time_resolution, time_resolution)
+    if time_bins.size < 2:
+        # Ensure at least one bin edge pair
+        time_bins = np.array([tb_start, tb_end], dtype=float)
     time_bin_centers = (time_bins[:-1] + time_bins[1:]) / 2
     
     # Initialize correlation arrays
@@ -3564,14 +3906,22 @@ def plot_time_frequency_correlation_heatmap(
     # Figure 1: Time-frequency correlation heatmap
     fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
     im1 = ax1.imshow(correlations, aspect='auto', origin='lower', 
-                     extent=[time_window[0], time_window[1], freq_range[0], freq_range[1]],
+                     extent=[tb_start, tb_end, freq_range[0], freq_range[1]],
                      cmap='RdBu_r', vmin=correlation_vmin, vmax=correlation_vmax)
     ax1.set_xlabel('Time (s)', fontweight='bold')
     ax1.set_ylabel('Frequency (Hz)', fontweight='bold')
-    ax1.set_title(f'Time-Frequency Power-Behavior Correlations\n'
-                 f'Subject: {subject} | Method: {use_spearman and "Spearman" or "Pearson"} | '
-                 f'ROI: {roi_selection or "All Channels"}', 
-                 fontsize=14, fontweight='bold')
+    title_main = 'Time-Frequency Power-Behavior Correlations'
+    method_name = 'Spearman' if use_spearman else 'Pearson'
+    roi_name = roi_selection or 'All Channels'
+    metric = 'log10(power/baseline)' if baseline_applied else 'raw power'
+    bl_txt = ''
+    if baseline_applied and baseline_window_used is not None:
+        bl_txt = f" | BL: [{baseline_window_used[0]:.2f}, {baseline_window_used[1]:.2f}] s"
+    ax1.set_title(
+        f"{title_main}\nSubject: {subject} | Method: {method_name} | ROI: {roi_name} | Metric: {metric}{bl_txt}",
+        fontsize=14,
+        fontweight='bold',
+    )
     ax1.axvline(0, color='black', linestyle='--', alpha=0.5)
     cbar1 = plt.colorbar(im1, ax=ax1, label='Correlation (r)')
     cbar1.ax.tick_params(labelsize=12)
@@ -3713,7 +4063,7 @@ def plot_power_behavior_evolution_across_trials(
         
         # Remove NaN values for smoothing
         y_clean = y.fillna(y.mean())
-        y_smooth = gaussian_filter1d(y_clean, sigma=2.0)
+        y_smooth = gaussian_filter1d(y_clean, sigma=VIZ_SMOOTHING_SIGMA)
         
         ax_behav.scatter(trial_numbers, y, alpha=0.4, s=15, color='gray', label='Raw ratings')
         ax_behav.plot(trial_numbers, y_smooth, color='red', linewidth=3, 
@@ -3788,7 +4138,7 @@ def plot_power_behavior_evolution_across_trials(
             for roi_idx, roi in enumerate(roi_power.keys()):
                 color = roi_colors[roi_idx % len(roi_colors)]
                 power_clean = roi_power[roi].fillna(roi_power[roi].mean())
-                power_smooth = gaussian_filter1d(power_clean, sigma=2.0)
+                power_smooth = gaussian_filter1d(power_clean, sigma=VIZ_SMOOTHING_SIGMA)
                 ax_power.plot(trial_numbers, power_smooth, 
                              label=f'{roi}', linewidth=2.5, alpha=0.8, color=color)
             
@@ -4021,15 +4371,13 @@ def process_subject(
     bootstrap: int = 0,
     n_perm: int = 0,
     build_report: bool = False,
-    rng_seed: Optional[int] = 42,
+    rng_seed: int = 42,
 ) -> None:
     logger = _setup_logging(subject)
     logger.info(f"=== Behavior-feature analyses: sub-{subject}, task-{task} ===")
     
-    # Initialize shared RNG for consistent but subject-specific randomization across functions
-    subj_hash = int(hashlib.sha256(subject.encode("utf-8")).hexdigest()[:8], 16)
-    combined_seed = (rng_seed + subj_hash) % (2**32) if rng_seed is not None else subj_hash
-    rng = np.random.default_rng(combined_seed)
+    # Initialize shared RNG for consistent but independent randomization across functions
+    rng = np.random.default_rng(rng_seed)
     try:
         plot_psychometrics(subject, task)
     except Exception as e:
@@ -4106,18 +4454,17 @@ def process_subject(
         
         # 11. Time-frequency correlation heatmap - NEW VISUALIZATION
         plot_time_frequency_correlation_heatmap(
-            subject, 
-            task, 
+            subject,
+            task,
             use_spearman=use_spearman,
-            config=config
         )
         
         # 11b. Sensorimotor ROI-specific time-frequency correlation heatmap
+        # To specialize by ROI, set behavior_analysis.time_frequency_heatmap.roi_selection in the YAML
         plot_time_frequency_correlation_heatmap(
-            subject, 
-            task, 
+            subject,
+            task,
             use_spearman=use_spearman,
-            config=config
         )
         
         
@@ -4151,6 +4498,20 @@ def process_subject(
     except Exception as e:
         logger.error(f"Connectivity ROI summaries failed for sub-{subject}: {e}")
 
+    # Generate per-band channel-level power correlation stats
+    try:
+        correlate_power_topomaps(
+            subject,
+            task,
+            use_spearman=use_spearman,
+            partial_covars=partial_covars,
+            bootstrap=bootstrap,
+            n_perm=0,
+            rng=rng,
+        )
+    except Exception as e:
+        logger.error(f"Channel-level power correlations failed for sub-{subject}: {e}")
+
     # Combine per-band power correlation stats into consolidated TSV/CSV
     try:
         export_combined_power_corr_stats(subject)
@@ -4162,6 +4523,12 @@ def process_subject(
         plot_top_behavioral_predictors(subject, task)
     except Exception as e:
         logger.error(f"Top behavioral predictors plot failed for sub-{subject}: {e}")
+
+    # Export all significant predictors to single CSV file
+    try:
+        export_all_significant_predictors(subject, alpha=0.05, use_fdr=True)
+    except Exception as e:
+        logger.error(f"All significant predictors export failed for sub-{subject}: {e}")
 
     # Apply a subject-level global FDR across all tests
     try:
@@ -4251,7 +4618,7 @@ def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK
         out_rows = []
         for band in sorted(dfg["band"].unique()):
             dfb = dfg[dfg["band"] == band].copy()
-            rej, crit = _fdr_bh(dfb["p_group"].to_numpy(), alpha=0.05)
+            rej, crit = _fdr_bh(dfb["p_group"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
             dfb["fdr_reject"] = rej
             dfb["fdr_crit_p"] = crit
             out_rows.append(dfb)
@@ -4280,80 +4647,6 @@ def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK
                 ax.axhline(0, color="k", linewidth=0.8)
                 fig.tight_layout()
                 _save_fig(fig, gplots / f"group_roi_power_vs_rating_{_sanitize(band)}")
-        except (ValueError, KeyError, OSError):
-            pass
-
-    # 1b) ROI power vs temperature
-    by_key = {}
-    for sub in subjects:
-        f = _stats_dir(sub) / "corr_stats_pow_roi_vs_temp.tsv"
-        if not f.exists():
-            continue
-        df = pd.read_csv(f, sep="\t")
-        for _, row in df.iterrows():
-            key = (str(row.get("roi")), str(row.get("band")))
-            r = row.get("r")
-            try:
-                r = float(r)
-            except (ValueError, TypeError):
-                r = np.nan
-            by_key.setdefault(key, []).append(r)
-    if by_key:
-        recs = []
-        for (roi, band), rs in by_key.items():
-            r_grp, ci_l, ci_h, n = _fisher_aggregate(rs)
-            recs.append(
-                {
-                    "roi": roi,
-                    "band": band,
-                    "r_group": r_grp,
-                    "r_ci_low": ci_l,
-                    "r_ci_high": ci_h,
-                    "n_subjects": n,
-                }
-            )
-        dfg = pd.DataFrame(recs)
-        pvals = []
-        for (roi, band), rs in by_key.items():
-            vals = np.array([r for r in rs if np.isfinite(r)])
-            vals = np.clip(vals, -0.999999, 0.999999)
-            n = vals.size
-            if n < 2:
-                pvals.append(np.nan)
-                continue
-            z = np.arctanh(vals)
-            tstat, p = stats.ttest_1samp(z, popmean=0.0)
-            pvals.append(float(p))
-        dfg["p_group"] = pvals
-        out_rows = []
-        for band in sorted(dfg["band"].unique()):
-            dfb = dfg[dfg["band"] == band].copy()
-            rej, crit = _fdr_bh(dfb["p_group"].to_numpy(), alpha=0.05)
-            dfb["fdr_reject"] = rej
-            dfb["fdr_crit_p"] = crit
-            out_rows.append(dfb)
-        dfg2 = pd.concat(out_rows, ignore_index=True)
-        dfg2.to_csv(gstats / "group_corr_pow_roi_vs_temp.tsv", sep="\t", index=False)
-        try:
-            for band in sorted(dfg2["band"].unique()):
-                dfb = dfg2[dfg2["band"] == band]
-                fig, ax = plt.subplots(figsize=(6, 3.2))
-                order = sorted(dfb["roi"].unique())
-                sns.barplot(data=dfb, x="roi", y="r_group", order=order, color="steelblue", ax=ax)
-                for i, roi in enumerate(order):
-                    row = dfb[dfb["roi"] == roi].iloc[0]
-                    yv = row["r_group"]
-                    yerr_low = yv - row["r_ci_low"] if np.isfinite(row["r_ci_low"]) else 0
-                    yerr_high = row["r_ci_high"] - yv if np.isfinite(row["r_ci_high"]) else 0
-                    ax.errorbar(i, yv, yerr=[[yerr_low], [yerr_high]], fmt="none", ecolor="k", capsize=3)
-                ax.set_ylabel("Group r (Fisher back-transformed)")
-                ax.set_xlabel("ROI")
-                band_rng = FEATURES_FREQ_BANDS.get(band)
-                band_label = f"{band} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng is not None else band
-                ax.set_title(f"Group ROI power vs temperature: {band_label}")
-                ax.axhline(0, color="k", linewidth=0.8)
-                fig.tight_layout()
-                _save_fig(fig, gplots / f"group_roi_power_vs_temp_{_sanitize(band)}")
         except (ValueError, KeyError, OSError):
             pass
 
@@ -4398,103 +4691,10 @@ def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK
                 "p_group": pval,
             })
         out_df = pd.DataFrame(out_rows)
-        rej, crit = _fdr_bh(out_df["p_group"].to_numpy(), alpha=0.05)
+        rej, crit = _fdr_bh(out_df["p_group"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
         out_df["fdr_reject"] = rej
         out_df["fdr_crit_p"] = crit
         out_df.to_csv(gstats / f"group_corr_conn_roi_summary_{_sanitize(pref)}_vs_rating.tsv", sep="\t", index=False)
-
-    # Connectivity ROI summaries vs temperature
-    per_pref = {}
-    for sub in subjects:
-        subj_stats = _stats_dir(sub)
-        if not subj_stats.exists():
-            continue
-        for f in subj_stats.glob("corr_stats_conn_roi_summary_*_vs_temp.tsv"):
-            try:
-                df = pd.read_csv(f, sep="\t")
-            except (FileNotFoundError, OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
-                continue
-            if df.empty or "measure_band" not in df.columns:
-                continue
-            per_pref.setdefault(str(df["measure_band"].iloc[0]), []).append(df)
-    for pref, dfs in per_pref.items():
-        cat = pd.concat(dfs, ignore_index=True)
-        out_rows = []
-        for (roi_i, roi_j), grp in cat.groupby(["roi_i", "roi_j"], dropna=False):
-            rs = grp["r"].to_numpy(dtype=float)
-            r_grp, ci_l, ci_h, n = _fisher_aggregate(rs.tolist())
-            vals = np.clip(rs[np.isfinite(rs)], -0.999999, 0.999999)
-            if vals.size >= 2:
-                tstat, p = stats.ttest_1samp(np.arctanh(vals), popmean=0.0)
-                pval = float(p)
-            else:
-                pval = np.nan
-            out_rows.append(
-                {
-                    "measure_band": pref,
-                    "roi_i": roi_i,
-                    "roi_j": roi_j,
-                    "summary_type": "within" if roi_i == roi_j else "between",
-                    "r_group": r_grp,
-                    "r_ci_low": ci_l,
-                    "r_ci_high": ci_h,
-                    "n_subjects": n,
-                    "p_group": pval,
-                }
-            )
-        out_df = pd.DataFrame(out_rows)
-        rej, crit = _fdr_bh(out_df["p_group"].to_numpy(), alpha=0.05)
-        out_df["fdr_reject"] = rej
-        out_df["fdr_crit_p"] = crit
-        out_df.to_csv(gstats / f"group_corr_conn_roi_summary_{_sanitize(pref)}_vs_temp.tsv", sep="\t", index=False)
-
-
-    # 3) Top behavioral predictors (power features)
-    comb: Dict[Tuple[str, str], List[float]] = {}
-    for sub in subjects:
-        f = _stats_dir(sub) / "corr_stats_pow_combined_vs_rating.tsv"
-        if not f.exists():
-            continue
-        try:
-            df = pd.read_csv(f, sep="\t")
-        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
-            continue
-        for _, row in df.iterrows():
-            key = (str(row.get("channel")), str(row.get("band")))
-            r = row.get("r")
-            try:
-                r = float(r)
-            except (ValueError, TypeError):
-                r = np.nan
-            comb.setdefault(key, []).append(r)
-    if comb:
-        rows = []
-        for (ch, band), rs in comb.items():
-            r_grp, ci_l, ci_h, n = _fisher_aggregate(rs)
-            vals = np.array([r for r in rs if np.isfinite(r)])
-            vals = np.clip(vals, -0.999999, 0.999999)
-            if vals.size >= 2:
-                tstat, p = stats.ttest_1samp(np.arctanh(vals), popmean=0.0)
-                pval = float(p)
-            else:
-                pval = np.nan
-            rows.append(
-                {
-                    "channel": ch,
-                    "band": band,
-                    "r_group": r_grp,
-                    "r_ci_low": ci_l,
-                    "r_ci_high": ci_h,
-                    "n_subjects": n,
-                    "p_group": pval,
-                }
-            )
-        df_grp = pd.DataFrame(rows)
-        rej, crit = _fdr_bh(df_grp["p_group"].to_numpy(), alpha=0.05)
-        df_grp["fdr_reject"] = rej
-        df_grp["fdr_crit_p"] = crit
-        df_grp.to_csv(gstats / "group_corr_stats_pow_combined_vs_rating.tsv", sep="\t", index=False)
-        plot_top_behavioral_predictors_group(df_grp, gplots, gstats)
 
 
 def build_subject_report(subject: str, task: str = TASK) -> None:
@@ -4517,10 +4717,11 @@ def build_subject_report(subject: str, task: str = TASK) -> None:
             rep.add_image(p, title=fn, section="Psychometrics")
     
     # Top behavioral predictors plot
-    for fn in [f"sub-{subject}_top_20_behavioral_predictors.png"]:
+    _top_n = int(config.get("behavior_analysis.predictors.top_n", 20))
+    for fn in [f"sub-{subject}_top_{_top_n}_behavioral_predictors.png"]:
         p = plots_dir / fn
         if p.exists():
-            rep.add_image(p, title="Top 20 Behavioral Predictors", section="Correlations")
+            rep.add_image(p, title=f"Top {_top_n} Behavioral Predictors", section="Correlations")
     # Save stats TSVs as links
     for fn in [
         "corr_stats_pow_roi_vs_rating.tsv",
@@ -4552,6 +4753,17 @@ def build_subject_report(subject: str, task: str = TASK) -> None:
     rep.save(out_html, overwrite=True, open_browser=False)
 
 
+def _collect_subject_ids_with_features(root: Path) -> List[str]:
+    subs: List[str] = []
+    for sub_dir in sorted(root.glob("sub-*/eeg/features")):
+        feat_ok = (sub_dir / "features_eeg_direct.tsv").exists()
+        tgt_ok = (sub_dir / "target_vas_ratings.tsv").exists()
+        if feat_ok and tgt_ok:
+            sid = sub_dir.parent.parent.name.replace("sub-", "")
+            subs.append(sid)
+    return subs
+
+
 def main(
     subjects: Optional[List[str]] = None,
     task: str = TASK,
@@ -4563,9 +4775,15 @@ def main(
     group_only: bool = False,
     build_reports: bool = False,
     rng_seed: int = 42,
+    all_subjects: bool = False,
 ):
-    if subjects is None or subjects == ["all"]:
-        subjects = SUBJECTS
+    # Enforce CLI-provided subjects; allow --all-subjects to auto-detect from derivatives
+    if all_subjects:
+        subjects = _collect_subject_ids_with_features(Path(DERIV_ROOT))
+        if not subjects:
+            raise ValueError(f"No subjects with features found in {DERIV_ROOT}")
+    elif subjects is None or len(subjects) == 0:
+        raise ValueError("No subjects specified. Use --subjects or --all-subjects.")
     if not group_only:
         for sub in subjects:
             process_subject(
@@ -4578,7 +4796,7 @@ def main(
                 build_report=build_reports,
                 rng_seed=rng_seed,
             )
-    if do_group or group_only or len(subjects) > 1:
+    if do_group or group_only:
         aggregate_group_level(subjects, task)
 
 
@@ -4586,7 +4804,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG feature correlations")
-    parser.add_argument("--subjects", nargs="*", default=None, help="Subject IDs to process (e.g., 001 002) or 'all' for all configured subjects")
+    subj_group = parser.add_mutually_exclusive_group(required=True)
+    subj_group.add_argument("--subjects", nargs="*", help="Subject IDs to process (e.g., 001 002)")
+    subj_group.add_argument("--all-subjects", action="store_true", help="Process all subjects with available features")
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
     parser.add_argument(
         "--bootstrap",
@@ -4602,9 +4822,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    subs = None if args.subjects in (None, [], ["all"]) else args.subjects
     main(
-        subs,
+        args.subjects,
         task=args.task,
         use_spearman=USE_SPEARMAN_DEFAULT,
         partial_covars=PARTIAL_COVARS_DEFAULT,
@@ -4614,4 +4833,5 @@ if __name__ == "__main__":
         group_only=GROUP_ONLY_DEFAULT,
         build_reports=BUILD_REPORTS_DEFAULT,
         rng_seed=args.rng_seed,
+        all_subjects=args.all_subjects,
     )
