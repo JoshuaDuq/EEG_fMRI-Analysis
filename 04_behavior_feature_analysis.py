@@ -246,6 +246,26 @@ def _pick_first_column(df: Optional[pd.DataFrame], candidates: List[str]) -> Opt
     return None
 
 
+
+def _canonical_covariate_name(name: Optional[str]) -> Optional[str]:
+    """Map covariate column variants to canonical labels.
+
+    Standardizes known aliases such that pooled design matrices share the same
+    column names across subjects.
+    """
+    if name is None:
+        return None
+    n = str(name).lower()
+    temp_aliases = {c.lower() for c in PSYCH_TEMP_COLUMNS}
+    trial_aliases = {"trial", "trial_number", "trial_index"}
+    if n in temp_aliases:
+        return "temperature"
+    if n in trial_aliases:
+        return "trial"
+    return n
+
+
+
 def _build_covariate_matrices(
     df_events: Optional[pd.DataFrame],
     partial_covars: Optional[List[str]],
@@ -259,24 +279,48 @@ def _build_covariate_matrices(
     """
     if df_events is None:
         return None, None
-    covars = list(partial_covars) if partial_covars is not None else []
-    if not covars:
+
+    covars = []
+    name_map: Dict[str, str] = {}
+    if partial_covars:
+        for c in partial_covars:
+            if c in df_events.columns:
+                covars.append(c)
+                name_map[c] = _canonical_covariate_name(c)
+            else:
+                canon = _canonical_covariate_name(c)
+                if canon == "temperature":
+                    tcol = _pick_first_column(df_events, PSYCH_TEMP_COLUMNS)
+                    if tcol is not None:
+                        covars.append(tcol)
+                        name_map[tcol] = canon
+                elif canon == "trial":
+                    tcol = _pick_first_column(df_events, ["trial", "trial_number", "trial_index"])
+                    if tcol is not None:
+                        covars.append(tcol)
+                        name_map[tcol] = canon
+    else:
         tcol = _pick_first_column(df_events, PSYCH_TEMP_COLUMNS)
         if tcol is not None:
             covars.append(tcol)
-        for c in ["trial", "trial_number", "trial_index", "run", "block"]:
-            if c in df_events.columns:
-                covars.append(c)
-                break
+            name_map[tcol] = "temperature"
+        trialc = _pick_first_column(df_events, ["trial", "trial_number", "trial_index", "run", "block"])
+        if trialc is not None:
+            covars.append(trialc)
+            name_map[trialc] = _canonical_covariate_name(trialc)
+
     if not covars:
         return None, None
     Z = pd.DataFrame()
     for c in covars:
         if c in df_events.columns:
-            Z[c] = pd.to_numeric(df_events[c], errors="coerce")
+
+            Z[name_map.get(c, c)] = pd.to_numeric(df_events[c], errors="coerce")
     if Z.empty:
         return None, None
-    Z_temp = Z.drop(columns=[temp_col], errors="ignore") if temp_col else Z.copy()
+    temp_col_can = _canonical_covariate_name(temp_col) if temp_col else None
+    Z_temp = Z.drop(columns=[temp_col_can], errors="ignore") if temp_col_can else Z.copy()
+
     if Z_temp.shape[1] == 0:
         Z_temp = None
     return Z, Z_temp
@@ -2239,12 +2283,29 @@ def plot_group_power_roi_scatter(
         x_all = pd.Series(np.concatenate(x_lists))
         y_all = pd.Series(np.concatenate(y_lists))
         Z_lists = rating_Z_by_key.get((band, roi))
-        Z_all = pd.concat(Z_lists, ignore_index=True) if Z_lists else None
+
+        if Z_lists:
+            common_cols = set(Z_lists[0].columns)
+            for df in Z_lists[1:]:
+                common_cols &= set(df.columns)
+            if common_cols:
+                Z_all = pd.concat(
+                    [df[sorted(common_cols)] for df in Z_lists], ignore_index=True
+                )
+            else:
+                Z_all = None
+        else:
+            Z_all = None
+
         band_rng = FEATURES_FREQ_BANDS.get(band)
         band_title = f"{band.capitalize()} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band.capitalize()
         title_roi = "Overall" if roi == "All" else roi
         title_prefix = f"{band_title} power vs rating — {title_roi}"
-        out_dir = plots_dir / ("overall" if roi == "All" else "roi_scatters" / _sanitize(roi))
+
+        out_dir = plots_dir / (
+            "overall" if roi == "All" else Path("roi_scatters") / _sanitize(roi)
+        )
+
         _ensure_dir(out_dir)
         base_name = (
             f"scatter_pow_overall_{_sanitize(band)}_vs_rating" if roi == "All" else f"scatter_pow_{_sanitize(band)}_vs_rating"
@@ -2308,12 +2369,29 @@ def plot_group_power_roi_scatter(
             x_all = pd.Series(np.concatenate(x_lists))
             y_all = pd.Series(np.concatenate(y_lists))
             Z_lists = temp_Z_by_key.get((band, roi))
-            Z_all = pd.concat(Z_lists, ignore_index=True) if Z_lists else None
+
+            if Z_lists:
+                common_cols = set(Z_lists[0].columns)
+                for df in Z_lists[1:]:
+                    common_cols &= set(df.columns)
+                if common_cols:
+                    Z_all = pd.concat(
+                        [df[sorted(common_cols)] for df in Z_lists], ignore_index=True
+                    )
+                else:
+                    Z_all = None
+            else:
+                Z_all = None
+
             band_rng = FEATURES_FREQ_BANDS.get(band)
             band_title = f"{band.capitalize()} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band.capitalize()
             title_roi = "Overall" if roi == "All" else roi
             title_prefix = f"{band_title} power vs temperature — {title_roi}"
-            out_dir = plots_dir / ("overall" if roi == "All" else "roi_scatters" / _sanitize(roi))
+
+            out_dir = plots_dir / (
+                "overall" if roi == "All" else Path("roi_scatters") / _sanitize(roi)
+            )
+
             _ensure_dir(out_dir)
             base_name = (
                 f"scatter_pow_overall_{_sanitize(band)}_vs_temp" if roi == "All" else f"scatter_pow_{_sanitize(band)}_vs_temp"
