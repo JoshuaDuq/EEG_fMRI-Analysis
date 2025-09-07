@@ -246,6 +246,7 @@ def _pick_first_column(df: Optional[pd.DataFrame], candidates: List[str]) -> Opt
     return None
 
 
+
 def _canonical_covariate_name(name: Optional[str]) -> Optional[str]:
     """Map covariate column variants to canonical labels.
 
@@ -264,6 +265,7 @@ def _canonical_covariate_name(name: Optional[str]) -> Optional[str]:
     return n
 
 
+
 def _build_covariate_matrices(
     df_events: Optional[pd.DataFrame],
     partial_covars: Optional[List[str]],
@@ -277,6 +279,7 @@ def _build_covariate_matrices(
     """
     if df_events is None:
         return None, None
+
     covars = []
     name_map: Dict[str, str] = {}
     if partial_covars:
@@ -305,16 +308,19 @@ def _build_covariate_matrices(
         if trialc is not None:
             covars.append(trialc)
             name_map[trialc] = _canonical_covariate_name(trialc)
+
     if not covars:
         return None, None
     Z = pd.DataFrame()
     for c in covars:
         if c in df_events.columns:
+
             Z[name_map.get(c, c)] = pd.to_numeric(df_events[c], errors="coerce")
     if Z.empty:
         return None, None
     temp_col_can = _canonical_covariate_name(temp_col) if temp_col else None
     Z_temp = Z.drop(columns=[temp_col_can], errors="ignore") if temp_col_can else Z.copy()
+
     if Z_temp.shape[1] == 0:
         Z_temp = None
     return Z, Z_temp
@@ -2277,6 +2283,7 @@ def plot_group_power_roi_scatter(
         x_all = pd.Series(np.concatenate(x_lists))
         y_all = pd.Series(np.concatenate(y_lists))
         Z_lists = rating_Z_by_key.get((band, roi))
+
         if Z_lists:
             common_cols = set(Z_lists[0].columns)
             for df in Z_lists[1:]:
@@ -2289,13 +2296,16 @@ def plot_group_power_roi_scatter(
                 Z_all = None
         else:
             Z_all = None
+
         band_rng = FEATURES_FREQ_BANDS.get(band)
         band_title = f"{band.capitalize()} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band.capitalize()
         title_roi = "Overall" if roi == "All" else roi
         title_prefix = f"{band_title} power vs rating — {title_roi}"
+
         out_dir = plots_dir / (
             "overall" if roi == "All" else Path("roi_scatters") / _sanitize(roi)
         )
+
         _ensure_dir(out_dir)
         base_name = (
             f"scatter_pow_overall_{_sanitize(band)}_vs_rating" if roi == "All" else f"scatter_pow_{_sanitize(band)}_vs_rating"
@@ -2359,6 +2369,7 @@ def plot_group_power_roi_scatter(
             x_all = pd.Series(np.concatenate(x_lists))
             y_all = pd.Series(np.concatenate(y_lists))
             Z_lists = temp_Z_by_key.get((band, roi))
+
             if Z_lists:
                 common_cols = set(Z_lists[0].columns)
                 for df in Z_lists[1:]:
@@ -2371,13 +2382,16 @@ def plot_group_power_roi_scatter(
                     Z_all = None
             else:
                 Z_all = None
+
             band_rng = FEATURES_FREQ_BANDS.get(band)
             band_title = f"{band.capitalize()} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band.capitalize()
             title_roi = "Overall" if roi == "All" else roi
             title_prefix = f"{band_title} power vs temperature — {title_roi}"
+
             out_dir = plots_dir / (
                 "overall" if roi == "All" else Path("roi_scatters") / _sanitize(roi)
             )
+
             _ensure_dir(out_dir)
             base_name = (
                 f"scatter_pow_overall_{_sanitize(band)}_vs_temp" if roi == "All" else f"scatter_pow_{_sanitize(band)}_vs_temp"
