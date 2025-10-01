@@ -1,8 +1,7 @@
-import os
-import sys
 import re
+import sys
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import logging
 
 import matplotlib
@@ -14,16 +13,48 @@ import numpy as np
 import pandas as pd
 import mne
 from mne_bids import BIDSPath
+from scipy.stats import ttest_rel, ttest_ind
+try:
+    from statsmodels.stats.multitest import fdrcorrection
+except Exception:  # fallback handled in helper
+    fdrcorrection = None
+from mne.stats import permutation_cluster_test, permutation_cluster_1samp_test
 
 # Load centralized configuration
 from config_loader import load_config, get_legacy_constants
+try:
+    from logging_utils import get_subject_logger, get_group_logger
+except Exception:  # pragma: no cover
+    from .logging_utils import get_subject_logger, get_group_logger  # type: ignore
 from tfr_utils import compute_adaptive_n_cycles
+from roi_utils import (
+    canonicalize_ch_name as _canonicalize_ch_name,
+    find_roi_channels as _find_roi_channels,
+    build_rois_from_info as _build_rois,
+)
+
+# Shared I/O helpers (support both script and package execution)
+try:
+    from io_utils import (
+        _find_clean_epochs_path as _find_clean_epochs_path,
+        _load_events_df as _load_events_df,
+    )
+except Exception:  # pragma: no cover
+    from .io_utils import (  # type: ignore
+        _find_clean_epochs_path as _find_clean_epochs_path,
+        _load_events_df as _load_events_df,
+    )
 
 config = load_config()
 config.setup_matplotlib()
 
 # Extract legacy constants
 _constants = get_legacy_constants(config)
+try:
+    from io_utils import _ensure_derivatives_dataset_description
+except Exception:  # pragma: no cover
+    from .io_utils import _ensure_derivatives_dataset_description  # type: ignore
+_ensure_derivatives_dataset_description()
 
 PROJECT_ROOT = _constants["PROJECT_ROOT"]
 BIDS_ROOT = _constants["BIDS_ROOT"]
@@ -45,7 +76,6 @@ BOOTSTRAP_DEFAULT = int(config.get("random.bootstrap_default", 0))
 N_PERM_DEFAULT = int(config.get("statistics.n_perm_default", 0))
 DO_GROUP_DEFAULT = bool(config.get("statistics.do_group_default", False))
 GROUP_ONLY_DEFAULT = bool(config.get("statistics.group_only_default", False))
-BUILD_REPORTS_DEFAULT = bool(config.get("statistics.build_reports_default", False))
 DEFAULT_TEMPERATURE_STRATEGY = config.get("time_frequency_analysis.temperature_strategy", "pooled")
 DEFAULT_PLATEAU_TMIN = float(config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])[0])
 DEFAULT_PLATEAU_TMAX = float(config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])[1])
@@ -78,11 +108,27 @@ ROI_MASK_PARAMS_DEFAULT = dict(config.get("time_frequency_analysis.roi_mask_para
     "linewidth": 0.5,
     "markersize": 4,
 }))
+SIG_MASK_PARAMS_DEFAULT = dict(config.get("time_frequency_analysis.sig_mask_params", {
+    "marker": "o",
+    "markerfacecolor": "none",
+    "markeredgecolor": "k",
+    "linewidth": 1.0,
+    "markersize": 5,
+}))
+ROI_HIGHLIGHT_ENABLED = bool(config.get("time_frequency_analysis.roi_highlight_enabled", False))
+ANNOTATE_DESCRIPTIVE_TOPO = bool(config.get("time_frequency_analysis.annotate_descriptive_topo", True))
+SIG_ALPHA = float(config.get("statistics.sig_alpha", 0.05))
+CLUSTER_N_PERM = int(config.get("statistics.cluster_n_perm", 1024))
+CLUSTER_REPORT_SIZE = bool(config.get("statistics.cluster_report_size", False))
+CLUSTER_REPORT_MASS = bool(config.get("statistics.cluster_report_mass", False))
+DIFF_ANNOTATION_ENABLED = bool(config.get("statistics.diff_annotation_enabled", False))
 TEMPERATURE_COLUMNS = config.get("event_columns.temperature", [])
 MIN_BASELINE_SAMPLES = int(config.get("time_frequency_analysis.min_baseline_samples", 5))
 # Alignment behavior: default to strict (fail on misalignment) unless explicitly allowed to trim
+# Allow misaligned trim flag (new location under 'alignment', with backward-compatible fallback)
 ALLOW_MISALIGNED_TRIM = bool(
-    config.get("time_frequency_analysis.allow_misaligned_trim", False)
+    config.get("alignment.allow_misaligned_trim",
+               config.get("time_frequency_analysis.allow_misaligned_trim", False))
 )
 
 
@@ -128,8 +174,71 @@ def _validate_baseline_indices(
     return b_start, b_end, baseline_indices
 
 
+def _log_baseline_qc(
+    tfr_obj: "mne.time_frequency.EpochsTFR",
+    baseline: Tuple[Optional[float], Optional[float]],
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Compute simple baseline QC metrics and log a summary.
+
+    Reports number of baseline time points, median temporal std across channels/freqs,
+    epoch-wise robust CV (1.4826*MAD/|median|). Warns if baseline window is empty
+    or QC metrics are NaN.
+    """
+    try:
+        times = np.asarray(tfr_obj.times)
+        b_start, b_end, idx = _validate_baseline_indices(times, baseline)
+    except Exception as e:
+        msg = f"Baseline QC: invalid baseline window ({baseline}): {e}"
+        if logger:
+            logger.warning(msg)
+        else:
+            print(f"Warning: {msg}")
+        return
+    try:
+        base = tfr_obj.data[:, :, :, idx]
+        # temporal std per (epoch, ch, freq)
+        temporal_std = np.nanstd(base, axis=-1)
+        median_temporal_std = float(np.nanmedian(temporal_std))
+        # epoch mean across (ch, freq, time)
+        epoch_means = np.nanmean(base, axis=(1, 2, 3))
+        med = float(np.nanmedian(epoch_means))
+        mad = float(np.nanmedian(np.abs(epoch_means - med)))
+        rcv = float(1.4826 * mad / (abs(med) if abs(med) > 1e-12 else 1e-12))
+        n_time = int(len(idx))
+        msg = (
+            f"Baseline QC: n_time={n_time}, median_temporal_std={median_temporal_std:.3g}, "
+            f"epoch_MAD={mad:.3g}, RCV={rcv:.3g}"
+        )
+        log = logger.info if logger else print
+        log(msg)
+        if not np.isfinite(median_temporal_std) or not np.isfinite(rcv):
+            warn = "Baseline QC: non-finite metrics detected; baseline may be unstable."
+            (logger.warning if logger else print)(warn)
+    except Exception as e:
+        msg = f"Baseline QC failed: {e}"
+        if logger:
+            logger.warning(msg)
+        else:
+            print(f"Warning: {msg}")
+
+
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+
+def _get_available_subjects() -> List[str]:
+    """Find all available subjects in DERIV_ROOT with cleaned epochs files."""
+    subjects: List[str] = []
+    if not DERIV_ROOT.exists():
+        return subjects
+    for subj_dir in DERIV_ROOT.glob("sub-*"):
+        if subj_dir.is_dir():
+            subject_id = subj_dir.name[4:]
+            # Check if cleaned epochs exist for default task
+            if _find_clean_epochs_path(subject_id, DEFAULT_TASK) is not None:
+                subjects.append(subject_id)
+    return sorted(subjects)
 
 
 def _sanitize(name: str) -> str:
@@ -152,35 +261,49 @@ def _roi_definitions() -> Dict[str, list[str]]:
     return {roi: list(patterns) for roi, patterns in rois.items()}
 
 
-def _find_roi_channels(info: mne.Info, patterns: list[str]) -> list[str]:
-    chs = info["ch_names"]
-    out: list[str] = []
-    for pat in patterns:
-        rx = re.compile(pat, flags=re.IGNORECASE)
-        out.extend([ch for ch in chs if rx.match(ch)])
-    # Preserve original channel order and deduplicate
-    seen = set()
-    ordered = []
-    for ch in chs:
-        if ch in out and ch not in seen:
-            seen.add(ch)
-            ordered.append(ch)
-    return ordered
+## _canonicalize_ch_name moved to roi_utils
 
 
-def _build_rois(info: mne.Info) -> Dict[str, list[str]]:
-    """Build ROI channel mappings.
-    
-    Args:
-        info: MNE info object containing channel information
-    
-    Returns:
-        Dictionary mapping ROI names to lists of channel names
+## _find_roi_channels moved to roi_utils
+
+
+
+## _build_rois moved to roi_utils
+
+
+def _build_group_roi_map_from_channels(ch_names: list[str]) -> Dict[str, list[str]]:
+    """Build a group ROI map by heuristics from a union of channel names.
+
+    Uses broad, prefix-based rules to maximize coverage while keeping ROIs sensible.
+    Channel order is preserved as in `ch_names`.
     """
-    roi_map = {}
-    for roi, pats in _roi_definitions().items():
-        chans = _find_roi_channels(info, pats)
-        roi_map[roi] = chans
+    def pick(prefixes: list[str]) -> list[str]:
+        out = []
+        seen = set()
+        for ch in ch_names:
+            up = _canonicalize_ch_name(ch).upper()
+            for p in prefixes:
+                if up.startswith(p.upper()):
+                    if ch not in seen:
+                        seen.add(ch)
+                        out.append(ch)
+                    break
+        return out
+
+    roi_map: Dict[str, list[str]] = {
+        "Frontal": pick(["FP", "AF", "F"]),
+        "Central": pick(["C", "CZ"]),
+        "Parietal": pick(["P", "PZ"]),
+        "Occipital": pick(["O", "PO", "OZ"]),
+        "Temporal": pick(["T", "TP", "FT"]),
+        "Sensorimotor": pick(["FC", "C", "CP", "CZ"]),
+    }
+    # Deduplicate overlaps by preference: Sensorimotor keeps FC/C/CP; Frontal drops FC
+    # Remove FC-prefixed channels from Frontal to avoid overlap with Sensorimotor
+    roi_map["Frontal"] = [
+        ch for ch in roi_map["Frontal"]
+        if not _canonicalize_ch_name(ch).upper().startswith("FC")
+    ]
     return roi_map
 
 
@@ -230,7 +353,7 @@ def run_quick_baseline_diagnostics(subject: str, task: str = DEFAULT_TASK) -> No
             return_itc=False,
             average=False,
             decim=int(TFR_DECIM),
-            n_jobs=1,
+            n_jobs=-1,
             picks=TFR_PICKS,
             verbose=False,
         )
@@ -249,108 +372,17 @@ def run_quick_baseline_diagnostics(subject: str, task: str = DEFAULT_TASK) -> No
         logger.error(f"Diagnostics failed: {e}")
 
 
-def _find_clean_epochs_path(subject: str, task: str) -> Optional[Path]:
-    """Locate cleaned epochs file under derivatives for a subject.
-
-    Prefers BIDSPath with processing='clean' and suffix='epo'. Falls back to glob.
-    """
-    # 1) Try BIDSPath construction
-    bp = BIDSPath(
-        subject=subject,
-        task=task,
-        datatype="eeg",
-        processing="clean",
-        suffix="epo",
-        extension=".fif",
-        root=DERIV_ROOT,
-        check=False,
-    )
-    p1 = bp.fpath
-    if p1 and p1.exists():
-        return p1
-
-    # 2) Try the literal name specified by user brief
-    p2 = DERIV_ROOT / f"sub-{subject}" / "eeg" / f"sub-{subject}_task-{task}_proc-clean_epo.fif"
-    if p2.exists():
-        return p2
-
-    # 3) Fallback: any *proc-clean*_epo.fif under subject eeg dir for the task
-    subj_eeg_dir = DERIV_ROOT / f"sub-{subject}" / "eeg"
-    if subj_eeg_dir.exists():
-        cands = sorted(subj_eeg_dir.glob(f"sub-{subject}_task-{task}*epo.fif"))
-        for c in cands:
-            if "proc-clean" in c.name or "proc-cleaned" in c.name or "clean" in c.name:
-                return c
-        if cands:
-            return cands[0]
-
-    # 4) Last resort: recursive search (could be slow but scoped to subject)
-    subj_dir = DERIV_ROOT / f"sub-{subject}"
-    if subj_dir.exists():
-        for c in sorted(subj_dir.rglob(f"sub-{subject}_task-{task}*epo.fif")):
-            return c
-    return None
-
-
-def _load_events_df(subject: str, task: str, logger: Optional[logging.Logger] = None) -> Optional[pd.DataFrame]:
-    ebp = BIDSPath(
-        subject=subject,
-        task=task,
-        datatype="eeg",
-        suffix="events",
-        extension=".tsv",
-        root=BIDS_ROOT,
-        check=False,
-    )
-    p = ebp.fpath
-    if p is None:
-        p = BIDS_ROOT / f"sub-{subject}" / "eeg" / f"sub-{subject}_task-{task}_events.tsv"
-    if p.exists():
-        try:
-            return pd.read_csv(p, sep="\t")
-        except Exception as e:
-            msg = f"Failed to read events TSV at {p}: {e}"
-            if logger:
-                logger.warning(msg)
-            else:
-                print(f"Warning: {msg}")
-            return None
-    else:
-        msg = f"Events TSV not found for subject {subject}: {p}"
-        if logger:
-            logger.warning(msg)
-        else:
-            print(f"Warning: {msg}")
-        return None
+## _load_events_df imported from io_utils
 
 
 def _setup_logging(subject: str) -> logging.Logger:
-    """Set up logging with console and file handlers for time-frequency analysis."""
-    logger = logging.getLogger(f"time_frequency_analysis_sub_{subject}")
-    logger.setLevel(logging.INFO)
-    # Avoid duplicate handlers if already set
-    if logger.handlers:
-        return logger
-    
-    # Create formatters
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    # File handler
-    log_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "logs"  # e.g., derivatives/sub-001/eeg/logs/
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / LOG_FILE_NAME
-    file_handler = logging.FileHandler(log_file, mode='w')  # Overwrite each run
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
-    return logger
+    """Backward-compatible wrapper using centralized logging utils."""
+    return get_subject_logger("time_frequency_analysis", subject, LOG_FILE_NAME)
+
+
+def _setup_group_logging() -> logging.Logger:
+    """Backward-compatible wrapper using centralized logging utils."""
+    return get_group_logger("time_frequency_analysis", LOG_FILE_NAME)
 
 
 def _find_temperature_column(events_df: Optional[pd.DataFrame]) -> Optional[str]:
@@ -496,6 +528,17 @@ def _save_fig(fig_obj: Any, out_dir: Path, name: str, formats: Optional[list[str
     stem, ext = (base.rsplit(".", 1) + [""])[:2]
     exts = formats if formats is not None else ([ext] if ext else ["png"])  # default to PNG if no ext
     for i, f in enumerate(figs):
+        # Add a small footer annotation with units and baseline for transparency
+        try:
+            bwin = config.get("time_frequency_analysis.baseline_window", [-5.0, -0.01])
+            foot = f"Units: log10(power/baseline) | Baseline: [{float(bwin[0]):.2f}, {float(bwin[1]):.2f}] s"
+            try:
+                # Avoid stacking repeated footers if _save_fig called on the same figure
+                f.text(0.01, 0.01, foot, fontsize=8, alpha=0.8)
+            except Exception:
+                pass
+        except Exception:
+            pass
         saved_any = False
         # Prefer constrained_layout to avoid tight_layout warnings (common with MNE topomaps/colorbars)
         for ext_i in exts:
@@ -632,6 +675,18 @@ def _plot_topomap_on_ax(
             cmap=TOPO_CMAP,
             vlim=(vmin, vmax) if vmin is not None and vmax is not None else None,
         )
+    # Optionally annotate figure that topomaps are descriptive unless explicitly masked by stats
+    try:
+        if ANNOTATE_DESCRIPTIVE_TOPO and hasattr(ax, 'figure'):
+            fig = ax.figure
+            # Avoid duplicating the note on multi-axes figures
+            if not getattr(fig, '_descriptive_note_added', False):
+                fig.text(0.02, 0.02,
+                         "Descriptive topomap; see stats for inference (FDR/cluster)",
+                         fontsize=7, ha='left', va='bottom', alpha=0.7)
+                setattr(fig, '_descriptive_note_added', True)
+    except Exception:
+        pass
 
 
 def _get_consistent_bands(max_freq_available: Optional[float] = None) -> Dict[str, Tuple[float, float]]:
@@ -649,7 +704,9 @@ def _get_consistent_bands(max_freq_available: Optional[float] = None) -> Dict[st
         Dictionary mapping band names to (low, high) frequency tuples.
     """
     bands: Dict[str, Tuple[float, float]] = {}
-    # Include theta if defined in configuration
+    # Include delta and theta if defined in configuration (low-frequency bands first)
+    if "delta" in BAND_BOUNDS:
+        bands["delta"] = BAND_BOUNDS["delta"]
     if "theta" in BAND_BOUNDS:
         bands["theta"] = BAND_BOUNDS["theta"]
     # Always include alpha and beta
@@ -667,6 +724,420 @@ def _get_consistent_bands(max_freq_available: Optional[float] = None) -> Dict[st
     
     bands["gamma"] = (gamma_lower, gamma_upper)
     return bands
+
+
+def _format_p_value(p: float) -> str:
+    try:
+        if not np.isfinite(p):
+            return "p=nan"
+        if p < 1e-3:
+            return "p<.001"
+        if p < 1e-2:
+            return f"p={p:.3f}"
+        return f"p={p:.3f}"
+    except Exception:
+        return "p=nan"
+
+
+def _format_t_label(t: float, df: int, p: float) -> str:
+    try:
+        if np.isfinite(t) and isinstance(df, (int, np.integer)):
+            return f"t({df})={t:.2f}, {_format_p_value(float(p))}"
+        return f"t=nan, {_format_p_value(float(p))}"
+    except Exception:
+        return f"t=nan, p=nan"
+
+
+def _paired_t_text(a: np.ndarray, b: np.ndarray) -> str:
+    """Return a concise paired t-test label for arrays a and b.
+
+    - Flattens inputs and removes NaNs pairwise
+    - Uses scipy.stats.ttest_rel
+    - Returns label like: "t(df)=x.xx, p=.yyy"
+    """
+    try:
+        a = np.asarray(a).ravel()
+        b = np.asarray(b).ravel()
+        mask = np.isfinite(a) & np.isfinite(b)
+        a2 = a[mask]
+        b2 = b[mask]
+        if a2.size < 2 or b2.size < 2:
+            return "t(n<2)"
+        res = ttest_rel(a2, b2, nan_policy="omit")
+        df = int(a2.size - 1)
+        t_val = float(res.statistic) if np.isfinite(res.statistic) else np.nan
+        p_val = float(res.pvalue) if np.isfinite(res.pvalue) else np.nan
+        return _format_t_label(t_val, df, p_val)
+    except Exception:
+        return "t=err"
+
+
+def _format_cluster_ann(p: Optional[float], k: Optional[int] = None, mass: Optional[float] = None) -> str:
+    try:
+        parts = []
+        if p is not None and np.isfinite(p):
+            parts.append(_format_p_value(float(p)))
+        if CLUSTER_REPORT_SIZE and k is not None and isinstance(k, (int, np.integer)) and k > 0:
+            parts.append(f"k={int(k)}")
+        if CLUSTER_REPORT_MASS and mass is not None and np.isfinite(mass):
+            parts.append(f"mass={float(mass):.1f}")
+        return "; ".join(parts) if parts else ""
+    except Exception:
+        return ""
+
+
+def _extract_epochwise_channel_values(
+    tfr_epochs: "mne.time_frequency.EpochsTFR",
+    fmin: float,
+    fmax: float,
+    tmin: float,
+    tmax: float,
+) -> Optional[np.ndarray]:
+    """Return per-epoch, per-channel mean over the given band/time window.
+
+    Shape: (n_epochs, n_channels). Returns None if selection invalid.
+    Assumes `tfr_epochs` is baseline-corrected in logratio units.
+    """
+    try:
+        freqs = np.asarray(tfr_epochs.freqs)
+        times = np.asarray(tfr_epochs.times)
+        fmask = (freqs >= float(fmin)) & (freqs <= float(fmax))
+        tmask = (times >= float(tmin)) & (times < float(tmax))
+        if fmask.sum() == 0 or tmask.sum() == 0:
+            return None
+        # data: (n_epochs, n_channels, n_freqs, n_times)
+        data = np.asarray(tfr_epochs.data)[:, :, fmask, :][:, :, :, tmask]
+        return data.mean(axis=(2, 3))
+    except Exception:
+        return None
+
+
+
+def _get_eeg_adjacency(info: mne.Info, restrict_picks: Optional[np.ndarray] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[mne.Info]]:
+    """Return (adjacency, eeg_picks, info_eeg) for EEG channels in `info`.
+
+    If adjacency cannot be computed, returns (None, eeg_picks, info_eeg) so that
+    callers can still fall back to per-channel tests.
+    """
+    try:
+        eeg_picks_all = mne.pick_types(info, eeg=True, exclude=[])
+        if len(eeg_picks) == 0:
+            return None, None, None
+        if restrict_picks is not None:
+            # Intersect with EEG picks
+            restrict_picks = np.asarray(restrict_picks, dtype=int)
+            eeg_picks = np.array([p for p in eeg_picks_all if p in set(restrict_picks)], dtype=int)
+        else:
+            eeg_picks = np.asarray(eeg_picks_all, dtype=int)
+        if eeg_picks.size == 0:
+            return None, None, None
+        info_eeg = mne.pick_info(info, sel=eeg_picks.tolist())
+        try:
+            adjacency, ch_names = mne.channels.find_ch_adjacency(info_eeg, ch_type="eeg")
+        except Exception:
+            adjacency = None
+        return adjacency, eeg_picks, info_eeg
+    except Exception:
+        return None, None, None
+
+
+def _build_full_mask_from_eeg(sig_mask_eeg: np.ndarray, n_ch_total: int, eeg_picks: np.ndarray) -> np.ndarray:
+    full = np.zeros(n_ch_total, dtype=bool)
+    try:
+        full[eeg_picks] = sig_mask_eeg.astype(bool)
+    except Exception:
+        pass
+    return full
+
+
+def _cluster_mask_from_clusters(
+    clusters: list,
+    p_vals: np.ndarray,
+    n_features: int,
+    alpha: float,
+) -> np.ndarray:
+    """Combine significant clusters into a boolean mask over features.
+
+    Supports clusters provided as index arrays or boolean masks.
+    """
+    mask = np.zeros(n_features, dtype=bool)
+    try:
+        for cl, p in zip(clusters, p_vals):
+            try:
+                if float(p) <= float(alpha):
+                    # MNE returns either boolean mask (n_features,) or tuple of arrays
+                    if isinstance(cl, np.ndarray) and cl.dtype == bool and cl.shape[0] == n_features:
+                        mask |= cl
+                    else:
+                        # Assume cl is index array or tuple
+                        try:
+                            mask[np.asarray(cl)] = True
+                        except Exception:
+                            # Try first element if tuple
+                            try:
+                                mask[np.asarray(cl[0])] = True
+                            except Exception:
+                                continue
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return mask
+
+
+def _cluster_mask_two_sample_arrays(
+    Xa: np.ndarray,
+    Xb: np.ndarray,
+    info: mne.Info,
+    alpha: float = SIG_ALPHA,
+    paired: bool = False,
+    n_permutations: int = CLUSTER_N_PERM,
+    restrict_picks: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    """Compute EEG sensor-level cluster mask for two-sample comparison.
+
+    Xa, Xb: arrays of shape (n_samples, n_channels_total). Only EEG channels are used.
+    Returns a boolean mask of length n_channels_total, with True for significant sensors
+    belonging to any cluster with p <= alpha. Returns None on failure.
+    """
+    try:
+        adjacency, eeg_picks, info_eeg = _get_eeg_adjacency(info, restrict_picks=restrict_picks)
+        if eeg_picks is None or info_eeg is None:
+            return None
+        A = np.asarray(Xa)[:, eeg_picks]
+        B = np.asarray(Xb)[:, eeg_picks]
+        if paired and A.shape[0] == B.shape[0]:
+            # 1-sample cluster test on paired differences
+            Xd = A - B
+            out = permutation_cluster_1samp_test(
+                Xd,
+                n_permutations=int(n_permutations),
+                adjacency=adjacency,
+                tail=0,
+                out_type="mask",
+                n_jobs=1,
+            )
+            T_obs, clusters, p_values, _ = out
+        else:
+            # Two-sample independent cluster test
+            out = permutation_cluster_test(
+                [A, B],
+                n_permutations=int(n_permutations),
+                adjacency=adjacency,
+                tail=0,
+                out_type="mask",
+                n_jobs=1,
+            )
+            T_obs, clusters, p_values, _ = out
+        sig_eeg = _cluster_mask_from_clusters(clusters, p_values, n_features=A.shape[1], alpha=alpha)
+        sig_full = _build_full_mask_from_eeg(sig_eeg, n_ch_total=len(info["ch_names"]), eeg_picks=eeg_picks)
+        return sig_full
+    except Exception:
+        return None
+
+
+def _cluster_test_two_sample_arrays(
+    Xa: np.ndarray,
+    Xb: np.ndarray,
+    info: mne.Info,
+    alpha: float = SIG_ALPHA,
+    paired: bool = False,
+    n_permutations: int = CLUSTER_N_PERM,
+    restrict_picks: Optional[np.ndarray] = None,
+) -> Tuple[Optional[np.ndarray], Optional[float], Optional[int], Optional[float]]:
+    """Two-sample sensor-level cluster test; return (mask_full, p_min).
+
+    - Xa, Xb: shape (n_samples, n_channels_total). EEG channels are used.
+    - Returns a boolean mask for significant sensors and the minimum cluster p-value.
+    - Returns (None, None) on failure.
+    """
+    try:
+        adjacency, eeg_picks, info_eeg = _get_eeg_adjacency(info, restrict_picks=restrict_picks)
+        if eeg_picks is None or info_eeg is None:
+            return None, None
+        A = np.asarray(Xa)[:, eeg_picks]
+        B = np.asarray(Xb)[:, eeg_picks]
+        if paired and A.shape[0] == B.shape[0]:
+            Xd = A - B
+            T_obs, clusters, p_values, _ = permutation_cluster_1samp_test(
+                Xd,
+                n_permutations=int(n_permutations),
+                adjacency=adjacency,
+                tail=0,
+                out_type="mask",
+                n_jobs=1,
+            )
+        else:
+            T_obs, clusters, p_values, _ = permutation_cluster_test(
+                [A, B],
+                n_permutations=int(n_permutations),
+                adjacency=adjacency,
+                tail=0,
+                out_type="mask",
+                n_jobs=1,
+            )
+        sig_eeg = _cluster_mask_from_clusters(clusters, p_values, n_features=A.shape[1], alpha=alpha)
+        sig_full = _build_full_mask_from_eeg(sig_eeg, n_ch_total=len(info["ch_names"]), eeg_picks=eeg_picks)
+        # Choose p-value, size, and mass of the largest cluster by |T| sum
+        p_of_largest: Optional[float] = None
+        k_of_largest: Optional[int] = None
+        mass_of_largest: Optional[float] = None
+        try:
+            if len(clusters) > 0:
+                masses = []
+                for cl in clusters:
+                    if isinstance(cl, np.ndarray) and cl.dtype == bool and cl.shape[0] == T_obs.shape[0]:
+                        idx = np.where(cl)[0]
+                    else:
+                        try:
+                            idx = np.asarray(cl)
+                        except Exception:
+                            idx = None
+                    if idx is None or idx.size == 0:
+                        masses.append(0.0)
+                    else:
+                        try:
+                            masses.append(float(np.nansum(np.abs(T_obs[idx]))))
+                        except Exception:
+                            masses.append(0.0)
+                if len(masses) > 0:
+                    k = int(np.nanargmax(np.asarray(masses)))
+                    # derive indices for k-th cluster
+                    cl_k = clusters[k]
+                    if isinstance(cl_k, np.ndarray) and cl_k.dtype == bool and cl_k.shape[0] == T_obs.shape[0]:
+                        idx_k = np.where(cl_k)[0]
+                    else:
+                        try:
+                            idx_k = np.asarray(cl_k)
+                        except Exception:
+                            idx_k = np.array([], dtype=int)
+                    p_of_largest = float(p_values[k]) if np.isfinite(p_values[k]) else None
+                    k_of_largest = int(idx_k.size)
+                    try:
+                        mass_of_largest = float(np.nansum(np.abs(T_obs[idx_k]))) if idx_k.size > 0 else 0.0
+                    except Exception:
+                        mass_of_largest = None
+        except Exception:
+            p_of_largest = None
+            k_of_largest = None
+            mass_of_largest = None
+        return sig_full, p_of_largest, k_of_largest, mass_of_largest
+    except Exception:
+        return None, None, None, None
+
+
+def _fdr_bh_mask(p_vals: np.ndarray, alpha: float = SIG_ALPHA) -> Optional[np.ndarray]:
+    try:
+        p_vals = np.asarray(p_vals)
+        if p_vals.ndim != 1 or p_vals.size == 0:
+            return None
+        if fdrcorrection is None:
+            return (p_vals < float(alpha)).astype(bool)
+        rej, _ = fdrcorrection(p_vals, alpha=float(alpha))
+        return rej.astype(bool)
+    except Exception:
+        try:
+            return (np.asarray(p_vals) < float(alpha)).astype(bool)
+        except Exception:
+            return None
+
+
+def _fdr_bh_values(p_vals: np.ndarray, alpha: float = SIG_ALPHA) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Return (reject, qvals) for BH-FDR; None on failure.
+
+    If statsmodels is unavailable, uses p as q (conservative) and reject = p<alpha.
+    """
+    try:
+        p_vals = np.asarray(p_vals)
+        if p_vals.ndim != 1 or p_vals.size == 0:
+            return None, None
+        if fdrcorrection is None:
+            rej = p_vals < float(alpha)
+            q = p_vals.astype(float)
+            return rej.astype(bool), q
+        rej, q = fdrcorrection(p_vals, alpha=float(alpha))
+        return rej.astype(bool), q.astype(float)
+    except Exception:
+        try:
+            p_vals = np.asarray(p_vals)
+            rej = p_vals < float(alpha)
+            q = p_vals.astype(float)
+            return rej.astype(bool), q
+        except Exception:
+            return None, None
+
+
+def _format_fdr_ann(q_min: Optional[float], k_rej: Optional[int]) -> str:
+    try:
+        parts = []
+        if q_min is not None and np.isfinite(q_min):
+            # format like p for consistency
+            parts.append(f"FDR q={q_min:.3f}" if q_min >= 1e-3 else "FDR q<.001")
+        if k_rej is not None and isinstance(k_rej, (int, np.integer)):
+            parts.append(f"k={int(k_rej)}")
+        return "; ".join(parts) if parts else ""
+    except Exception:
+        return ""
+
+
+def _cluster_test_epochs(
+    tfr_epochs: "mne.time_frequency.EpochsTFR",
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    fmin: float,
+    fmax: float,
+    tmin: float,
+    tmax: float,
+    paired: bool = False,
+    alpha: float = SIG_ALPHA,
+    n_permutations: int = CLUSTER_N_PERM,
+    restrict_picks: Optional[np.ndarray] = None,
+) -> Tuple[Optional[np.ndarray], Optional[float], Optional[int], Optional[float]]:
+    """Cluster test for epochwise values in a band/time window; return (mask, p_min)."""
+    X = _extract_epochwise_channel_values(tfr_epochs, fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax)
+    if X is None:
+        return None, None
+    try:
+        Xa = np.asarray(X)[np.asarray(mask_a, dtype=bool), :]
+        Xb = np.asarray(X)[np.asarray(mask_b, dtype=bool), :]
+        if Xa.shape[0] < 2 or Xb.shape[0] < 2:
+            return None, None
+        return _cluster_test_two_sample_arrays(
+            Xa, Xb, tfr_epochs.info,
+            alpha=alpha, paired=paired, n_permutations=n_permutations,
+            restrict_picks=restrict_picks,
+        )
+    except Exception:
+        return None, None, None, None
+
+
+def _cluster_mask_epochs(
+    tfr_epochs: "mne.time_frequency.EpochsTFR",
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    fmin: float,
+    fmax: float,
+    tmin: float,
+    tmax: float,
+    paired: bool = False,
+    alpha: float = SIG_ALPHA,
+    n_permutations: int = CLUSTER_N_PERM,
+) -> Optional[np.ndarray]:
+    """Cluster-based permutation mask across EEG sensors using epochwise values.
+
+    Returns boolean mask length = n_channels_total in `tfr_epochs.info`, or None if invalid.
+    """
+    X = _extract_epochwise_channel_values(tfr_epochs, fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax)
+    if X is None:
+        return None
+    try:
+        Xa = np.asarray(X)[np.asarray(mask_a, dtype=bool), :]
+        Xb = np.asarray(X)[np.asarray(mask_b, dtype=bool), :]
+        if Xa.shape[0] < 2 or Xb.shape[0] < 2:
+            return None
+        return _cluster_mask_two_sample_arrays(Xa, Xb, tfr_epochs.info, alpha=alpha, paired=paired, n_permutations=n_permutations)
+    except Exception:
+        return None
 
 
 def _robust_sym_vlim(
@@ -705,6 +1176,115 @@ def _robust_sym_vlim(
     except Exception:
         return cap
 
+
+def _compute_power_and_events(
+    subject: str,
+    task: str,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[Optional["mne.time_frequency.EpochsTFR"], Optional[pd.DataFrame]]:
+    """Compute per-trial TFR (EpochsTFR) and load aligned events metadata.
+
+    Returns (power, events_df) or (None, None) on failure.
+    """
+    # Load epochs
+    epo_path = _find_clean_epochs_path(subject, task)
+    if epo_path is None or not epo_path.exists():
+        msg = f"No cleaned epochs for sub-{subject}, task-{task}"
+        if logger:
+            logger.error(msg)
+        else:
+            print(f"Error: {msg}")
+        return None, None
+    try:
+        epochs = mne.read_epochs(epo_path, preload=True, verbose=False)
+    except Exception as e:
+        msg = f"Failed to load epochs for sub-{subject}: {e}"
+        if logger:
+            logger.error(msg)
+        else:
+            print(f"Error: {msg}")
+        return None, None
+
+    # Load and align events
+    events_df = _load_events_df(subject, task, logger)
+    if events_df is not None:
+        aligned = False
+        sel = getattr(epochs, "selection", None)
+        if sel is not None and len(sel) == len(epochs):
+            try:
+                if len(events_df) > int(np.max(sel)):
+                    events_aligned = events_df.iloc[sel].reset_index(drop=True)
+                    events_df = events_aligned
+                    epochs.metadata = events_df.copy()
+                    aligned = True
+                    if logger:
+                        logger.info("Aligned metadata via epochs.selection")
+                
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Selection-based alignment failed: {e}")
+        if not aligned and "sample" in events_df.columns and isinstance(getattr(epochs, "events", None), np.ndarray):
+            try:
+                samples = epochs.events[:, 0]
+                events_by_sample = events_df.set_index("sample")
+                events_aligned = events_by_sample.reindex(samples)
+                if len(events_aligned) == len(epochs) and not events_aligned.isna().all(axis=1).any():
+                    events_df = events_aligned.reset_index()
+                    epochs.metadata = events_df.copy()
+                    aligned = True
+                    if logger:
+                        logger.info("Aligned metadata via events.sample")
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Sample-based alignment failed: {e}")
+        if not aligned:
+            n = min(len(events_df), len(epochs))
+            if len(events_df) != len(epochs):
+                msg = f"Epochs ({len(epochs)}) and events ({len(events_df)}) mismatch; proceeding with trim to n={n}."
+                if logger:
+                    logger.warning(msg)
+                else:
+                    print(f"Warning: {msg}")
+                if not ALLOW_MISALIGNED_TRIM:
+                    if logger:
+                        logger.error("Trimming not allowed by config; skipping subject.")
+                    return None, None
+            try:
+                if len(epochs) != n:
+                    epochs = epochs[:n]
+                events_df = events_df.iloc[:n].reset_index(drop=True)
+                epochs.metadata = events_df.copy()
+            except Exception as e:
+                if logger:
+                    logger.error(f"Failed to attach trimmed metadata: {e}")
+                return None, None
+    else:
+        if logger:
+            logger.warning("Events missing; contrasts will be skipped for this subject.")
+
+    # Compute per-trial TFR
+    try:
+        freqs = np.logspace(np.log10(FREQ_MIN), np.log10(FREQ_MAX), N_FREQS)
+        n_cycles = compute_adaptive_n_cycles(freqs, cycles_factor=N_CYCLES_FACTOR, min_cycles=3.0)
+        power = mne.time_frequency.tfr_morlet(
+            epochs,
+            freqs=freqs,
+            n_cycles=n_cycles,
+            use_fft=True,
+            return_itc=False,
+            average=False,
+            decim=TFR_DECIM,
+            n_jobs=-1,
+            picks=TFR_PICKS,
+            verbose=False,
+        )
+    except Exception as e:
+        if logger:
+            logger.error(f"TFR computation failed for sub-{subject}: {e}")
+        else:
+            print(f"Error: TFR computation failed for sub-{subject}: {e}")
+        return None, None
+    return power, events_df
 def plot_cz_all_trials_raw(tfr, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
     # Plot Cz TFR without baseline correction
     tfr_copy = tfr.copy()
@@ -773,7 +1353,7 @@ def plot_cz_all_trials(
         fig = tfr_avg.plot(picks=cz, vlim=(-vabs, +vabs), show=False)
         try:
             fig.suptitle(
-                f"Cz TFR — all trials (baseline logratio)\nvlim ±{vabs:.2f}; \u03bc_plateau={mu:.3f} ({pct:+.0f}%)",
+                f"Cz TFR — all trials (baseline logratio)\nvlim ±{vabs:.2f}; mean %Δ vs BL={pct:+.0f}%",
                 fontsize=12,
             )
         except Exception:
@@ -1360,7 +1940,7 @@ def contrast_pain_nonpain(
         fig = tfr_pain.plot(picks=cz, vlim=(-vabs_pn, +vabs_pn), show=False)
         try:
             fig.suptitle(
-                f"Cz — Pain (baseline logratio)\nvlim ±{vabs_pn:.2f}; \u03bc_plateau={mu_pain:.3f} ({pct_pain:+.0f}%)",
+                f"Cz — Pain (baseline logratio)\nvlim ±{vabs_pn:.2f}; mean %Δ vs BL={pct_pain:+.0f}%",
                 fontsize=12,
             )
         except Exception:
@@ -1376,7 +1956,7 @@ def contrast_pain_nonpain(
         fig = tfr_non.plot(picks=cz, vlim=(-vabs_pn, +vabs_pn), show=False)
         try:
             fig.suptitle(
-                f"Cz — Non-pain (baseline logratio)\nvlim ±{vabs_pn:.2f}; \u03bc_plateau={mu_non:.3f} ({pct_non:+.0f}%)",
+                f"Cz — Non-pain (baseline logratio)\nvlim ±{vabs_pn:.2f}; mean %Δ vs BL={pct_non:+.0f}%",
                 fontsize=12,
             )
         except Exception:
@@ -1402,7 +1982,7 @@ def contrast_pain_nonpain(
         fig = tfr_diff.plot(picks=cz, vlim=(-vabs_diff, +vabs_diff), show=False)
         try:
             fig.suptitle(
-                f"Cz — Pain minus Non (baseline logratio)\nvlim ±{vabs_diff:.2f}; \u0394\u03bc_plateau={mu_diff:.3f} ({pct_diff:+.0f}%)",
+                f"Cz — Pain minus Non (baseline logratio)\nvlim ±{vabs_diff:.2f}; Δ% vs BL={pct_diff:+.0f}%",
                 fontsize=12,
             )
         except Exception:
@@ -1427,73 +2007,65 @@ def contrast_pain_nonpain(
     # Final counts after potential reslicing
     n_pain = int(pain_mask.sum())
     n_non = int(non_mask.sum())
-    cond_labels = [f"Pain (n={n_pain})", f"Non-pain (n={n_non})", "", "Pain - Non"]
-    n_rows = len(bands)
-    # Insert a narrow spacer column between Non-pain and Diff
-    n_cols = 4
+    row_labels = [f"Pain (n={n_pain})", f"Non-pain (n={n_non})", "Pain - Non"]
+    n_rows = 3  # pain, non, diff
+    n_cols = len(bands)
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(4.0 * n_cols, 3.5 * n_rows),
+        figsize=(3.5 * n_cols, 3.5 * n_rows),
         squeeze=False,
-        gridspec_kw={"width_ratios": [1.0, 1.0, 0.25, 1.0], "wspace": 0.3},
+        gridspec_kw={"wspace": 0.3, "hspace": 0.3},
     )
-    for r, (band, (fmin, fmax)) in enumerate(bands.items()):
+    for c, (band, (fmin, fmax)) in enumerate(bands.items()):
         fmax_eff = min(fmax, fmax_available)
         if fmin >= fmax_eff:
-            for c in range(n_cols):
+            for r in range(n_rows):
                 axes[r, c].axis('off')
             continue
-        # Average data for each condition
+        # Average data for each condition in this band
         pain_data = _average_tfr_band(tfr_pain, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax)
         non_data = _average_tfr_band(tfr_non, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax)
         if pain_data is None or non_data is None:
-            for c in range(n_cols):
+            for r in range(n_rows):
                 axes[r, c].axis('off')
             continue
         diff_data = pain_data - non_data
-        # Scalp-averaged values for compact annotation (logratio and percent change) - EEG only
-        pain_mu = float(np.nanmean(pain_data))
-        non_mu = float(np.nanmean(non_data))
-        diff_mu = float(np.nanmean(diff_data))
-        # Robust symmetric scaling for pain/non and diff within band
+        # Compute per-band scaling
         vabs_pn = _robust_sym_vlim([pain_data, non_data])
         diff_abs = _robust_sym_vlim(diff_data) if np.isfinite(diff_data).any() else 0.0
-        # Plot Pain (col 0), Non-pain (col 1), leave col 2 empty, Diff (col 3)
-        # Pain
-        ax = axes[r, 0]
-        try:
-            mne.viz.plot_topomap(
-                pain_data,
-                tfr_pain.info,
-                axes=ax,
-                show=False,
-                vlim=(-vabs_pn, +vabs_pn),
-                cmap=TOPO_CMAP,
+        # Significance for diff (per band)
+        sig_mask = None
+        cluster_p_min = cluster_k = cluster_mass = None
+        fdr_txt = ""
+        if DIFF_ANNOTATION_ENABLED:
+            sig_mask, cluster_p_min, cluster_k, cluster_mass = _cluster_test_epochs(
+                tfr_sub, pain_mask, non_mask, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax, paired=False
             )
+        # Plot pain (row 0)
+        ax = axes[0, c]
+        try:
+            mne.viz.plot_topomap(pain_data, tfr_pain.info, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
         except Exception:
             _plot_topomap_on_ax(ax, pain_data, tfr_pain.info, vmin=-vabs_pn, vmax=+vabs_pn)
-        # Annotate mean value
-        ax.text(0.5, 1.02, f"\u03bc={pain_mu:.3f} ({(10**pain_mu - 1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
-        # Non-pain
-        ax = axes[r, 1]
         try:
-            mne.viz.plot_topomap(
-                non_data,
-                tfr_pain.info,
-                axes=ax,
-                show=False,
-                vlim=(-vabs_pn, +vabs_pn),
-                cmap=TOPO_CMAP,
-            )
+            pain_mu = float(np.nanmean(pain_data))
+            ax.text(0.5, 1.02, f"%Δ={(10**pain_mu - 1)*100:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Plot non-pain (row 1)
+        ax = axes[1, c]
+        try:
+            mne.viz.plot_topomap(non_data, tfr_pain.info, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
         except Exception:
             _plot_topomap_on_ax(ax, non_data, tfr_pain.info, vmin=-vabs_pn, vmax=+vabs_pn)
-        # Annotate mean value
-        ax.text(0.5, 1.02, f"\u03bc={non_mu:.3f} ({(10**non_mu - 1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
-        # Spacer column (col 2)
-        axes[r, 2].axis('off')
-        # Diff
-        ax = axes[r, 3]
+        try:
+            non_mu = float(np.nanmean(non_data))
+            ax.text(0.5, 1.02, f"%Δ={(10**non_mu - 1)*100:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Plot diff (row 2)
+        ax = axes[2, c]
         try:
             mne.viz.plot_topomap(
                 diff_data,
@@ -1502,6 +2074,8 @@ def contrast_pain_nonpain(
                 show=False,
                 vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else None),
                 cmap=TOPO_CMAP,
+                mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None),
+                mask_params=SIG_MASK_PARAMS_DEFAULT,
             )
         except Exception:
             _plot_topomap_on_ax(
@@ -1510,41 +2084,43 @@ def contrast_pain_nonpain(
                 tfr_pain.info,
                 vmin=(-diff_abs if diff_abs > 0 else None),
                 vmax=(+diff_abs if diff_abs > 0 else None),
+                mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None),
+                mask_params=SIG_MASK_PARAMS_DEFAULT,
             )
-        # Annotate mean difference value
-        pct_mu = (10**(diff_mu) - 1.0) * 100.0
-        ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
-        if r == 0:
-            for c_title in (0, 1, 3):
-                axes[r, c_title].set_title(cond_labels[c_title], fontsize=9, pad=4, y=1.04)
-        axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
-        # Add compact colorbars per row
+        try:
+            diff_mu = float(np.nanmean(diff_data))
+            pct_mu = (10**(diff_mu) - 1.0) * 100.0
+            cl_txt = (_format_cluster_ann(cluster_p_min, cluster_k, cluster_mass) or fdr_txt) if DIFF_ANNOTATION_ENABLED else ""
+            label = f"Δ%={pct_mu:+.1f}%" + (f" | {cl_txt}" if cl_txt else "")
+            ax.text(0.5, 1.02, label, transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Column title: band label
+        try:
+            axes[0, c].set_title(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=9, pad=4, y=1.04)
+        except Exception:
+            pass
+        # Per-column colorbars: conditions (rows 0-1) and diff (row 2)
         try:
             sm_pn = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-vabs_pn, vcenter=0.0, vmax=vabs_pn), cmap=TOPO_CMAP)
             sm_pn.set_array([])
-            cbar_pn = fig.colorbar(
-                sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
-            )
-            try:
-                cbar_pn.set_label("log10(power/baseline)")
-            except Exception:
-                pass
+            fig.colorbar(sm_pn, ax=[axes[0, c], axes[1, c]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
             if diff_abs > 0:
                 sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-diff_abs, vcenter=0.0, vmax=diff_abs), cmap=TOPO_CMAP)
                 sm_diff.set_array([])
-                cbar_diff = fig.colorbar(
-                    sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
-                )
-                try:
-                    cbar_diff.set_label("log10(power/baseline)")
-                except Exception:
-                    pass
+                fig.colorbar(sm_diff, ax=axes[2, c], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
         except Exception:
             pass
+    # Row labels
+    try:
+        axes[0, 0].set_ylabel(row_labels[0], fontsize=10)
+        axes[1, 0].set_ylabel(row_labels[1], fontsize=10)
+        axes[2, 0].set_ylabel(row_labels[2], fontsize=10)
+    except Exception:
+        pass
     fig.suptitle(f"Topomaps (baseline: logratio; t=[{tmin:.1f}, {tmax:.1f}] s)", fontsize=12)
     try:
-        # Removed bottom 'Conditions' label per request; keep y-label for frequency bands
-        fig.supylabel("Frequency bands", fontsize=10)
+        fig.supxlabel("Frequency bands", fontsize=10)
     except Exception:
         pass
     _save_fig(fig, out_dir, "topomap_grid_bands_pain_non_diff_baseline_logratio.png", formats=["png", "svg"])
@@ -1655,6 +2231,14 @@ def contrast_maxmin_temperature(
             for c in range(n_cols):
                 axes[r, c].axis("off")
             continue
+        # Cluster/FDR significance (guarded by config)
+        sig_mask = None
+        cluster_p_min = cluster_k = cluster_mass = None
+        fdr_txt = ""
+        if DIFF_ANNOTATION_ENABLED:
+            sig_mask, cluster_p_min, cluster_k, cluster_mass = _cluster_test_epochs(
+                tfr_sub, mask_max, mask_min, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax, paired=False
+            )
         diff_data = max_data - min_data
 
         # Means for compact annotations (log10 ratio units)
@@ -1679,7 +2263,7 @@ def contrast_maxmin_temperature(
             )
         except Exception:
             _plot_topomap_on_ax(ax, max_data, tfr_max.info, vmin=-vabs_pn, vmax=+vabs_pn)
-        ax.text(0.5, 1.02, f"\u03bc={max_mu:.3f} ({(10**max_mu - 1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"%Δ={(10**max_mu - 1)*100:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         # Min temp (col 1)
         ax = axes[r, 1]
@@ -1694,7 +2278,7 @@ def contrast_maxmin_temperature(
             )
         except Exception:
             _plot_topomap_on_ax(ax, min_data, tfr_min.info, vmin=-vabs_pn, vmax=+vabs_pn)
-        ax.text(0.5, 1.02, f"\u03bc={min_mu:.3f} ({(10**min_mu - 1)*100:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        ax.text(0.5, 1.02, f"%Δ={(10**min_mu - 1)*100:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         # Spacer (col 2)
         axes[r, 2].axis("off")
@@ -1709,6 +2293,8 @@ def contrast_maxmin_temperature(
                 show=False,
                 vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else None),
                 cmap=TOPO_CMAP,
+                mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None),
+                mask_params=SIG_MASK_PARAMS_DEFAULT,
             )
         except Exception:
             _plot_topomap_on_ax(
@@ -1717,9 +2303,18 @@ def contrast_maxmin_temperature(
                 tfr_max.info,
                 vmin=(-diff_abs if diff_abs > 0 else None),
                 vmax=(+diff_abs if diff_abs > 0 else None),
+                mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None),
+                mask_params=SIG_MASK_PARAMS_DEFAULT,
             )
         pct_mu = (10**(diff_mu) - 1.0) * 100.0
-        ax.text(0.5, 1.02, f"\u0394\u03bc={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        try:
+            cl_txt = (_format_cluster_ann(cluster_p_min, cluster_k, cluster_mass) or fdr_txt) if DIFF_ANNOTATION_ENABLED else ""
+            if cl_txt:
+                ax.text(0.5, 1.02, f"Δ%={pct_mu:+.1f}% | {cl_txt}", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+            else:
+                ax.text(0.5, 1.02, f"Δ%={pct_mu:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            ax.text(0.5, 1.02, f"Δ%={pct_mu:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
 
         if r == 0:
             axes[r, 0].set_title(f"Max {t_max:.1f}°C (n={int(mask_max.sum())})", fontsize=9, pad=4, y=1.04)
@@ -1846,150 +2441,146 @@ def contrast_pain_nonpain_topomaps_rois(
         mask_vec = np.array([ch in roi_chs for ch in ch_names], dtype=bool)
         mask_params = ROI_MASK_PARAMS_DEFAULT
 
-        n_rows = len(bands)
-        n_cols = 4
+        # New layout: rows=Pain/Non/Diff, columns=bands
+        n_rows = 3
+        n_cols = len(bands)
         fig, axes = plt.subplots(
             n_rows,
             n_cols,
-            figsize=(4.0 * n_cols, 3.5 * n_rows),
+            figsize=(3.5 * n_cols, 3.5 * n_rows),
             squeeze=False,
-            gridspec_kw={"width_ratios": [1.0, 1.0, 0.25, 1.0], "wspace": 0.3},
+            gridspec_kw={"wspace": 0.3, "hspace": 0.3},
         )
-        for r, (band, (fmin, fmax)) in enumerate(bands.items()):
+        for c, (band, (fmin, fmax)) in enumerate(bands.items()):
             fmax_eff = min(fmax, fmax_available)
             if fmin >= fmax_eff:
-                for c in range(n_cols):
+                for r in range(n_rows):
                     axes[r, c].axis('off')
                 continue
             pain_data = _average_tfr_band(tfr_pain, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax)
             non_data = _average_tfr_band(tfr_non, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax)
             if pain_data is None or non_data is None:
-                for c in range(n_cols):
+                for r in range(n_rows):
                     axes[r, c].axis('off')
                 continue
             diff_data = pain_data - non_data
-            # Robust symmetric scaling for pain/non and diff within band
+            # Scaling per band
             vabs_pn = _robust_sym_vlim([pain_data, non_data])
             vmin, vmax = -vabs_pn, +vabs_pn
             diff_abs = _robust_sym_vlim(diff_data) if np.isfinite(diff_data).any() else 0.0
-            # ROI-averaged values for annotation (use ROI mask when available)
+            # ROI-mean annotation values
             if mask_vec.any():
-                pain_mu = float(np.nanmean(pain_data[mask_vec]))
-                non_mu = float(np.nanmean(non_data[mask_vec]))
-                diff_mu = float(np.nanmean(diff_data[mask_vec]))
+                pain_mu = float(np.nanmean(pain_data[mask_vec])); non_mu = float(np.nanmean(non_data[mask_vec])); diff_mu = float(np.nanmean(diff_data[mask_vec]))
             else:
-                pain_mu = float(np.nanmean(pain_data))
-                non_mu = float(np.nanmean(non_data))
-                diff_mu = float(np.nanmean(diff_data))
-            # Pain (col 0)
-            ax = axes[r, 0]
+                pain_mu = float(np.nanmean(pain_data)); non_mu = float(np.nanmean(non_data)); diff_mu = float(np.nanmean(diff_data))
+            # Row 0: Pain
+            ax = axes[0, c]
             try:
                 mne.viz.plot_topomap(
-                    pain_data,
-                    tfr_pain.info,
-                    axes=ax,
-                    show=False,
+                    pain_data, tfr_pain.info, axes=ax, show=False,
                     vlim=(vmin, vmax) if vmin is not None and vmax is not None else None,
-                    mask=mask_vec,
-                    mask_params=mask_params,
+                    mask=(mask_vec if ROI_HIGHLIGHT_ENABLED else None), mask_params=mask_params,
                     cmap=TOPO_CMAP,
                 )
             except Exception:
                 _plot_topomap_on_ax(
-                    ax,
-                    pain_data,
-                    tfr_pain.info,
-                    mask=mask_vec,
-                    mask_params=mask_params,
-                    vmin=vmin,
-                    vmax=vmax,
+                    ax, pain_data, tfr_pain.info,
+                    mask=(mask_vec if ROI_HIGHLIGHT_ENABLED else None), mask_params=mask_params,
+                    vmin=vmin, vmax=vmax,
                 )
-            # Annotate ROI-mean
-            ax.text(0.5, 1.02, f"\u03bc_ROI={pain_mu:.3f}", transform=ax.transAxes, ha="center", va="top", fontsize=8)
-            # Non-pain (col 1)
-            ax = axes[r, 1]
+            try:
+                ax.text(0.5, 1.02, f"%Δ_ROI={(10**(pain_mu) - 1.0)*100:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=8)
+            except Exception:
+                pass
+            # Row 1: Non-pain
+            ax = axes[1, c]
             try:
                 mne.viz.plot_topomap(
-                    non_data,
-                    tfr_pain.info,
-                    axes=ax,
-                    show=False,
+                    non_data, tfr_pain.info, axes=ax, show=False,
                     vlim=(vmin, vmax) if vmin is not None and vmax is not None else None,
-                    mask=mask_vec,
-                    mask_params=mask_params,
+                    mask=(mask_vec if ROI_HIGHLIGHT_ENABLED else None), mask_params=mask_params,
                     cmap=TOPO_CMAP,
                 )
             except Exception:
                 _plot_topomap_on_ax(
-                    ax,
-                    non_data,
-                    tfr_pain.info,
-                    mask=mask_vec,
-                    mask_params=mask_params,
-                    vmin=vmin,
-                    vmax=vmax,
+                    ax, non_data, tfr_pain.info,
+                    mask=(mask_vec if ROI_HIGHLIGHT_ENABLED else None), mask_params=mask_params,
+                    vmin=vmin, vmax=vmax,
                 )
-            # Annotate ROI-mean
-            ax.text(0.5, 1.02, f"\u03bc_ROI={non_mu:.3f}", transform=ax.transAxes, ha="center", va="top", fontsize=8)
-            # Spacer (col 2)
-            axes[r, 2].axis('off')
-            # Diff (col 3)
-            ax = axes[r, 3]
+            try:
+                ax.text(0.5, 1.02, f"%Δ_ROI={(10**(non_mu) - 1.0)*100:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=8)
+            except Exception:
+                pass
+            # Row 2: Diff
+            roi_picks = np.where(mask_vec)[0]
+            sig_mask = None; cluster_p_min = cluster_k = cluster_mass = None; fdr_txt = ""
+            if DIFF_ANNOTATION_ENABLED:
+                sig_mask, cluster_p_min, cluster_k, cluster_mass = _cluster_test_epochs(
+                    tfr_sub, pain_mask, non_mask, fmin=fmin, fmax=fmax_eff, tmin=tmin, tmax=tmax, paired=False,
+                    restrict_picks=roi_picks,
+                )
+            ax = axes[2, c]
             try:
                 mne.viz.plot_topomap(
-                    diff_data,
-                    tfr_pain.info,
-                    axes=ax,
-                    show=False,
+                    diff_data, tfr_pain.info, axes=ax, show=False,
                     vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else None),
-                    mask=mask_vec,
-                    mask_params=mask_params,
+                    mask=(mask_vec if ROI_HIGHLIGHT_ENABLED else None), mask_params=mask_params,
                     cmap=TOPO_CMAP,
                 )
             except Exception:
                 _plot_topomap_on_ax(
-                    ax,
-                    diff_data,
-                    tfr_pain.info,
-                    mask=mask_vec,
-                    mask_params=mask_params,
-                    vmin=(-diff_abs if diff_abs > 0 else None),
-                    vmax=(+diff_abs if diff_abs > 0 else None),
+                    ax, diff_data, tfr_pain.info,
+                    mask=(mask_vec if ROI_HIGHLIGHT_ENABLED else None), mask_params=mask_params,
+                    vmin=(-diff_abs if diff_abs > 0 else None), vmax=(+diff_abs if diff_abs > 0 else None),
                 )
-            # Annotate ROI-mean difference
-            pct_mu = (10**(diff_mu) - 1.0) * 100.0
-            ax.text(0.5, 1.02, f"\u0394\u03bc_ROI={diff_mu:.3f} ({pct_mu:+.1f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=8)
-            if r == 0:
-                for c_title in (0, 1, 3):
-                    axes[r, c_title].set_title(cond_labels[c_title], fontsize=9, pad=4, y=1.04)
-            axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
-            # Add compact colorbars per row
+            # Overlay significance markers if enabled
+            if DIFF_ANNOTATION_ENABLED and sig_mask is not None and sig_mask.any():
+                try:
+                    mne.viz.plot_topomap(
+                        diff_data, tfr_pain.info, axes=ax, show=False,
+                        vlim=((-diff_abs, +diff_abs) if diff_abs > 0 else None), cmap=TOPO_CMAP,
+                        mask=sig_mask, mask_params=SIG_MASK_PARAMS_DEFAULT,
+                    )
+                except Exception:
+                    try:
+                        _plot_topomap_on_ax(
+                            ax, diff_data, tfr_pain.info,
+                            mask=sig_mask, mask_params=SIG_MASK_PARAMS_DEFAULT,
+                            vmin=(-diff_abs if diff_abs > 0 else None), vmax=(+diff_abs if diff_abs > 0 else None),
+                        )
+                    except Exception:
+                        pass
+            # Diff annotation
+            try:
+                pct_mu = (10**(diff_mu) - 1.0) * 100.0
+                cl_txt = (_format_cluster_ann(cluster_p_min, cluster_k, cluster_mass) or fdr_txt) if DIFF_ANNOTATION_ENABLED else ""
+                label = f"Δ%_ROI={pct_mu:+.1f}%" + (f" | {cl_txt}" if cl_txt else "")
+                ax.text(0.5, 1.02, label, transform=ax.transAxes, ha="center", va="top", fontsize=8)
+            except Exception:
+                pass
+            # Column title
+            try:
+                axes[0, c].set_title(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=9, pad=4, y=1.04)
+            except Exception:
+                pass
+            # Per-column colorbars
             try:
                 sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs_pn, vmax=+vabs_pn), cmap=TOPO_CMAP)
                 sm_pn.set_array([])
-                cbar_pn = fig.colorbar(
-                    sm_pn, ax=[axes[r, 0], axes[r, 1]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
-                )
-                try:
-                    cbar_pn.set_label("log10(power/baseline)")
-                except Exception:
-                    pass
+                fig.colorbar(sm_pn, ax=[axes[0, c], axes[1, c]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
                 if diff_abs > 0:
                     sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-diff_abs, vcenter=0.0, vmax=diff_abs), cmap=TOPO_CMAP)
                     sm_diff.set_array([])
-                    cbar_diff = fig.colorbar(
-                        sm_diff, ax=axes[r, 3], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD
-                    )
-                    try:
-                        cbar_diff.set_label("log10(power/baseline)")
-                    except Exception:
-                        pass
+                    fig.colorbar(sm_diff, ax=axes[2, c], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
             except Exception:
                 pass
+        # Row labels and titles
         try:
+            axes[0, 0].set_ylabel(row_labels[0], fontsize=10)
+            axes[1, 0].set_ylabel(row_labels[1], fontsize=10)
+            axes[2, 0].set_ylabel(row_labels[2], fontsize=10)
             fig.suptitle(f"ROI: {roi} — Topomaps (baseline: logratio; t=[{tmin:.1f}, {tmax:.1f}] s)", fontsize=12)
-            # Removed bottom 'Conditions' label per request; keep frequency bands label
-            fig.supylabel("Frequency bands", fontsize=10)
+            fig.supxlabel("Frequency bands", fontsize=10)
         except Exception:
             pass
         _save_fig(
@@ -2159,7 +2750,7 @@ def plot_topomaps_bands_all_trials(
             )
         except Exception:
             _plot_topomap_on_ax(axes[r, 0], data, tfr_avg.info, vmin=vmin, vmax=vmax)
-        # Annotate scalp-mean over the plotted window (logratio and percent change) - EEG only
+        # Annotate scalp-mean percent change over the plotted window (EEG only)
         try:
             eeg_picks = mne.pick_types(tfr_avg.info, eeg=True, exclude=[])
             mu = float(np.nanmean(data[eeg_picks]))  # EEG channels only
@@ -2167,7 +2758,7 @@ def plot_topomaps_bands_all_trials(
             axes[r, 0].text(
                 0.5,
                 1.02,
-                f"\u0394\u03bc={mu:.3f} ({pct:+.0f}%)",
+                f"%Δ={pct:+.0f}%",
                 transform=axes[r, 0].transAxes,
                 ha="center",
                 va="top",
@@ -2196,6 +2787,1620 @@ def plot_topomaps_bands_all_trials(
         pass
     _save_fig(fig, out_dir, f"topomap_grid_bands_all_trials_baseline_logratio.png", formats=["png", "svg"])
 
+
+def _align_avg_tfrs(
+    tfr_list: List["mne.time_frequency.AverageTFR"],
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[Optional[mne.Info], Optional[np.ndarray]]:
+    """Align AverageTFR objects across subjects to common channels/freqs/times.
+
+    Returns (info_common, data_array) where data_array has shape
+    (n_subjects, n_channels, n_freqs, n_times). Subjects that do not match
+    the first subject's freqs/times are skipped.
+    """
+    if not tfr_list:
+        return None, None
+    # Filter out Nones just in case
+    tfr_list = [t for t in tfr_list if t is not None]
+    if not tfr_list:
+        return None, None
+    base = tfr_list[0]
+    base_times = np.asarray(base.times)
+    base_freqs = np.asarray(base.freqs)
+    base_chs = list(base.info["ch_names"])
+    keep: List[Tuple[str, "mne.time_frequency.AverageTFR"]] = [("S0", base)]
+    for i, tfr in enumerate(tfr_list[1:], start=1):
+        ok = np.allclose(tfr.times, base_times) and np.allclose(tfr.freqs, base_freqs)
+        if not ok:
+            if logger:
+                logger.warning(f"Skipping subject {i}: times/freqs mismatch for group alignment")
+            continue
+        keep.append((f"S{i}", tfr))
+    if len(keep) == 0:
+        return None, None
+    # Common channels intersection
+    ch_sets = [set(t.info["ch_names"]) for _, t in keep]
+    common = list(sorted(set.intersection(*ch_sets))) if ch_sets else []
+    if len(common) == 0:
+        if logger:
+            logger.warning("No common channels across subjects; cannot align")
+        return None, None
+    # Reorder each subject to common channel order
+    arrs = []
+    for tag, t in keep:
+        idxs = [t.info["ch_names"].index(ch) for ch in common]
+        arrs.append(np.asarray(t.data)[idxs, :, :])  # (n_ch_common, n_freqs, n_times)
+    data = np.stack(arrs, axis=0)
+    # Build aligned Info from base by picking common channels
+    pick_inds = [base_chs.index(ch) for ch in common]
+    info_common = mne.pick_info(base.info, pick_inds)
+    return info_common, data
+
+
+def _align_paired_avg_tfrs(
+    list_a: List["mne.time_frequency.AverageTFR"],
+    list_b: List["mne.time_frequency.AverageTFR"],
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[Optional[mne.Info], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Align paired AverageTFR lists across subjects to common channels/freqs/times.
+
+    Returns (info_common, data_a, data_b) with shapes:
+        - data_a: (n_subjects, n_channels, n_freqs, n_times)
+        - data_b: (n_subjects, n_channels, n_freqs, n_times)
+
+    Only retains subjects for which both A and B match the base times/freqs and
+    for which there is at least one common EEG channel across all retained pairs.
+    """
+    if not list_a or not list_b:
+        return None, None, None
+    n = min(len(list_a), len(list_b))
+    pairs = []
+    for i in range(n):
+        a = list_a[i]
+        b = list_b[i]
+        if a is None or b is None:
+            continue
+        pairs.append((a, b))
+    if not pairs:
+        return None, None, None
+    base_a, base_b = pairs[0]
+    base_times = np.asarray(base_a.times)
+    base_freqs = np.asarray(base_a.freqs)
+    keep: list[tuple["mne.time_frequency.AverageTFR", "mne.time_frequency.AverageTFR"]] = []
+    for idx, (a, b) in enumerate(pairs):
+        ok = (
+            np.allclose(a.times, base_times) and np.allclose(a.freqs, base_freqs)
+            and np.allclose(b.times, base_times) and np.allclose(b.freqs, base_freqs)
+        )
+        if not ok:
+            if logger:
+                logger.warning(f"Skipping subject pair {idx}: times/freqs mismatch for paired alignment")
+            continue
+        keep.append((a, b))
+    if not keep:
+        return None, None, None
+    # Compute common channel set across all pairs (intersection of A∩B per pair, then across pairs)
+    per_pair_common = []
+    for a, b in keep:
+        per_pair_common.append(set(a.info["ch_names"]) & set(b.info["ch_names"]))
+    common = list(sorted(set.intersection(*per_pair_common))) if per_pair_common else []
+    if len(common) == 0:
+        if logger:
+            logger.warning("Paired alignment: no common channels across retained pairs")
+        return None, None, None
+    # Stack aligned data in common channel order
+    data_a = []
+    data_b = []
+    for a, b in keep:
+        idx_a = [a.info["ch_names"].index(ch) for ch in common]
+        idx_b = [b.info["ch_names"].index(ch) for ch in common]
+        data_a.append(np.asarray(a.data)[idx_a, :, :])
+        data_b.append(np.asarray(b.data)[idx_b, :, :])
+    data_a_arr = np.stack(data_a, axis=0)
+    data_b_arr = np.stack(data_b, axis=0)
+    pick_inds = [base_a.info["ch_names"].index(ch) for ch in common]
+    info_common = mne.pick_info(base_a.info, pick_inds)
+    return info_common, data_a_arr, data_b_arr
+
+
+def _avg_alltrials_to_avg_tfr(power: "mne.time_frequency.EpochsTFR") -> "mne.time_frequency.AverageTFR":
+    """Return a baseline-corrected AverageTFR for all trials from an EpochsTFR."""
+    tfr_all = power.copy()
+    _apply_baseline_safe(tfr_all, baseline=BASELINE, mode="logratio")
+    return tfr_all.average()
+
+
+def _avg_by_mask_to_avg_tfr(
+    power: "mne.time_frequency.EpochsTFR",
+    mask: np.ndarray,
+) -> Optional["mne.time_frequency.AverageTFR"]:
+    try:
+        t = power.copy()[mask]
+        _apply_baseline_safe(t, baseline=BASELINE, mode="logratio")
+        return t.average()
+    except Exception:
+        return None
+
+
+def group_topomaps_bands_all_trials(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    out_dir: Path,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Group-level topomaps for all trials averaged (baseline logratio) across subjects."""
+    if not powers:
+        return
+    avg_list = []
+    for p in powers:
+        try:
+            avg_list.append(_avg_alltrials_to_avg_tfr(p))
+        except Exception:
+            continue
+    info_common, data = _align_avg_tfrs(avg_list, logger=logger)
+    if info_common is None or data is None:
+        if logger:
+            logger.warning("Group all-trials: no aligned data across subjects")
+        return
+    # data shape: (n_subj, n_ch, n_freqs, n_times)
+    mean_data = data.mean(axis=0)  # (n_ch, n_freqs, n_times)
+    freqs = np.asarray(avg_list[0].freqs)
+    times = np.asarray(avg_list[0].times)
+    fmax_available = float(freqs.max())
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
+    tmin_req, tmax_req = plateau_window
+    tmin = float(max(times.min(), tmin_req))
+    tmax = float(min(times.max(), tmax_req))
+    # Horizontal layout: 1 row x n_cols (bands)
+    n_cols = len(bands)
+    fig, axes = plt.subplots(1, n_cols, figsize=(4.8 * n_cols, 4.8))
+    if n_cols == 1:
+        axes = [axes]
+    # Reduce whitespace between columns similar to other horizontal grids
+    try:
+        plt.subplots_adjust(left=0.06, right=0.98, top=0.83, bottom=0.20, wspace=0.08)
+    except Exception:
+        pass
+
+    for c, (band, (fmin, fmax)) in enumerate(bands.items()):
+        fmax_eff = min(fmax, fmax_available)
+        ax = axes[c]
+        if fmin >= fmax_eff:
+            ax.axis('off')
+            continue
+        fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+        tmask = (times >= tmin) & (times < tmax)
+        if fmask.sum() == 0 or tmask.sum() == 0:
+            ax.axis('off')
+            continue
+        vec = mean_data[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+        vabs = _robust_sym_vlim(vec)
+        try:
+            mne.viz.plot_topomap(
+                vec,
+                info_common,
+                axes=ax,
+                show=False,
+                vlim=(-vabs, +vabs),
+                cmap=TOPO_CMAP,
+            )
+        except Exception:
+            _plot_topomap_on_ax(ax, vec, info_common, vmin=-vabs, vmax=+vabs)
+        # Annotate scalp-mean over EEG channels
+        try:
+            eeg_picks = mne.pick_types(info_common, eeg=True, exclude=[])
+            mu = float(np.nanmean(vec[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(vec))
+            pct = (10.0 ** (mu) - 1.0) * 100.0
+            ax.text(0.5, 1.02, f"%Δ={pct:+.0f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Put band label as title above each map
+        try:
+            ax.set_title(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=10)
+        except Exception:
+            pass
+        # Per-axes colorbar
+        try:
+            sm = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs, vmax=+vabs), cmap=TOPO_CMAP)
+            sm.set_array([])
+            fig.colorbar(sm, ax=ax, fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+        except Exception:
+            pass
+    try:
+        fig.suptitle(f"Group topomaps (all trials; baseline: logratio; t=[{tmin:.1f}, {tmax:.1f}] s)", fontsize=12)
+    except Exception:
+        pass
+    _save_fig(fig, out_dir, f"group_topomap_grid_bands_all_trials_baseline_logratio.png", formats=["png", "svg"], logger=logger)
+
+
+def group_topomaps_pain_nonpain(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Group-level pain vs non-pain topomaps (baseline logratio) and their difference.
+
+    Uses subjects that have valid pain/non-pain splits with at least one trial in each.
+    """
+    if not powers:
+        return
+    avg_pain: List["mne.time_frequency.AverageTFR"] = []
+    avg_non: List["mne.time_frequency.AverageTFR"] = []
+    for power, ev in zip(powers, events_by_subj):
+        if ev is None:
+            continue
+        # Find pain column
+        pain_col = None
+        for c in PAIN_BINARY_COLUMNS:
+            if c in ev.columns:
+                pain_col = c
+                break
+        if pain_col is None:
+            continue
+        vals = pd.to_numeric(ev[pain_col], errors="coerce").fillna(0).astype(int).values
+        pain_mask = np.asarray(vals == 1, dtype=bool)
+        non_mask = np.asarray(vals == 0, dtype=bool)
+        if pain_mask.sum() == 0 or non_mask.sum() == 0:
+            continue
+        a_p = _avg_by_mask_to_avg_tfr(power, pain_mask)
+        a_n = _avg_by_mask_to_avg_tfr(power, non_mask)
+        if a_p is not None and a_n is not None:
+            avg_pain.append(a_p)
+            avg_non.append(a_n)
+    if len(avg_pain) == 0 or len(avg_non) == 0:
+        if logger:
+            logger.warning("Group pain/non-pain: insufficient aligned subjects")
+        return
+    # Align paired across subjects to ensure pairing for t-tests
+    info_p, data_p, data_n = _align_paired_avg_tfrs(avg_pain, avg_non, logger=logger)
+    if info_p is None or data_p is None or data_n is None:
+        if logger:
+            logger.warning("Group pain/non-pain: could not align paired data")
+        return
+    n_subj = int(data_p.shape[0])
+    mean_p = data_p.mean(axis=0)
+    mean_n = data_n.mean(axis=0)
+    # Create per-band topomap grid similar to contrast_pain_nonpain_topomaps_rois (but no ROI)
+    fmax_available = float(np.max(avg_pain[0].freqs))
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
+    times = np.asarray(avg_pain[0].times)
+    tmin_req, tmax_req = plateau_window
+    tmin = float(max(times.min(), tmin_req))
+    tmax = float(min(times.max(), tmax_req))
+    # New layout: rows=Pain/Non/Diff, columns=bands
+    n_rows = 3
+    n_cols = len(bands)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 3.5 * n_rows), squeeze=False)
+    for c, (band, (fmin, fmax)) in enumerate(bands.items()):
+        fmax_eff = min(fmax, fmax_available)
+        if fmin >= fmax_eff:
+            for r in range(n_rows):
+                axes[r, c].axis('off')
+            continue
+        freqs = np.asarray(avg_pain[0].freqs)
+        times = np.asarray(avg_pain[0].times)
+        fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+        tmask = (times >= tmin) & (times < tmax)
+        if fmask.sum() == 0 or tmask.sum() == 0:
+            for r in range(n_rows):
+                axes[r, c].axis('off')
+            continue
+        v_p = mean_p[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+        v_n = mean_n[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+        v_d = v_p - v_n
+        vabs_pn = _robust_sym_vlim([v_p, v_n])
+        vabs_d = _robust_sym_vlim(v_d)
+        # Row 0: Pain
+        try:
+            mne.viz.plot_topomap(v_p, info_p, axes=axes[0, c], show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
+        except Exception:
+            _plot_topomap_on_ax(axes[0, c], v_p, info_p, vmin=-vabs_pn, vmax=+vabs_pn)
+        try:
+            eeg_picks = mne.pick_types(info_p, eeg=True, exclude=[])
+            mu_p = float(np.nanmean(v_p[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(v_p))
+            pct_p = (10.0 ** (mu_p) - 1.0) * 100.0
+            axes[0, c].text(0.5, 1.02, f"%Δ={pct_p:+.0f}%", transform=axes[0, c].transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Row 1: Non
+        try:
+            mne.viz.plot_topomap(v_n, info_p, axes=axes[1, c], show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
+        except Exception:
+            _plot_topomap_on_ax(axes[1, c], v_n, info_p, vmin=-vabs_pn, vmax=+vabs_pn)
+        try:
+            eeg_picks = mne.pick_types(info_p, eeg=True, exclude=[])
+            mu_n = float(np.nanmean(v_n[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(v_n))
+            pct_n = (10.0 ** (mu_n) - 1.0) * 100.0
+            axes[1, c].text(0.5, 1.02, f"%Δ={pct_n:+.0f}%", transform=axes[1, c].transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Row 2: Diff with significance gating
+        sig_mask = None; cluster_p_min = cluster_k = cluster_mass = None; fdr_txt = ""
+        try:
+            subj_p = data_p[:, :, fmask, :][:, :, :, tmask].mean(axis=(2, 3))
+            subj_n = data_n[:, :, fmask, :][:, :, :, tmask].mean(axis=(2, 3))
+            if DIFF_ANNOTATION_ENABLED:
+                sig_mask, cluster_p_min, cluster_k, cluster_mass = _cluster_test_two_sample_arrays(
+                    subj_p, subj_n, info_p, alpha=SIG_ALPHA, paired=True, n_permutations=CLUSTER_N_PERM
+                )
+                if sig_mask is None:
+                    try:
+                        res = ttest_rel(subj_p, subj_n, axis=0, nan_policy="omit")
+                        p_ch = np.asarray(res.pvalue)
+                        sig_mask = _fdr_bh_mask(p_ch, alpha=SIG_ALPHA)
+                        rej, q = _fdr_bh_values(p_ch, alpha=SIG_ALPHA)
+                        if q is not None:
+                            q_min = float(np.nanmin(q))
+                            k_rej = int(np.nansum(rej)) if rej is not None else int(np.sum(p_ch < SIG_ALPHA))
+                            fdr_txt = _format_fdr_ann(q_min, k_rej)
+                    except Exception:
+                        sig_mask = None
+        except Exception:
+            sig_mask = None
+        try:
+            mne.viz.plot_topomap(
+                v_d, info_p, axes=axes[2, c], show=False, vlim=(-vabs_d, +vabs_d), cmap=TOPO_CMAP,
+                mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None), mask_params=SIG_MASK_PARAMS_DEFAULT,
+            )
+        except Exception:
+            _plot_topomap_on_ax(
+                axes[2, c], v_d, info_p, vmin=-vabs_d, vmax=+vabs_d,
+                mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None), mask_params=SIG_MASK_PARAMS_DEFAULT,
+            )
+        try:
+            mu_d = float(np.nanmean(v_d)); pct_d = (10.0 ** (mu_d) - 1.0) * 100.0
+            cl_txt = (_format_cluster_ann(cluster_p_min, cluster_k, cluster_mass) or fdr_txt) if DIFF_ANNOTATION_ENABLED else ""
+            label = f"Δ%={pct_d:+.1f}%" + (f" | {cl_txt}" if cl_txt else "")
+            axes[2, c].text(0.5, 1.02, label, transform=axes[2, c].transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Column title (band)
+        try:
+            axes[0, c].set_title(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=9, pad=4, y=1.04)
+        except Exception:
+            pass
+        # Per-column colorbars
+        try:
+            sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs_pn, vmax=+vabs_pn), cmap=TOPO_CMAP)
+            sm_pn.set_array([])
+            fig.colorbar(sm_pn, ax=[axes[0, c], axes[1, c]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            sm_d = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-vabs_d, vcenter=0.0, vmax=vabs_d), cmap=TOPO_CMAP)
+            sm_d.set_array([])
+            fig.colorbar(sm_d, ax=axes[2, c], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+        except Exception:
+            pass
+    # Row labels and save
+    try:
+        axes[0, 0].set_ylabel("Pain", fontsize=10)
+        axes[1, 0].set_ylabel("Non-pain", fontsize=10)
+        axes[2, 0].set_ylabel("Pain - Non", fontsize=10)
+        fig.suptitle("Group topomaps: Pain vs Non-pain (baseline logratio)", fontsize=12)
+        fig.supxlabel("Frequency bands", fontsize=10)
+    except Exception:
+        pass
+    _ensure_dir(out_dir)
+    _save_fig(fig, out_dir, "group_topomap_grid_bands_pain_vs_nonpain_baseline_logratio.png", formats=["png", "svg"], logger=logger)
+
+
+def group_pain_nonpain_temporal_topomaps(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    window_count: int = 5,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Group temporal topomaps: pain vs non across multiple windows and bands.
+
+    - Builds per-subject AverageTFR for pain and non, aligns across subjects, averages to group.
+    - Splits the plateau interval into `window_count` equal windows.
+    - Rows: Pain, Non-pain, Difference; Columns: windows; separate figure per band.
+    """
+    if not powers:
+        return
+    avg_pain: List["mne.time_frequency.AverageTFR"] = []
+    avg_non: List["mne.time_frequency.AverageTFR"] = []
+    for power, ev in zip(powers, events_by_subj):
+        if ev is None:
+            continue
+        pain_col = None
+        for c in PAIN_BINARY_COLUMNS:
+            if c in ev.columns:
+                pain_col = c
+                break
+        if pain_col is None:
+            continue
+        vals = pd.to_numeric(ev[pain_col], errors="coerce").fillna(0).astype(int).values
+        pain_mask = np.asarray(vals == 1, dtype=bool)
+        non_mask = np.asarray(vals == 0, dtype=bool)
+        if pain_mask.sum() == 0 or non_mask.sum() == 0:
+            continue
+        a_p = _avg_by_mask_to_avg_tfr(power, pain_mask)
+        a_n = _avg_by_mask_to_avg_tfr(power, non_mask)
+        if a_p is not None and a_n is not None:
+            avg_pain.append(a_p)
+            avg_non.append(a_n)
+    if len(avg_pain) < 2 or len(avg_non) < 2:
+        if logger:
+            logger.warning("Group temporal topomaps: insufficient subjects with pain/non trials")
+        return
+    info_p, data_p, data_n = _align_paired_avg_tfrs(avg_pain, avg_non, logger=logger)
+    if info_p is None or data_p is None or data_n is None:
+        if logger:
+            logger.warning("Group temporal topomaps: could not align paired pain/non data")
+        return
+    mean_p = data_p.mean(axis=0)  # (n_ch, n_freqs, n_times)
+    mean_n = data_n.mean(axis=0)
+    freqs = np.asarray(avg_pain[0].freqs)
+    times = np.asarray(avg_pain[0].times)
+    # Plateau windows
+    tmin_req, tmax_req = plateau_window
+    tmin = float(max(times.min(), tmin_req))
+    tmax = float(min(times.max(), tmax_req))
+    if not np.isfinite(tmin) or not np.isfinite(tmax) or tmax <= tmin:
+        if logger:
+            logger.warning("Group temporal topomaps: invalid plateau window after clipping")
+        return
+    edges = np.linspace(tmin, tmax, int(window_count) + 1)
+    win_starts = edges[:-1]
+    win_ends = edges[1:]
+
+    fmax_available = float(freqs.max())
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
+    for band_name, (fmin, fmax) in bands.items():
+        fmax_eff = min(fmax, fmax_available)
+        if fmin >= fmax_eff:
+            continue
+        # Precompute masks for performance
+        fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+        # Collect vectors per window for scaling
+        pain_vecs = []
+        non_vecs = []
+        diff_vecs = []
+        for w_start, w_end in zip(win_starts, win_ends):
+            tmask = (times >= w_start) & (times < w_end)
+            if fmask.sum() == 0 or tmask.sum() == 0:
+                pain_vecs.append(None); non_vecs.append(None); diff_vecs.append(None)
+                continue
+            v_p = mean_p[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            v_n = mean_n[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            pain_vecs.append(v_p)
+            non_vecs.append(v_n)
+            diff_vecs.append(v_p - v_n)
+        vals = [v for v in (pain_vecs + non_vecs) if v is not None]
+        if len(vals) == 0:
+            continue
+        vabs_cond = _robust_sym_vlim(vals)
+        diff_vals = [v for v in diff_vecs if v is not None]
+        vabs_diff = _robust_sym_vlim(diff_vals) if len(diff_vals) > 0 else vabs_cond
+
+        n_rows = 3
+        n_cols = len(win_starts)
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(3.0 * n_cols, 9.0),
+            squeeze=False,
+            gridspec_kw={"hspace": 0.08, "wspace": 0.2},
+        )
+        for col, (w_start, w_end) in enumerate(zip(win_starts, win_ends)):
+            # Title per column
+            try:
+                axes[0, col].set_title(f"{w_start:.1f}-{w_end:.1f}s", fontsize=10, pad=10)
+            except Exception:
+                pass
+            v_p = pain_vecs[col]
+            v_n = non_vecs[col]
+            v_d = diff_vecs[col]
+            # Pain row 0
+            if v_p is not None:
+                try:
+                    mne.viz.plot_topomap(v_p, info_p, axes=axes[0, col], show=False, vlim=(-vabs_cond, +vabs_cond), cmap=TOPO_CMAP)
+                except Exception:
+                    _plot_topomap_on_ax(axes[0, col], v_p, info_p, vmin=-vabs_cond, vmax=+vabs_cond)
+                try:
+                    eeg_picks = mne.pick_types(info_p, eeg=True, exclude=[])
+                    mu = float(np.nanmean(v_p[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(v_p))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    axes[0, col].text(0.5, 1.02, f"%Δ={pct:+.0f}%", transform=axes[0, col].transAxes, ha="center", va="bottom", fontsize=8)
+                except Exception:
+                    pass
+            else:
+                axes[0, col].axis('off')
+            # Non row 1
+            if v_n is not None:
+                try:
+                    mne.viz.plot_topomap(v_n, info_p, axes=axes[1, col], show=False, vlim=(-vabs_cond, +vabs_cond), cmap=TOPO_CMAP)
+                except Exception:
+                    _plot_topomap_on_ax(axes[1, col], v_n, info_p, vmin=-vabs_cond, vmax=+vabs_cond)
+                try:
+                    eeg_picks = mne.pick_types(info_p, eeg=True, exclude=[])
+                    mu = float(np.nanmean(v_n[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(v_n))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    axes[1, col].text(0.5, 1.02, f"%Δ={pct:+.0f}%", transform=axes[1, col].transAxes, ha="center", va="bottom", fontsize=8)
+                except Exception:
+                    pass
+            else:
+                axes[1, col].axis('off')
+            # Diff row 2
+            if v_d is not None:
+                sig_mask = None
+                p_min_window = k_win = mass_win = None
+                fdr_txt = ""
+                # Compute significance only if annotations are enabled
+                if DIFF_ANNOTATION_ENABLED:
+                    try:
+                        tmask_w = (times >= w_start) & (times < w_end)
+                        subj_p = data_p[:, :, fmask, :][:, :, :, tmask_w].mean(axis=(2, 3))
+                        subj_n = data_n[:, :, fmask, :][:, :, :, tmask_w].mean(axis=(2, 3))
+                        sig_mask, p_min_window, k_win, mass_win = _cluster_test_two_sample_arrays(
+                            subj_p, subj_n, info_p, alpha=SIG_ALPHA, paired=True, n_permutations=CLUSTER_N_PERM
+                        )
+                    except Exception:
+                        sig_mask, p_min_window, k_win, mass_win = None, None, None, None
+                    if sig_mask is None:
+                        # FDR fallback across sensors using paired t across subjects
+                        try:
+                            res = ttest_rel(subj_p, subj_n, axis=0, nan_policy="omit")
+                            p_ch = np.asarray(res.pvalue)
+                            sig_mask = _fdr_bh_mask(p_ch, alpha=SIG_ALPHA)
+                            rej, q = _fdr_bh_values(p_ch, alpha=SIG_ALPHA)
+                            if q is not None:
+                                q_min = float(np.nanmin(q))
+                                k_rej = int(np.nansum(rej)) if rej is not None else int(np.sum(p_ch < SIG_ALPHA))
+                                fdr_txt = _format_fdr_ann(q_min, k_rej)
+                        except Exception:
+                            sig_mask = None
+                try:
+                    mne.viz.plot_topomap(
+                        v_d,
+                        info_p,
+                        axes=axes[2, col],
+                        show=False,
+                        vlim=(-vabs_diff, +vabs_diff),
+                        cmap=TOPO_CMAP,
+                        mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None),
+                        mask_params=SIG_MASK_PARAMS_DEFAULT,
+                    )
+                except Exception:
+                    _plot_topomap_on_ax(
+                        axes[2, col],
+                        v_d,
+                        info_p,
+                        vmin=-vabs_diff,
+                        vmax=+vabs_diff,
+                        mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None),
+                        mask_params=SIG_MASK_PARAMS_DEFAULT,
+                    )
+                try:
+                    mu = float(np.nanmean(v_d))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    # Cluster/FDR annotation only when enabled
+                    cl_txt = (_format_cluster_ann(p_min_window, k_win, mass_win) or fdr_txt) if DIFF_ANNOTATION_ENABLED else ""
+                    if cl_txt:
+                        axes[2, col].set_title(f"Δ%={pct:+.1f}% | {cl_txt}", fontsize=8, pad=10, y=1.06)
+                    else:
+                        axes[2, col].set_title(f"Δ%={pct:+.1f}%", fontsize=8, pad=10, y=1.06)
+                except Exception:
+                    pass
+            else:
+                axes[2, col].axis('off')
+        # Labels
+        try:
+            axes[0, 0].set_ylabel("Pain", fontsize=10)
+            axes[1, 0].set_ylabel("Non-pain", fontsize=10)
+            axes[2, 0].set_ylabel("Pain - Non", fontsize=10)
+        except Exception:
+            pass
+        # Row colorbars
+        try:
+            sm_cond = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs_cond, vmax=+vabs_cond), cmap=TOPO_CMAP)
+            sm_cond.set_array([])
+            fig.colorbar(sm_cond, ax=axes[0:2, :].ravel().tolist(), fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-vabs_diff, vcenter=0.0, vmax=vabs_diff), cmap=TOPO_CMAP)
+            sm_diff.set_array([])
+            fig.colorbar(sm_diff, ax=axes[2, :].ravel().tolist(), fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+        except Exception:
+            pass
+        # Title and save
+        try:
+            fig.suptitle(
+                f"Group Temporal Topomaps: Pain vs Non-pain — {band_name} (t=[{tmin:.1f},{tmax:.1f}]s; {len(win_starts)} windows)",
+                fontsize=12,
+            )
+        except Exception:
+            pass
+        band_suffix = band_name.lower()
+        fname = f"group_temporal_topomaps_pain_vs_nonpain_{band_suffix}_plateau_{tmin:.0f}-{tmax:.0f}s_{len(win_starts)}windows.png"
+        _save_fig(fig, out_dir, fname, formats=["png", "svg"], logger=logger)
+
+
+def group_maxmin_temperature_temporal_topomaps(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    window_count: int = 5,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Group temporal topomaps: max vs min temperature across multiple windows and bands.
+
+    - Finds global min and max temperature levels across subjects (rounded to 0.1°C)
+    - Builds paired per-subject AverageTFRs and aligns them
+    - Splits the plateau into `window_count` equal windows
+    - Rows: Max temp, Min temp, Difference; Columns: windows; separate figure per band
+    """
+    if not powers:
+        return
+    temps = _collect_group_temperatures(events_by_subj)
+    if len(temps) < 2:
+        if logger:
+            logger.warning("Group temporal (max/min): fewer than 2 temperature levels; skipping")
+        return
+    t_min = float(min(temps)); t_max = float(max(temps))
+
+    # Build per-subject AverageTFR pairs for min and max temps (paired across same subjects)
+    avg_min: List["mne.time_frequency.AverageTFR"] = []
+    avg_max: List["mne.time_frequency.AverageTFR"] = []
+    for power, ev in zip(powers, events_by_subj):
+        if ev is None:
+            continue
+        tcol = None
+        for c in TEMPERATURE_COLUMNS:
+            if c in ev.columns:
+                tcol = c
+                break
+        if tcol is None:
+            continue
+        try:
+            vals = pd.to_numeric(ev[tcol], errors="coerce").round(1)
+        except Exception:
+            continue
+        mask_min = np.asarray(vals == round(t_min, 1), dtype=bool)
+        mask_max = np.asarray(vals == round(t_max, 1), dtype=bool)
+        if mask_min.sum() == 0 or mask_max.sum() == 0:
+            continue
+        a_min = _avg_by_mask_to_avg_tfr(power, mask_min)
+        a_max = _avg_by_mask_to_avg_tfr(power, mask_max)
+        if a_min is not None and a_max is not None:
+            avg_min.append(a_min)
+            avg_max.append(a_max)
+
+    if len(avg_min) < 2 or len(avg_max) < 2:
+        if logger:
+            logger.warning("Group temporal (max/min): insufficient subjects with both min and max trials")
+        return
+    info_c, data_min, data_max = _align_paired_avg_tfrs(avg_min, avg_max, logger=logger)
+    if info_c is None or data_min is None or data_max is None:
+        if logger:
+            logger.warning("Group temporal (max/min): could not align paired min/max data")
+        return
+
+    mean_min = data_min.mean(axis=0)
+    mean_max = data_max.mean(axis=0)
+    freqs = np.asarray(avg_min[0].freqs if avg_min else avg_max[0].freqs)
+    times = np.asarray(avg_min[0].times if avg_min else avg_max[0].times)
+
+    # Plateau windows
+    tmin_req, tmax_req = plateau_window
+    tmin = float(max(times.min(), tmin_req))
+    tmax = float(min(times.max(), tmax_req))
+    if not np.isfinite(tmin) or not np.isfinite(tmax) or tmax <= tmin:
+        if logger:
+            logger.warning("Group temporal (max/min): invalid plateau window after clipping")
+        return
+    edges = np.linspace(tmin, tmax, int(window_count) + 1)
+    win_starts = edges[:-1]
+    win_ends = edges[1:]
+
+    fmax_available = float(freqs.max())
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
+    for band_name, (fmin, fmax) in bands.items():
+        fmax_eff = min(fmax, fmax_available)
+        if fmin >= fmax_eff:
+            continue
+        fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+        # Collect vectors per window for scaling
+        max_vecs = []
+        min_vecs = []
+        diff_vecs = []
+        for w_start, w_end in zip(win_starts, win_ends):
+            tmask = (times >= w_start) & (times < w_end)
+            if fmask.sum() == 0 or tmask.sum() == 0:
+                max_vecs.append(None); min_vecs.append(None); diff_vecs.append(None)
+                continue
+            v_max = mean_max[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            v_min = mean_min[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            max_vecs.append(v_max)
+            min_vecs.append(v_min)
+            diff_vecs.append(v_max - v_min)
+        vals = [v for v in (max_vecs + min_vecs) if v is not None]
+        if len(vals) == 0:
+            continue
+        vabs_cond = _robust_sym_vlim(vals)
+        diff_vals = [v for v in diff_vecs if v is not None]
+        vabs_diff = _robust_sym_vlim(diff_vals) if len(diff_vals) > 0 else vabs_cond
+
+        n_rows = 3
+        n_cols = len(win_starts)
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(3.0 * n_cols, 9.0),
+            squeeze=False,
+            gridspec_kw={"hspace": 0.08, "wspace": 0.2},
+        )
+        for col, (w_start, w_end) in enumerate(zip(win_starts, win_ends)):
+            # Title per column
+            try:
+                axes[0, col].set_title(f"{w_start:.1f}-{w_end:.1f}s", fontsize=10, pad=10)
+            except Exception:
+                pass
+            v_max = max_vecs[col]
+            v_min = min_vecs[col]
+            v_diff = diff_vecs[col]
+            # Row 0: Max
+            if v_max is not None:
+                try:
+                    mne.viz.plot_topomap(v_max, info_c, axes=axes[0, col], show=False, vlim=(-vabs_cond, +vabs_cond), cmap=TOPO_CMAP)
+                except Exception:
+                    _plot_topomap_on_ax(axes[0, col], v_max, info_c, vmin=-vabs_cond, vmax=+vabs_cond)
+                try:
+                    eeg_picks = mne.pick_types(info_c, eeg=True, exclude=[])
+                    mu = float(np.nanmean(v_max[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(v_max))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    axes[0, col].text(0.5, 1.02, f"%Δ={pct:+.0f}%", transform=axes[0, col].transAxes, ha="center", va="bottom", fontsize=8)
+                except Exception:
+                    pass
+            else:
+                axes[0, col].axis('off')
+            # Row 1: Min
+            if v_min is not None:
+                try:
+                    mne.viz.plot_topomap(v_min, info_c, axes=axes[1, col], show=False, vlim=(-vabs_cond, +vabs_cond), cmap=TOPO_CMAP)
+                except Exception:
+                    _plot_topomap_on_ax(axes[1, col], v_min, info_c, vmin=-vabs_cond, vmax=+vabs_cond)
+                try:
+                    eeg_picks = mne.pick_types(info_c, eeg=True, exclude=[])
+                    mu = float(np.nanmean(v_min[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(v_min))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    axes[1, col].text(0.5, 1.02, f"%Δ={pct:+.0f}%", transform=axes[1, col].transAxes, ha="center", va="bottom", fontsize=8)
+                except Exception:
+                    pass
+            else:
+                axes[1, col].axis('off')
+            # Row 2: Diff with significance gating
+            if v_diff is not None:
+                sig_mask = None
+                p_min_window = k_win = mass_win = None
+                fdr_txt = ""
+                if DIFF_ANNOTATION_ENABLED:
+                    try:
+                        tmask_w = (times >= w_start) & (times < w_end)
+                        subj_max = data_max[:, :, fmask, :][:, :, :, tmask_w].mean(axis=(2, 3))
+                        subj_min = data_min[:, :, fmask, :][:, :, :, tmask_w].mean(axis=(2, 3))
+                        sig_mask, p_min_window, k_win, mass_win = _cluster_test_two_sample_arrays(
+                            subj_max, subj_min, info_c, alpha=SIG_ALPHA, paired=True, n_permutations=CLUSTER_N_PERM
+                        )
+                    except Exception:
+                        sig_mask, p_min_window, k_win, mass_win = None, None, None, None
+                    if sig_mask is None:
+                        try:
+                            res = ttest_rel(subj_max, subj_min, axis=0, nan_policy="omit")
+                            p_ch = np.asarray(res.pvalue)
+                            sig_mask = _fdr_bh_mask(p_ch, alpha=SIG_ALPHA)
+                            rej, q = _fdr_bh_values(p_ch, alpha=SIG_ALPHA)
+                            if q is not None:
+                                q_min = float(np.nanmin(q))
+                                k_rej = int(np.nansum(rej)) if rej is not None else int(np.sum(p_ch < SIG_ALPHA))
+                                fdr_txt = _format_fdr_ann(q_min, k_rej)
+                        except Exception:
+                            sig_mask = None
+                try:
+                    mne.viz.plot_topomap(
+                        v_diff,
+                        info_c,
+                        axes=axes[2, col],
+                        show=False,
+                        vlim=(-vabs_diff, +vabs_diff),
+                        cmap=TOPO_CMAP,
+                        mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None),
+                        mask_params=SIG_MASK_PARAMS_DEFAULT,
+                    )
+                except Exception:
+                    _plot_topomap_on_ax(
+                        axes[2, col],
+                        v_diff,
+                        info_c,
+                        vmin=-vabs_diff,
+                        vmax=+vabs_diff,
+                        mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None),
+                        mask_params=SIG_MASK_PARAMS_DEFAULT,
+                    )
+                try:
+                    mu = float(np.nanmean(v_diff))
+                    pct = (10.0 ** (mu) - 1.0) * 100.0
+                    cl_txt = (_format_cluster_ann(p_min_window, k_win, mass_win) or fdr_txt) if DIFF_ANNOTATION_ENABLED else ""
+                    if cl_txt:
+                        axes[2, col].set_title(f"Δ%={pct:+.1f}% | {cl_txt}", fontsize=8, pad=10, y=1.06)
+                    else:
+                        axes[2, col].set_title(f"Δ%={pct:+.1f}%", fontsize=8, pad=10, y=1.06)
+                except Exception:
+                    pass
+            else:
+                axes[2, col].axis('off')
+        # Labels
+        try:
+            axes[0, 0].set_ylabel(f"Max {t_max:.1f}°C", fontsize=10)
+            axes[1, 0].set_ylabel(f"Min {t_min:.1f}°C", fontsize=10)
+            axes[2, 0].set_ylabel("Max - Min", fontsize=10)
+        except Exception:
+            pass
+        # Row colorbars
+        try:
+            sm_cond = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs_cond, vmax=+vabs_cond), cmap=TOPO_CMAP)
+            sm_cond.set_array([])
+            fig.colorbar(sm_cond, ax=axes[0:2, :].ravel().tolist(), fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            sm_diff = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-vabs_diff, vcenter=0.0, vmax=vabs_diff), cmap=TOPO_CMAP)
+            sm_diff.set_array([])
+            fig.colorbar(sm_diff, ax=axes[2, :].ravel().tolist(), fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+        except Exception:
+            pass
+        # Title and save
+        try:
+            fig.suptitle(
+                f"Group Temporal Topomaps: Max vs Min temperature — {band_name} (t=[{tmin:.1f},{tmax:.1f}]s; {len(win_starts)} windows)",
+                fontsize=12,
+            )
+        except Exception:
+            pass
+        band_suffix = band_name.lower()
+        fname = f"group_temporal_topomaps_max_vs_min_temp_{band_suffix}_plateau_{tmin:.0f}-{tmax:.0f}s_{len(win_starts)}windows.png"
+        _save_fig(fig, out_dir, fname, formats=["png", "svg"], logger=logger)
+
+def _collect_group_temperatures(events_by_subj: List[Optional[pd.DataFrame]]) -> list[float]:
+    temps: set[float] = set()
+    for ev in events_by_subj:
+        if ev is None:
+            continue
+        # Find temperature column
+        tcol = None
+        for c in TEMPERATURE_COLUMNS:
+            if c in ev.columns:
+                tcol = c
+                break
+        if tcol is None:
+            continue
+        try:
+            vals = pd.to_numeric(ev[tcol], errors="coerce").round(1).dropna().unique()
+            for v in vals:
+                try:
+                    temps.add(float(v))
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return sorted(temps)
+
+
+def group_topomap_grid_baseline_temps(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Group Δ=log10(power/baseline) topomap grid: All trials + per-temperature across bands."""
+    if not powers:
+        return
+    # All trials per-subject AverageTFR
+    avg_all: List["mne.time_frequency.AverageTFR"] = []
+    for p in powers:
+        try:
+            avg_all.append(_avg_alltrials_to_avg_tfr(p))
+        except Exception:
+            continue
+    info_all, data_all = _align_avg_tfrs(avg_all, logger=logger)
+    if info_all is None or data_all is None:
+        if logger:
+            logger.warning("Group temperature grid: could not align all-trials TFRs")
+        return
+    mean_all = data_all.mean(axis=0)  # (n_ch, n_freqs, n_times)
+
+    # Determine temperature levels across group
+    temps = _collect_group_temperatures(events_by_subj)
+    # Build per-temp group mean Averages
+    cond_map: Dict[str, Tuple[mne.Info, np.ndarray, int, float]] = {}
+    # Add All trials first (label, info, data, N, nan tval)
+    cond_map["All trials"] = (info_all, mean_all, data_all.shape[0], float("nan"))
+    for tval in temps:
+        avg_list: List["mne.time_frequency.AverageTFR"] = []
+        for p, ev in zip(powers, events_by_subj):
+            if ev is None:
+                continue
+            tcol = None
+            for c in TEMPERATURE_COLUMNS:
+                if c in ev.columns:
+                    tcol = c
+                    break
+            if tcol is None:
+                continue
+            try:
+                mask = pd.to_numeric(ev[tcol], errors="coerce").round(1) == round(float(tval), 1)
+            except Exception:
+                continue
+            mask = np.asarray(mask, dtype=bool)
+            if mask.sum() == 0:
+                continue
+            a = _avg_by_mask_to_avg_tfr(p, mask)
+            if a is not None:
+                avg_list.append(a)
+        if not avg_list:
+            continue
+        info_t, data_t = _align_avg_tfrs(avg_list, logger=logger)
+        if info_t is None or data_t is None:
+            continue
+        mean_t = data_t.mean(axis=0)
+        cond_map[f"{tval:.1f}°C"] = (info_t, mean_t, data_t.shape[0], float(tval))
+
+    if len(cond_map) <= 1:
+        if logger:
+            logger.warning("Group temperature grid: no temperature-specific data available")
+        return
+
+    # Plot: rows=bands, cols=conditions (All + per-temperature)
+    # Build ordered columns
+    labels = list(cond_map.keys())
+    # Use first entry to get freqs/times (should be consistent post-alignment)
+    any_info, any_data, _, _ = next(iter(cond_map.values()))
+    freqs = np.asarray(avg_all[0].freqs)
+    times = np.asarray(avg_all[0].times)
+    fmax_available = float(freqs.max())
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
+    tmin_req, tmax_req = plateau_window
+    tmin = float(max(times.min(), tmin_req))
+    tmax = float(min(times.max(), tmax_req))
+
+    n_rows = len(bands)
+    n_cols = len(labels)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3.6 * n_cols, 3.6 * n_rows),
+        squeeze=False,
+        gridspec_kw={"wspace": 0.18, "hspace": 0.35},
+    )
+
+    for r, (band, (fmin, fmax)) in enumerate(bands.items()):
+        fmax_eff = min(fmax, fmax_available)
+        if fmin >= fmax_eff:
+            for c in range(n_cols):
+                axes[r, c].axis('off')
+            continue
+        # Gather vectors for vlim across columns
+        col_vecs: List[np.ndarray] = []
+        for label in labels:
+            info_c, data_c, _, _ = cond_map[label]
+            freqs_c = freqs  # aligned selections guarantee same freqs
+            times_c = times
+            fmask = (freqs_c >= fmin) & (freqs_c <= fmax_eff)
+            tmask = (times_c >= tmin) & (times_c < tmax)
+            if fmask.sum() == 0 or tmask.sum() == 0:
+                col_vecs.append(None)
+                continue
+            vec = data_c[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            col_vecs.append(vec)
+        vals = [v for v in col_vecs if v is not None]
+        if len(vals) == 0:
+            for c in range(n_cols):
+                axes[r, c].axis('off')
+            continue
+        vabs = _robust_sym_vlim(vals)
+        for c, label in enumerate(labels):
+            ax = axes[r, c]
+            info_c, data_c, nsub, tval = cond_map[label]
+            fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+            tmask = (times >= tmin) & (times < tmax)
+            if fmask.sum() == 0 or tmask.sum() == 0:
+                ax.axis('off')
+                continue
+            vec = data_c[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            try:
+                mne.viz.plot_topomap(
+                    vec,
+                    info_c,
+                    axes=ax,
+                    show=False,
+                    vlim=(-vabs, +vabs),
+                    cmap=TOPO_CMAP,
+                )
+            except Exception:
+                _plot_topomap_on_ax(ax, vec, info_c, vmin=-vabs, vmax=+vabs)
+            # Title with N subjects for this condition
+            try:
+                title = f"{label} (n={nsub})"
+                ax.set_title(title, fontsize=9, pad=2)
+            except Exception:
+                pass
+            # Annotate scalp-mean (percent change)
+            try:
+                eeg_picks = mne.pick_types(info_c, eeg=True, exclude=[])
+                mu = float(np.nanmean(vec[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(vec))
+                pct = (10.0 ** (mu) - 1.0) * 100.0
+                ax.text(0.5, 1.01, f"%Δ={pct:+.0f}%", transform=ax.transAxes, ha="center", va="top", fontsize=8)
+            except Exception:
+                pass
+            
+        axes[r, 0].set_ylabel(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)")
+        # Row colorbar
+        try:
+            sm = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs, vmax=+vabs), cmap=TOPO_CMAP)
+            sm.set_array([])
+            fig.colorbar(sm, ax=axes[r, :].ravel().tolist(), fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+        except Exception:
+            pass
+    try:
+        fig.suptitle(
+            f"Group Δ=log10(power/baseline) by temperature (t=[{tmin:.1f}, {tmax:.1f}] s)",
+            fontsize=12,
+        )
+    except Exception:
+        pass
+    _save_fig(
+        fig,
+        out_dir,
+        "group_topomap_grid_bands_by_temperature_baseline_logratio.png",
+        formats=["png", "svg"],
+        logger=logger,
+    )
+
+
+def group_contrast_maxmin_temperature(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Group topomap grid comparing highest vs lowest temperature (baseline logratio).
+
+    - Columns: [Max temp, Min temp, spacer, Max - Min]
+    - Rows: frequency bands from configuration
+    - Uses global min/max temperature across subjects (rounded to 0.1°C); subjects
+      without that level are excluded for that condition.
+    """
+    if not powers:
+        return
+    temps = _collect_group_temperatures(events_by_subj)
+    if len(temps) < 2:
+        if logger:
+            logger.info("Group max/min: fewer than 2 temperature levels; skipping")
+        return
+    t_min = float(min(temps)); t_max = float(max(temps))
+
+    # Build per-subject AverageTFR pairs for min and max temps (paired across same subjects)
+    avg_min: List["mne.time_frequency.AverageTFR"] = []
+    avg_max: List["mne.time_frequency.AverageTFR"] = []
+    for power, ev in zip(powers, events_by_subj):
+        if ev is None:
+            continue
+        tcol = None
+        for c in TEMPERATURE_COLUMNS:
+            if c in ev.columns:
+                tcol = c
+                break
+        if tcol is None:
+            continue
+        try:
+            vals = pd.to_numeric(ev[tcol], errors="coerce").round(1)
+        except Exception:
+            continue
+        mask_min = np.asarray(vals == round(t_min, 1), dtype=bool)
+        mask_max = np.asarray(vals == round(t_max, 1), dtype=bool)
+        if mask_min.sum() == 0 or mask_max.sum() == 0:
+            continue
+        a_min = _avg_by_mask_to_avg_tfr(power, mask_min)
+        a_max = _avg_by_mask_to_avg_tfr(power, mask_max)
+        if a_min is not None and a_max is not None:
+            avg_min.append(a_min)
+            avg_max.append(a_max)
+
+    info_common, data_min, data_max = _align_paired_avg_tfrs(avg_min, avg_max, logger=logger)
+    if info_common is None or data_min is None or data_max is None:
+        if logger:
+            logger.info("Group max/min: could not align paired min/max TFRs; skipping")
+        return
+
+    mean_min = data_min.mean(axis=0)  # (n_ch, n_freqs, n_times)
+    mean_max = data_max.mean(axis=0)
+    freqs = np.asarray(avg_min[0].freqs if avg_min else avg_max[0].freqs)
+    times = np.asarray(avg_min[0].times if avg_min else avg_max[0].times)
+    fmax_available = float(freqs.max())
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
+    tmin_req, tmax_req = plateau_window
+    tmin = float(max(times.min(), tmin_req)); tmax = float(min(times.max(), tmax_req))
+
+    # New layout: rows are Max/Min/Diff; columns are bands
+    n_rows = 3
+    n_cols = len(bands)
+    row_labels = [f"Max {t_max:.1f}°C (n={data_max.shape[0]})", f"Min {t_min:.1f}°C (n={data_min.shape[0]})", "Max - Min"]
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 3.5 * n_rows), squeeze=False, gridspec_kw={"wspace": 0.3, "hspace": 0.3})
+    for c, (band, (fmin, fmax)) in enumerate(bands.items()):
+        fmax_eff = min(fmax, fmax_available)
+        if fmin >= fmax_eff:
+            for r in range(n_rows):
+                axes[r, c].axis('off')
+            continue
+        fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+        tmask = (times >= tmin) & (times < tmax)
+        if fmask.sum() == 0 or tmask.sum() == 0:
+            for r in range(n_rows):
+                axes[r, c].axis('off')
+            continue
+        v_max = mean_max[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+        v_min = mean_min[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+        v_diff = v_max - v_min
+        vabs_pn = _robust_sym_vlim([v_max, v_min])
+        vabs_diff = _robust_sym_vlim(v_diff)
+        # Row 0: Max
+        ax = axes[0, c]
+        try:
+            mne.viz.plot_topomap(v_max, info_common, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
+        except Exception:
+            _plot_topomap_on_ax(ax, v_max, info_common, vmin=-vabs_pn, vmax=+vabs_pn)
+        try:
+            mu_max = float(np.nanmean(v_max)); pct_max = (10.0 ** (mu_max) - 1.0) * 100.0
+            ax.text(0.5, 1.02, f"%Δ={pct_max:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Row 1: Min
+        ax = axes[1, c]
+        try:
+            mne.viz.plot_topomap(v_min, info_common, axes=ax, show=False, vlim=(-vabs_pn, +vabs_pn), cmap=TOPO_CMAP)
+        except Exception:
+            _plot_topomap_on_ax(ax, v_min, info_common, vmin=-vabs_pn, vmax=+vabs_pn)
+        try:
+            mu_min = float(np.nanmean(v_min)); pct_min = (10.0 ** (mu_min) - 1.0) * 100.0
+            ax.text(0.5, 1.02, f"%Δ={pct_min:+.1f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Row 2: Diff
+        sig_mask = None; cluster_p_min = cluster_k = cluster_mass = None; fdr_txt = ""
+        if DIFF_ANNOTATION_ENABLED:
+            try:
+                subj_max = data_max[:, :, fmask, :][:, :, :, tmask].mean(axis=(2, 3))
+                subj_min = data_min[:, :, fmask, :][:, :, :, tmask].mean(axis=(2, 3))
+                sig_mask, cluster_p_min, cluster_k, cluster_mass = _cluster_test_two_sample_arrays(
+                    subj_max, subj_min, info_common, alpha=SIG_ALPHA, paired=True, n_permutations=CLUSTER_N_PERM
+                )
+            except Exception:
+                sig_mask, cluster_p_min, cluster_k, cluster_mass = None, None, None, None
+            if sig_mask is None:
+                try:
+                    res = ttest_rel(subj_max, subj_min, axis=0, nan_policy="omit")
+                    p_ch = np.asarray(res.pvalue)
+                    sig_mask = _fdr_bh_mask(p_ch, alpha=SIG_ALPHA)
+                    rej, q = _fdr_bh_values(p_ch, alpha=SIG_ALPHA)
+                    if q is not None:
+                        q_min = float(np.nanmin(q))
+                        k_rej = int(np.nansum(rej)) if rej is not None else int(np.sum(p_ch < SIG_ALPHA))
+                        fdr_txt = _format_fdr_ann(q_min, k_rej)
+                except Exception:
+                    sig_mask = None
+        ax = axes[2, c]
+        try:
+            mne.viz.plot_topomap(
+                v_diff, info_common, axes=ax, show=False,
+                vlim=(-vabs_diff, +vabs_diff), cmap=TOPO_CMAP,
+                mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None), mask_params=SIG_MASK_PARAMS_DEFAULT
+            )
+        except Exception:
+            _plot_topomap_on_ax(
+                ax, v_diff, info_common, vmin=-vabs_diff, vmax=+vabs_diff,
+                mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None), mask_params=SIG_MASK_PARAMS_DEFAULT
+            )
+        try:
+            mu_d = float(np.nanmean(v_diff)); pct_d = (10.0 ** (mu_d) - 1.0) * 100.0
+            cl_txt = (_format_cluster_ann(cluster_p_min, cluster_k, cluster_mass) or fdr_txt) if DIFF_ANNOTATION_ENABLED else ""
+            label = f"Δ%={pct_d:+.1f}%" + (f" | {cl_txt}" if cl_txt else "")
+            ax.text(0.5, 1.02, label, transform=ax.transAxes, ha="center", va="top", fontsize=9)
+        except Exception:
+            pass
+        # Column title
+        try:
+            axes[0, c].set_title(f"{band} ({fmin:.0f}-{fmax_eff:.0f} Hz)", fontsize=9, pad=4, y=1.04)
+        except Exception:
+            pass
+        # Per-column colorbars
+        try:
+            sm_pn = ScalarMappable(norm=mcolors.Normalize(vmin=-vabs_pn, vmax=+vabs_pn), cmap=TOPO_CMAP)
+            sm_pn.set_array([])
+            fig.colorbar(sm_pn, ax=[axes[0, c], axes[1, c]], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+            sm_d = ScalarMappable(norm=mcolors.TwoSlopeNorm(vmin=-vabs_diff, vcenter=0.0, vmax=vabs_diff), cmap=TOPO_CMAP)
+            sm_d.set_array([])
+            fig.colorbar(sm_d, ax=axes[2, c], fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+        except Exception:
+            pass
+    # Row labels
+    try:
+        axes[0, 0].set_ylabel(row_labels[0], fontsize=10)
+        axes[1, 0].set_ylabel(row_labels[1], fontsize=10)
+        axes[2, 0].set_ylabel(row_labels[2], fontsize=10)
+    except Exception:
+        pass
+    try:
+        fig.suptitle(
+            f"Group Topomaps: Max vs Min temperature (baseline logratio; t=[{tmin:.1f}, {tmax:.1f}] s)",
+            fontsize=12,
+        )
+    except Exception:
+        pass
+    _save_fig(fig, out_dir, "group_topomap_grid_bands_maxmin_temp_diff_baseline_logratio.png", formats=["png", "svg"], logger=logger)
+
+
+def _avg_tfr_to_roi_average(
+    tfr_avg: "mne.time_frequency.AverageTFR", 
+    roi: str,
+    roi_map_override: Optional[Dict[str, list[str]]] = None,
+) -> Optional["mne.time_frequency.AverageTFR"]:
+    """Collapse an AverageTFR to a single-channel ROI AverageTFR by averaging ROI channels.
+
+    Returns None if no channels found for the ROI.
+    """
+    # Determine ROI channels (channel names, not regex patterns)
+    # If an override is provided, it must contain concrete channel names.
+    # Otherwise, compute channels by applying regex patterns from config to this subject's info.
+    if roi_map_override is not None:
+        roi_map = roi_map_override
+        chs_override = roi_map.get(roi)
+        if chs_override:
+            chs_all = list(chs_override)
+        else:
+            # Fallback to pattern-based detection when override lacks this ROI
+            pats = (_roi_definitions().get(roi) or [])
+            chs_all = _find_roi_channels(tfr_avg.info, pats)
+    else:
+        pats = (_roi_definitions().get(roi) or [])
+        chs_all = _find_roi_channels(tfr_avg.info, pats)
+    # Intersect with available channels (robust to case/ref variants) and preserve subject order
+    subj_chs = tfr_avg.info['ch_names']
+    canon_subj = { _canonicalize_ch_name(ch).upper(): ch for ch in subj_chs }
+    want = { _canonicalize_ch_name(ch).upper() for ch in chs_all }
+    chs = [canon_subj[_canonicalize_ch_name(ch).upper()] for ch in subj_chs if _canonicalize_ch_name(ch).upper() in want]
+    if len(chs) == 0:
+        # Fallback 1: heuristic prefix-based ROI map built from this subject's channels
+        try:
+            subj_roi_map = _build_group_roi_map_from_channels(list(subj_chs))
+            chs_subj_heur = list(subj_roi_map.get(roi, []))
+        except Exception:
+            chs_subj_heur = []
+        if chs_subj_heur:
+            # Preserve subject order
+            chs = [ch for ch in subj_chs if ch in set(chs_subj_heur)]
+    if len(chs) == 0:
+        # Fallback 2: regex-based discovery against this subject's info (config ROIs)
+        chs_rx = _find_roi_channels(tfr_avg.info, (_roi_definitions().get(roi) or []))
+        if chs_rx:
+            chs = [ch for ch in subj_chs if ch in set(chs_rx)]
+    if len(chs) == 0:
+        return None
+    try:
+        # Use MNE's robust channel picker (case-insensitive, handles ordering)
+        picks = mne.pick_channels(subj_chs, include=chs, exclude=[])
+    except Exception:
+        # Fallback to exact index lookup
+        picks = [subj_chs.index(ch) for ch in chs]
+    if len(picks) == 0:
+        return None
+    data = np.asarray(tfr_avg.data)[picks, :, :].mean(axis=0, keepdims=True)  # (1, n_freqs, n_times)
+    # Avoid constructor API issues by cloning and mutating the existing AverageTFR
+    try:
+        roi_tfr = tfr_avg.copy()
+        roi_tfr.data = data
+        roi_tfr.info = mne.create_info([f"ROI:{roi}"], sfreq=tfr_avg.info['sfreq'], ch_types='eeg')
+        roi_tfr.nave = int(getattr(tfr_avg, 'nave', 1))
+        roi_tfr.comment = f"ROI:{roi}"
+        return roi_tfr
+    except Exception:
+        return None
+
+
+def group_rois_all_trials(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    out_dir: Path,
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
+    logger: Optional[logging.Logger] = None,
+    roi_map: Optional[Dict[str, list[str]]] = None,
+) -> None:
+    """Group-level ROI TFRs (all trials, baseline logratio)."""
+    if not powers:
+        return
+    # Per-subject AverageTFR (all trials)
+    avg_list = []
+    for p in powers:
+        try:
+            t = p.copy()
+            _apply_baseline_safe(t, baseline=baseline, mode="logratio", logger=logger)
+            avg_list.append(t.average())
+        except Exception:
+            continue
+    if not avg_list:
+        return
+    # For each ROI, collect per-subject ROI AverageTFR and aggregate
+    rois = list((roi_map or _roi_definitions()).keys())
+    for roi in rois:
+        per_subj: List["mne.time_frequency.AverageTFR"] = []
+        for a in avg_list:
+            ra = _avg_tfr_to_roi_average(a, roi, roi_map_override=roi_map)
+            if ra is not None:
+                per_subj.append(ra)
+        # Retry without override if override produced no contributions
+        if len(per_subj) < 1 and roi_map is not None:
+            for a in avg_list:
+                ra = _avg_tfr_to_roi_average(a, roi, roi_map_override=None)
+                if ra is not None:
+                    per_subj.append(ra)
+        if len(per_subj) < 1:
+            if logger:
+                logger.info(f"Group ROI all-trials: no subjects contributed to ROI '{roi}'")
+            continue
+        info_c, data_c = _align_avg_tfrs(per_subj, logger=logger)
+        if info_c is None or data_c is None:
+            continue
+        mean_roi = data_c.mean(axis=0)  # (n_ch=1, n_freqs, n_times)
+        # Build AverageTFR for plotting using clone to avoid constructor API differences
+        try:
+            grp = per_subj[0].copy()
+            grp.data = mean_roi
+            grp.info = info_c  # aligned single-channel info
+            grp.nave = int(data_c.shape[0])
+            grp.comment = f"Group ROI:{roi}"
+            ch = grp.info['ch_names'][0]
+            fig = grp.plot(picks=ch, show=False)
+            try:
+                fig.suptitle(f"Group ROI: {roi} — all trials (baseline logratio, n={data_c.shape[0]})", fontsize=12)
+            except Exception:
+                pass
+            _save_fig(fig, out_dir, f"group_tfr_ROI-{_sanitize(roi)}_all_trials_baseline_logratio.png", logger=logger)
+        except Exception as e:
+            if logger:
+                logger.warning(f"Group ROI all-trials plot failed for {roi}: {e}")
+
+
+def group_contrast_pain_nonpain_rois(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
+    logger: Optional[logging.Logger] = None,
+    roi_map: Optional[Dict[str, list[str]]] = None,
+) -> None:
+    """Group-level ROI TFRs for pain vs non-pain and their difference."""
+    if not powers:
+        return
+    rois = list((roi_map or _roi_definitions()).keys())
+    # Build per-ROI lists of per-subject (pain, non) AverageTFR collapsed to ROI
+    for roi in rois:
+        roi_p_list: List["mne.time_frequency.AverageTFR"] = []
+        roi_n_list: List["mne.time_frequency.AverageTFR"] = []
+        for power, ev in zip(powers, events_by_subj):
+            if ev is None:
+                continue
+            pain_col = None
+            for c in PAIN_BINARY_COLUMNS:
+                if c in ev.columns:
+                    pain_col = c
+                    break
+            if pain_col is None:
+                continue
+            vals = pd.to_numeric(ev[pain_col], errors="coerce").fillna(0).astype(int).values
+            pain_mask = np.asarray(vals == 1, dtype=bool)
+            non_mask = np.asarray(vals == 0, dtype=bool)
+            if pain_mask.sum() == 0 or non_mask.sum() == 0:
+                continue
+            a_p = _avg_by_mask_to_avg_tfr(power, pain_mask)
+            a_n = _avg_by_mask_to_avg_tfr(power, non_mask)
+            if a_p is None or a_n is None:
+                continue
+            r_p = _avg_tfr_to_roi_average(a_p, roi, roi_map_override=roi_map)
+            r_n = _avg_tfr_to_roi_average(a_n, roi, roi_map_override=roi_map)
+            if r_p is not None and r_n is not None:
+                roi_p_list.append(r_p)
+                roi_n_list.append(r_n)
+        # Retry without override if no contributions under override
+        if (len(roi_p_list) < 1 or len(roi_n_list) < 1) and roi_map is not None:
+            roi_p_list = []
+            roi_n_list = []
+            for power, ev in zip(powers, events_by_subj):
+                if ev is None:
+                    continue
+                pain_col = None
+                for c in PAIN_BINARY_COLUMNS:
+                    if c in ev.columns:
+                        pain_col = c
+                        break
+                if pain_col is None:
+                    continue
+                vals = pd.to_numeric(ev[pain_col], errors="coerce").fillna(0).astype(int).values
+                pain_mask = np.asarray(vals == 1, dtype=bool)
+                non_mask = np.asarray(vals == 0, dtype=bool)
+                if pain_mask.sum() == 0 or non_mask.sum() == 0:
+                    continue
+                a_p = _avg_by_mask_to_avg_tfr(power, pain_mask)
+                a_n = _avg_by_mask_to_avg_tfr(power, non_mask)
+                if a_p is None or a_n is None:
+                    continue
+                r_p = _avg_tfr_to_roi_average(a_p, roi, roi_map_override=None)
+                r_n = _avg_tfr_to_roi_average(a_n, roi, roi_map_override=None)
+                if r_p is not None and r_n is not None:
+                    roi_p_list.append(r_p)
+                    roi_n_list.append(r_n)
+        if len(roi_p_list) < 1 or len(roi_n_list) < 1:
+            if logger:
+                logger.info(f"Group ROI pain/non: no subjects contributed to ROI '{roi}'")
+            continue
+        info_p, data_p = _align_avg_tfrs(roi_p_list, logger=logger)
+        info_n, data_n = _align_avg_tfrs(roi_n_list, logger=logger)
+        if info_p is None or info_n is None or data_p is None or data_n is None:
+            continue
+        mean_p = data_p.mean(axis=0)  # (1, n_freqs, n_times)
+        mean_n = data_n.mean(axis=0)
+        # Build group AverageTFRs using clones
+        try:
+            grp_p = roi_p_list[0].copy()
+            grp_p.data = mean_p
+            grp_p.info = info_p
+            grp_p.nave = int(data_p.shape[0])
+            grp_p.comment = f"Group ROI:{roi} Pain"
+
+            grp_n = roi_n_list[0].copy()
+            grp_n.data = mean_n
+            grp_n.info = info_n
+            grp_n.nave = int(data_n.shape[0])
+            grp_n.comment = f"Group ROI:{roi} Non"
+
+            # Difference array
+            diff = mean_p - mean_n
+            grp_d = roi_p_list[0].copy()
+            grp_d.data = diff
+            grp_d.info = info_p
+            grp_d.nave = int(min(data_p.shape[0], data_n.shape[0]))
+            grp_d.comment = f"Group ROI:{roi} Diff"
+            ch = grp_p.info['ch_names'][0]
+            # Pain
+            fig = grp_p.plot(picks=ch, show=False)
+            try:
+                fig.suptitle(f"Group ROI: {roi} — Pain (baseline logratio, n={data_p.shape[0]})", fontsize=12)
+            except Exception:
+                pass
+            _save_fig(fig, out_dir, f"group_tfr_ROI-{_sanitize(roi)}_pain_baseline_logratio.png", logger=logger)
+            # Non-pain
+            fig = grp_n.plot(picks=ch, show=False)
+            try:
+                fig.suptitle(f"Group ROI: {roi} — Non-pain (baseline logratio, n={data_n.shape[0]})", fontsize=12)
+            except Exception:
+                pass
+            _save_fig(fig, out_dir, f"group_tfr_ROI-{_sanitize(roi)}_nonpain_baseline_logratio.png", logger=logger)
+            # Diff
+            fig = grp_d.plot(picks=ch, show=False)
+            try:
+                fig.suptitle(f"Group ROI: {roi} — Pain minus Non (baseline logratio)", fontsize=12)
+            except Exception:
+                pass
+            _save_fig(fig, out_dir, f"group_tfr_ROI-{_sanitize(roi)}_pain_minus_non_baseline_logratio.png", logger=logger)
+        except Exception as e:
+            if logger:
+                logger.warning(f"Group ROI pain/non plot failed for {roi}: {e}")
+
+
+def group_contrast_pain_nonpain_scalpmean(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    baseline: Tuple[Optional[float], Optional[float]] = BASELINE,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Group-level All-EEG (scalp-mean) TFRs for pain vs non-pain and their difference.
+
+    Creates three figures (PNG+SVG):
+    - group_tfr_AllEEG_pain_baseline_logratio
+    - group_tfr_AllEEG_nonpain_baseline_logratio
+    - group_tfr_AllEEG_pain_minus_non_baseline_logratio
+    """
+    if not powers:
+        return
+    avg_pain: List["mne.time_frequency.AverageTFR"] = []
+    avg_non: List["mne.time_frequency.AverageTFR"] = []
+    for power, ev in zip(powers, events_by_subj):
+        if ev is None:
+            continue
+        pain_col = None
+        for c in PAIN_BINARY_COLUMNS:
+            if c in ev.columns:
+                pain_col = c
+                break
+        if pain_col is None:
+            continue
+        vals = pd.to_numeric(ev[pain_col], errors="coerce").fillna(0).astype(int).values
+        pain_mask = np.asarray(vals == 1, dtype=bool)
+        non_mask = np.asarray(vals == 0, dtype=bool)
+        if pain_mask.sum() == 0 or non_mask.sum() == 0:
+            continue
+        a_p = _avg_by_mask_to_avg_tfr(power, pain_mask)
+        a_n = _avg_by_mask_to_avg_tfr(power, non_mask)
+        if a_p is None or a_n is None:
+            continue
+        avg_pain.append(a_p)
+        avg_non.append(a_n)
+    if len(avg_pain) < 1 or len(avg_non) < 1:
+        return
+    # Align across subjects (paired) and compute group means
+    info_p, data_p, data_n = _align_paired_avg_tfrs(avg_pain, avg_non, logger=logger)
+    if info_p is None or data_p is None or data_n is None:
+        return
+    n_subj = int(min(data_p.shape[0], data_n.shape[0]))
+    mean_p = data_p.mean(axis=0)  # (n_ch, n_freqs, n_times)
+    mean_n = data_n.mean(axis=0)
+    # Scalp-mean collapse to 1 channel
+    try:
+        data_p_sm = np.asarray(mean_p).mean(axis=0, keepdims=True)  # (1, n_freqs, n_times)
+        data_n_sm = np.asarray(mean_n).mean(axis=0, keepdims=True)
+        diff_sm = data_p_sm - data_n_sm
+    except Exception:
+        return
+    # Build AverageTFR clones for plotting
+    try:
+        # Use avg_pain[0] as a template
+        tmpl = avg_pain[0].copy()
+        sfreq = tmpl.info['sfreq']
+        freqs = tmpl.freqs
+        times = tmpl.times
+        # Pain
+        grp_p = tmpl.copy()
+        grp_p.data = data_p_sm
+        grp_p.info = mne.create_info(["AllEEG"], sfreq=sfreq, ch_types='eeg')
+        grp_p.nave = n_subj
+        grp_p.comment = "Group AllEEG Pain"
+        # Non
+        grp_n = tmpl.copy()
+        grp_n.data = data_n_sm
+        grp_n.info = mne.create_info(["AllEEG"], sfreq=sfreq, ch_types='eeg')
+        grp_n.nave = n_subj
+        grp_n.comment = "Group AllEEG Non"
+        # Diff
+        grp_d = tmpl.copy()
+        grp_d.data = diff_sm
+        grp_d.info = mne.create_info(["AllEEG"], sfreq=sfreq, ch_types='eeg')
+        grp_d.nave = n_subj
+        grp_d.comment = "Group AllEEG Diff"
+
+        # Plot and save
+        fig = grp_p.plot(picks="AllEEG", show=False)
+        try:
+            fig.suptitle(f"Group TFR: All EEG — Pain (baseline logratio, n={n_subj})", fontsize=12)
+        except Exception:
+            pass
+        _save_fig(fig, out_dir, "group_tfr_AllEEG_pain_baseline_logratio.png", logger=logger)
+
+        fig = grp_n.plot(picks="AllEEG", show=False)
+        try:
+            fig.suptitle(f"Group TFR: All EEG — Non-pain (baseline logratio, n={n_subj})", fontsize=12)
+        except Exception:
+            pass
+        _save_fig(fig, out_dir, "group_tfr_AllEEG_nonpain_baseline_logratio.png", logger=logger)
+
+        fig = grp_d.plot(picks="AllEEG", show=False)
+        try:
+            fig.suptitle("Group TFR: All EEG — Pain minus Non (baseline logratio)", fontsize=12)
+        except Exception:
+            pass
+        _save_fig(fig, out_dir, "group_tfr_AllEEG_pain_minus_non_baseline_logratio.png", logger=logger)
+    except Exception as e:
+        if logger:
+            logger.warning(f"Group AllEEG pain/non plot failed: {e}")
 
 def plot_topomap_grid_baseline_temps(
     tfr: "mne.time_frequency.EpochsTFR | mne.time_frequency.AverageTFR",
@@ -2323,7 +4528,7 @@ def plot_topomap_grid_baseline_temps(
                 _plot_topomap_on_ax(ax, data, tfr_cond.info, vmin=-diff_abs, vmax=+diff_abs)
             mu = float(np.nanmean(data))
             pct = (10.0 ** (mu) - 1.0) * 100.0
-            ax.text(0.5, 1.02, f"\u0394\u03bc={mu:.3f} ({pct:+.0f}%)", transform=ax.transAxes, ha="center", va="top", fontsize=9)
+            ax.text(0.5, 1.02, f"%Δ={pct:+.0f}%", transform=ax.transAxes, ha="center", va="top", fontsize=9)
             if r == 0:
                 ax.set_title(f"{label} (n={n_cond})", fontsize=9, pad=4, y=1.04)
         # Label frequency band on the leftmost axis in the row
@@ -2532,7 +4737,7 @@ def plot_pain_nonpain_temporal_topomaps(
                     # Add mean value with percentage change above topomap
                     mu = float(np.nanmean(pain_data))
                     pct = (10.0 ** (mu) - 1.0) * 100.0
-                    axes[0, col].text(0.5, 1.08, f"μ={mu:.3f} ({pct:+.0f}%)", 
+                    axes[0, col].text(0.5, 1.08, f"%Δ={pct:+.0f}%", 
                                     transform=axes[0, col].transAxes, ha="center", va="bottom", fontsize=8)
                 except Exception as e:
                     axes[0, col].axis('off')
@@ -2552,7 +4757,7 @@ def plot_pain_nonpain_temporal_topomaps(
                     # Add mean value with percentage change above topomap
                     mu = float(np.nanmean(non_data))
                     pct = (10.0 ** (mu) - 1.0) * 100.0
-                    axes[1, col].text(0.5, 1.08, f"μ={mu:.3f} ({pct:+.0f}%)", 
+                    axes[1, col].text(0.5, 1.08, f"%Δ={pct:+.0f}%", 
                                     transform=axes[1, col].transAxes, ha="center", va="bottom", fontsize=8)
                 except Exception as e:
                     axes[1, col].axis('off')
@@ -2564,16 +4769,33 @@ def plot_pain_nonpain_temporal_topomaps(
             # Row 2: Difference (pain - non-pain)
             diff_data = diff_data_windows[col]
             if diff_data is not None:
+                # Cluster-based significance for this window and minimal cluster p
+                sig_mask = None
+                cluster_p_min = cluster_k = cluster_mass = None
+                fdr_txt = ""
+                if DIFF_ANNOTATION_ENABLED:
+                    try:
+                        sig_mask, cluster_p_min, cluster_k, cluster_mass = _cluster_test_epochs(
+                            tfr_sub, pain_mask, non_mask,
+                            fmin=fmin, fmax=fmax_eff, tmin=tmin_win, tmax=tmax_win,
+                            paired=False,
+                        )
+                    except Exception:
+                        sig_mask, cluster_p_min, cluster_k, cluster_mass = None, None, None, None
                 try:
                     _plot_topomap_on_ax(
                         axes[2, col], diff_data, tfr_pain.info,
-                        vmin=-vabs_diff, vmax=+vabs_diff
+                        vmin=-vabs_diff, vmax=+vabs_diff,
+                        mask=(sig_mask if DIFF_ANNOTATION_ENABLED else None), mask_params=SIG_MASK_PARAMS_DEFAULT
                     )
-                    # Add mean difference value with percentage change above topomap
+                    # Add mean difference with cluster p if available
                     mu = float(np.nanmean(diff_data))
                     pct = (10.0 ** (mu) - 1.0) * 100.0
-                    axes[2, col].text(0.5, 1.08, f"Δμ={mu:.3f} ({pct:+.1f}%)", 
-                                    transform=axes[2, col].transAxes, ha="center", va="bottom", fontsize=8)
+                    cl_txt = (_format_cluster_ann(cluster_p_min, cluster_k, cluster_mass) or fdr_txt) if DIFF_ANNOTATION_ENABLED else ""
+                    if cl_txt:
+                        axes[2, col].text(0.5, 1.08, f"Δ%={pct:+.1f}% | {cl_txt}", transform=axes[2, col].transAxes, ha="center", va="bottom", fontsize=8)
+                    else:
+                        axes[2, col].text(0.5, 1.08, f"Δ%={pct:+.1f}%", transform=axes[2, col].transAxes, ha="center", va="bottom", fontsize=8)
                 except Exception as e:
                     axes[2, col].axis('off')
                     if logger:
@@ -2750,12 +4972,540 @@ def contrast_pain_nonpain_rois(
                 print(f"ROI {roi} banded contrast TFR export skipped: {e}")
         except Exception as e:
             print(f"ROI {roi} contrast failed: {e}")
+    
+
+def _write_group_pain_counts_from_events(
+    subjects: List[str],
+    events_list: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    rows = []
+    for subj, ev in zip(subjects, events_list):
+        n_pain = 0
+        n_non = 0
+        if ev is not None:
+            pain_col = None
+            for c in PAIN_BINARY_COLUMNS:
+                if c in ev.columns:
+                    pain_col = c; break
+            if pain_col is not None:
+                vals = pd.to_numeric(ev[pain_col], errors="coerce")
+                n_pain = int((vals == 1).sum())
+                n_non = int((vals == 0).sum())
+        rows.append({
+            "subject": subj,
+            "n_pain": n_pain,
+            "n_nonpain": n_non,
+            "n_total": n_pain + n_non,
+        })
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    total = df[["n_pain", "n_nonpain", "n_total"]].sum()
+    total_row = {"subject": "TOTAL", **{k: int(v) for k, v in total.to_dict().items()}}
+    df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+    _ensure_dir(out_dir)
+    out_path = out_dir / "counts_pain.tsv"
+    try:
+        df.to_csv(out_path, sep="\t", index=False)
+        if logger:
+            logger.info(f"Saved counts: {out_path}")
+        else:
+            print(f"Saved counts: {out_path}")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to write counts TSV at {out_path}: {e}")
+        else:
+            print(f"Warning: Failed to write counts TSV at {out_path}: {e}")
 
 
+def _write_group_band_summary(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Write concise TSV with per-band log10 ratio and % change for group conditions.
+
+    Conditions: All-trials, Pain, Non-pain, Diff, and per temperature labels.
+    Means are computed over EEG channels, plateau window, and band frequencies.
+    """
+    rows: list[dict] = []
+    # Helper to append rows
+    def add_row(cond: str, label: str, band: str, mu: float, n_subj: int):
+        rows.append({
+            "condition": cond,
+            "label": label,
+            "band": band,
+            "mu_log10": float(mu),
+            "pct_change": float((10.0 ** mu - 1.0) * 100.0),
+            "n_subjects": int(n_subj),
+        })
+
+    # All-trials
+    avg_list = []
+    for p in powers:
+        try:
+            t = p.copy(); _apply_baseline_safe(t, baseline=BASELINE, mode="logratio")
+            avg_list.append(t.average())
+        except Exception:
+            continue
+    info_all, data_all = _align_avg_tfrs(avg_list, logger=logger)
+    if info_all is not None and data_all is not None:
+        freqs = np.asarray(avg_list[0].freqs)
+        times = np.asarray(avg_list[0].times)
+        fmax_available = float(freqs.max())
+        bands = _get_consistent_bands(max_freq_available=fmax_available)
+        tmin_req, tmax_req = plateau_window
+        tmin = float(max(times.min(), tmin_req)); tmax = float(min(times.max(), tmax_req))
+        mean_all = data_all.mean(axis=0)
+        eeg_picks = mne.pick_types(info_all, eeg=True, exclude=[])
+        for band, (fmin, fmax) in bands.items():
+            fmax_eff = min(fmax, fmax_available)
+            fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+            tmask = (times >= tmin) & (times < tmax)
+            if fmask.sum() == 0 or tmask.sum() == 0:
+                continue
+            vec = mean_all[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            mu = float(np.nanmean(vec[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(vec))
+            add_row("All", "All trials", band, mu, data_all.shape[0])
+
+    # Pain vs Non
+    avg_pain = []; avg_non = []
+    for p, ev in zip(powers, events_by_subj):
+        if ev is None: continue
+        pain_col = None
+        for c in PAIN_BINARY_COLUMNS:
+            if c in ev.columns: pain_col = c; break
+        if pain_col is None: continue
+        vals = pd.to_numeric(ev[pain_col], errors="coerce").fillna(0).astype(int).values
+        mask_p = np.asarray(vals == 1, dtype=bool); mask_n = np.asarray(vals == 0, dtype=bool)
+        if mask_p.sum() == 0 or mask_n.sum() == 0: continue
+        a_p = _avg_by_mask_to_avg_tfr(p, mask_p); a_n = _avg_by_mask_to_avg_tfr(p, mask_n)
+        if a_p is None or a_n is None: continue
+        avg_pain.append(a_p); avg_non.append(a_n)
+    info_p, data_p = _align_avg_tfrs(avg_pain, logger=logger)
+    info_n, data_n = _align_avg_tfrs(avg_non, logger=logger)
+    if info_p is not None and info_n is not None and data_p is not None and data_n is not None:
+        freqs = np.asarray(avg_pain[0].freqs)
+        times = np.asarray(avg_pain[0].times)
+        fmax_available = float(freqs.max())
+        bands = _get_consistent_bands(max_freq_available=fmax_available)
+        tmin_req, tmax_req = plateau_window
+        tmin = float(max(times.min(), tmin_req)); tmax = float(min(times.max(), tmax_req))
+        mean_p = data_p.mean(axis=0); mean_n = data_n.mean(axis=0)
+        eeg_picks_p = mne.pick_types(info_p, eeg=True, exclude=[])
+        eeg_picks_n = mne.pick_types(info_n, eeg=True, exclude=[])
+        for band, (fmin, fmax) in bands.items():
+            fmax_eff = min(fmax, fmax_available)
+            fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+            tmask = (times >= tmin) & (times < tmax)
+            if fmask.sum() == 0 or tmask.sum() == 0:
+                continue
+            v_p = mean_p[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            v_n = mean_n[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            mu_p = float(np.nanmean(v_p[eeg_picks_p])) if len(eeg_picks_p) > 0 else float(np.nanmean(v_p))
+            mu_n = float(np.nanmean(v_n[eeg_picks_n])) if len(eeg_picks_n) > 0 else float(np.nanmean(v_n))
+            mu_d = float(np.nanmean(v_p - v_n))
+            add_row("Pain", "pain", band, mu_p, data_p.shape[0])
+            add_row("Non-pain", "non-pain", band, mu_n, data_n.shape[0])
+            add_row("Diff", "pain-minus-non", band, mu_d, min(data_p.shape[0], data_n.shape[0]))
+
+    # Temperatures
+    # Reuse routine to collect temps per group
+    temps = _collect_group_temperatures(events_by_subj)
+    for tval in temps:
+        avg_list = []
+        ns = 0
+        for p, ev in zip(powers, events_by_subj):
+            if ev is None: continue
+            tcol = None
+            for c in TEMPERATURE_COLUMNS:
+                if c in ev.columns: tcol = c; break
+            if tcol is None: continue
+            mask = pd.to_numeric(ev[tcol], errors="coerce").round(1) == round(float(tval), 1)
+            mask = np.asarray(mask, dtype=bool)
+            if mask.sum() == 0: continue
+            a = _avg_by_mask_to_avg_tfr(p, mask)
+            if a is not None:
+                avg_list.append(a); ns += 1
+        info_t, data_t = _align_avg_tfrs(avg_list, logger=logger)
+        if info_t is None or data_t is None: continue
+        freqs = np.asarray(avg_list[0].freqs)
+        times = np.asarray(avg_list[0].times)
+        fmax_available = float(freqs.max())
+        bands = _get_consistent_bands(max_freq_available=fmax_available)
+        tmin_req, tmax_req = plateau_window
+        tmin = float(max(times.min(), tmin_req)); tmax = float(min(times.max(), tmax_req))
+        mean_t = data_t.mean(axis=0)
+        eeg_picks = mne.pick_types(info_t, eeg=True, exclude=[])
+        for band, (fmin, fmax) in bands.items():
+            fmax_eff = min(fmax, fmax_available)
+            fmask = (freqs >= fmin) & (freqs <= fmax_eff)
+            tmask = (times >= tmin) & (times < tmax)
+            if fmask.sum() == 0 or tmask.sum() == 0: continue
+            vec = mean_t[:, fmask, :][:, :, tmask].mean(axis=(1, 2))
+            mu = float(np.nanmean(vec[eeg_picks])) if len(eeg_picks) > 0 else float(np.nanmean(vec))
+            add_row("Temperature", f"{float(tval):.1f}°C", band, mu, data_t.shape[0])
+
+    if rows:
+        _ensure_dir(out_dir)
+        out_path = out_dir / "group_band_summary.tsv"
+        try:
+            pd.DataFrame(rows).to_csv(out_path, sep='\t', index=False)
+            if logger:
+                logger.info(f"Saved band summary: {out_path}")
+            else:
+                print(f"Saved band summary: {out_path}")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to write band summary TSV: {e}")
+            else:
+                print(f"Warning: Failed to write band summary TSV: {e}")
+
+
+def _write_group_roi_summary(
+    powers: List["mne.time_frequency.EpochsTFR"],
+    events_by_subj: List[Optional[pd.DataFrame]],
+    out_dir: Path,
+    plateau_window: Tuple[float, float] = (DEFAULT_PLATEAU_TMIN, DEFAULT_PLATEAU_TMAX),
+    roi_map: Optional[Dict[str, list[str]]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Write TSV with per-ROI, per-band log10 ratio and % change for group conditions.
+
+    Conditions: All-trials, Pain, Non-pain, Diff, and per-temperature labels.
+    Means computed over ROI channel (single-channel AverageTFR), plateau window, and band freqs.
+    """
+    rows: list[dict] = []
+    def add_row(roi: str, cond: str, label: str, band: str, mu: float, n_subj: int):
+        rows.append({
+            "roi": roi,
+            "condition": cond,
+            "label": label,
+            "band": band,
+            "mu_log10": float(mu),
+            "pct_change": float((10.0 ** mu - 1.0) * 100.0),
+            "n_subjects": int(n_subj),
+        })
+
+    if not powers:
+        return
+
+    # Build per-subject AverageTFR (all trials) once
+    avg_all = []
+    for p in powers:
+        try:
+            avg_all.append(_avg_alltrials_to_avg_tfr(p))
+        except Exception:
+            continue
+    if not avg_all:
+        return
+
+    # Determine bands and plateau window from any AverageTFR
+    freqs_ref = np.asarray(avg_all[0].freqs)
+    times_ref = np.asarray(avg_all[0].times)
+    fmax_available = float(freqs_ref.max())
+    bands = _get_consistent_bands(max_freq_available=fmax_available)
+    tmin_req, tmax_req = plateau_window
+    tmin = float(max(times_ref.min(), tmin_req)); tmax = float(min(times_ref.max(), tmax_req))
+
+    # ROIs
+    rois = list((roi_map or _roi_definitions()).keys())
+
+    # Helper: compute group mean ROI AverageTFR list -> (mean_data, n_subj)
+    def group_mean_roi(avgs: List["mne.time_frequency.AverageTFR"], roi_name: str) -> Tuple[Optional[np.ndarray], int]:
+        rois_list: List["mne.time_frequency.AverageTFR"] = []
+        for a in avgs:
+            r = _avg_tfr_to_roi_average(a, roi_name, roi_map_override=roi_map)
+            if r is not None:
+                rois_list.append(r)
+        if not rois_list:
+            return None, 0
+        info_c, data_c = _align_avg_tfrs(rois_list, logger=logger)
+        if info_c is None or data_c is None:
+            return None, 0
+        return data_c.mean(axis=0), data_c.shape[0]  # (1, n_freqs, n_times), N
+
+    # All-trials per ROI
+    for roi in rois:
+        mean_roi, nsub = group_mean_roi(avg_all, roi)
+        if mean_roi is None or nsub == 0:
+            continue
+        arr = np.asarray(mean_roi[0])  # (n_freqs, n_times)
+        for band, (fmin, fmax) in bands.items():
+            fmax_eff = min(fmax, fmax_available)
+            fmask = (freqs_ref >= fmin) & (freqs_ref <= fmax_eff)
+            tmask = (times_ref >= tmin) & (times_ref < tmax)
+            if fmask.sum() == 0 or tmask.sum() == 0:
+                continue
+            mu = float(np.nanmean(arr[fmask, :][:, tmask]))
+            add_row(roi, "All", "All trials", band, mu, nsub)
+
+    # Pain/Non/Diff per ROI
+    avg_pain = []
+    avg_non = []
+    for p, ev in zip(powers, events_by_subj):
+        if ev is None:
+            continue
+        pain_col = None
+        for c in PAIN_BINARY_COLUMNS:
+            if c in ev.columns:
+                pain_col = c; break
+        if pain_col is None:
+            continue
+        vals = pd.to_numeric(ev[pain_col], errors="coerce").fillna(0).astype(int).values
+        mask_p = np.asarray(vals == 1, dtype=bool)
+        mask_n = np.asarray(vals == 0, dtype=bool)
+        if mask_p.sum() == 0 or mask_n.sum() == 0:
+            continue
+        a_p = _avg_by_mask_to_avg_tfr(p, mask_p)
+        a_n = _avg_by_mask_to_avg_tfr(p, mask_n)
+        if a_p is not None and a_n is not None:
+            avg_pain.append(a_p)
+            avg_non.append(a_n)
+    if avg_pain and avg_non:
+        freqs_p = np.asarray(avg_pain[0].freqs)
+        times_p = np.asarray(avg_pain[0].times)
+        fmax_available_p = float(freqs_p.max())
+        bands_p = _get_consistent_bands(max_freq_available=fmax_available_p)
+        tmin_p = float(max(times_p.min(), tmin_req)); tmax_p = float(min(times_p.max(), tmax_req))
+        for roi in rois:
+            mean_p, n_p = group_mean_roi(avg_pain, roi)
+            mean_n, n_n = group_mean_roi(avg_non, roi)
+            if mean_p is None or mean_n is None or n_p == 0 or n_n == 0:
+                continue
+            arr_p = np.asarray(mean_p[0]); arr_n = np.asarray(mean_n[0])
+            for band, (fmin, fmax) in bands_p.items():
+                fmax_eff = min(fmax, fmax_available_p)
+                fmask = (freqs_p >= fmin) & (freqs_p <= fmax_eff)
+                tmask = (times_p >= tmin_p) & (times_p < tmax_p)
+                if fmask.sum() == 0 or tmask.sum() == 0:
+                    continue
+                mu_p = float(np.nanmean(arr_p[fmask, :][:, tmask]))
+                mu_n = float(np.nanmean(arr_n[fmask, :][:, tmask]))
+                mu_d = float(np.nanmean((arr_p - arr_n)[fmask, :][:, tmask]))
+                add_row(roi, "Pain", "pain", band, mu_p, n_p)
+                add_row(roi, "Non-pain", "non-pain", band, mu_n, n_n)
+                add_row(roi, "Diff", "pain-minus-non", band, mu_d, min(n_p, n_n))
+
+    # Temperatures per ROI
+    temps = _collect_group_temperatures(events_by_subj)
+    if temps:
+        for roi in rois:
+            for tval in temps:
+                avgs_t = []
+                for p, ev in zip(powers, events_by_subj):
+                    if ev is None:
+                        continue
+                    tcol = None
+                    for c in TEMPERATURE_COLUMNS:
+                        if c in ev.columns:
+                            tcol = c; break
+                    if tcol is None:
+                        continue
+                    mask = pd.to_numeric(ev[tcol], errors="coerce").round(1) == round(float(tval), 1)
+                    mask = np.asarray(mask, dtype=bool)
+                    if mask.sum() == 0:
+                        continue
+                    a = _avg_by_mask_to_avg_tfr(p, mask)
+                    if a is not None:
+                        avgs_t.append(a)
+                if not avgs_t:
+                    continue
+                freqs_t = np.asarray(avgs_t[0].freqs)
+                times_t = np.asarray(avgs_t[0].times)
+                fmax_available_t = float(freqs_t.max())
+                bands_t = _get_consistent_bands(max_freq_available=fmax_available_t)
+                tmin_t = float(max(times_t.min(), tmin_req)); tmax_t = float(min(times_t.max(), tmax_req))
+                mean_t, n_t = group_mean_roi(avgs_t, roi)
+                if mean_t is None or n_t == 0:
+                    continue
+                arr_t = np.asarray(mean_t[0])
+                for band, (fmin, fmax) in bands_t.items():
+                    fmax_eff = min(fmax, fmax_available_t)
+                    fmask = (freqs_t >= fmin) & (freqs_t <= fmax_eff)
+                    tmask = (times_t >= tmin_t) & (times_t < tmax_t)
+                    if fmask.sum() == 0 or tmask.sum() == 0:
+                        continue
+                    mu = float(np.nanmean(arr_t[fmask, :][:, tmask]))
+                    add_row(roi, "Temperature", f"{float(tval):.1f}°C", band, mu, n_t)
+
+    if rows:
+        _ensure_dir(out_dir)
+        out_path = out_dir / "group_roi_summary.tsv"
+        try:
+            pd.DataFrame(rows).to_csv(out_path, sep='\t', index=False)
+            if logger:
+                logger.info(f"Saved ROI summary: {out_path}")
+            else:
+                print(f"Saved ROI summary: {out_path}")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to write ROI summary TSV: {e}")
+            else:
+                print(f"Warning: Failed to write ROI summary TSV: {e}")
+
+
+def main_group(
+    subjects: List[str],
+    task: str = DEFAULT_TASK,
+    plateau_tmin: float = DEFAULT_PLATEAU_TMIN,
+    plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
+    temperature_strategy: str = DEFAULT_TEMPERATURE_STRATEGY,
+) -> None:
+    logger = get_group_logger("time_frequency_analysis", LOG_FILE_NAME)
+    logger.info(f"=== Time-frequency group analysis: {len(subjects)} subjects, task-{task} ===")
+    logger.info(f"Subjects: {', '.join(subjects)}")
+    out_dir = DERIV_ROOT / "group" / "eeg" / "plots" / "02_time_frequency_analysis"
+    _ensure_dir(out_dir)
+
+    powers: List[mne.time_frequency.EpochsTFR] = []
+    events_list: List[Optional[pd.DataFrame]] = []
+    ok_subjects: List[str] = []
+    for s in subjects:
+        logger.info(f"--- Computing TFR for subject {s} ---")
+        power, ev = _compute_power_and_events(s, task, logger)
+        if power is not None:
+            powers.append(power)
+            events_list.append(ev)
+            ok_subjects.append(s)
+        else:
+            logger.warning(f"Skipping subject {s} due to errors")
+
+    if len(powers) < 2:
+        logger.warning(f"Only {len(powers)} subjects valid; skipping group-level plots")
+        return
+
+    # Build group ROI map from union of channels across subjects
+    try:
+        all_chs: list[str] = []
+        seen = set()
+        for p in powers:
+            for ch in p.info['ch_names']:
+                if ch not in seen:
+                    seen.add(ch)
+                    all_chs.append(ch)
+        group_roi_map = _build_group_roi_map_from_channels(all_chs)
+        # Summarize counts per ROI for transparency
+        try:
+            counts = {roi: len(chs) for roi, chs in group_roi_map.items()}
+            counts_str = ", ".join([f"{k}={v}" for k, v in counts.items()])
+            logger.info(f"Built group ROI map from union of subject channels; counts: {counts_str}")
+        except Exception:
+            logger.info("Built group ROI map from union of subject channels")
+    except Exception as e:
+        logger.warning(f"Failed to build group ROI map: {e}")
+        group_roi_map = None
+
+    # Group all-trials topomaps
+    group_topomaps_bands_all_trials(
+        powers,
+        out_dir,
+        plateau_window=(plateau_tmin, plateau_tmax),
+        logger=logger,
+    )
+
+    # Group pain vs non-pain topomaps
+    try:
+        group_topomaps_pain_nonpain(
+            powers,
+            events_list,
+            out_dir,
+            plateau_window=(plateau_tmin, plateau_tmax),
+            logger=logger,
+        )
+    except Exception as e:
+        logger.warning(f"Group pain/non-pain topomaps failed: {e}")
+
+    # Group temperature grid (pooled/both)
+    if temperature_strategy in ("pooled", "both"):
+        try:
+            group_topomap_grid_baseline_temps(
+                powers,
+                events_list,
+                out_dir,
+                plateau_window=(plateau_tmin, plateau_tmax),
+                logger=logger,
+            )
+        except Exception as e:
+            logger.warning(f"Group temperature grid failed: {e}")
+        # Group max vs min temperature grid
+        try:
+            group_contrast_maxmin_temperature(
+                powers,
+                events_list,
+                out_dir,
+                plateau_window=(plateau_tmin, plateau_tmax),
+                logger=logger,
+            )
+        except Exception as e:
+            logger.warning(f"Group max/min temperature grid failed: {e}")
+        # Group temporal topomaps across windows (max vs min temperature)
+        try:
+            group_maxmin_temperature_temporal_topomaps(
+                powers,
+                events_list,
+                out_dir,
+                plateau_window=(plateau_tmin, plateau_tmax),
+                window_count=5,
+                logger=logger,
+            )
+        except Exception as e:
+            logger.warning(f"Group temporal topomaps (max/min temp) failed: {e}")
+
+    # Group ROI analyses (all trials and pain/non)
+    try:
+        group_rois_all_trials(powers, out_dir, baseline=BASELINE, logger=logger, roi_map=group_roi_map)
+    except Exception as e:
+        logger.warning(f"Group ROI all-trials failed: {e}")
+    try:
+        group_contrast_pain_nonpain_rois(powers, events_list, out_dir, baseline=BASELINE, logger=logger, roi_map=group_roi_map)
+    except Exception as e:
+        logger.warning(f"Group ROI pain/non failed: {e}")
+
+    # Group temporal topomaps across windows (pain vs non)
+    try:
+        group_pain_nonpain_temporal_topomaps(
+            powers,
+            events_list,
+            out_dir,
+            plateau_window=(plateau_tmin, plateau_tmax),
+            window_count=5,
+            logger=logger,
+        )
+    except Exception as e:
+        logger.warning(f"Group temporal topomaps failed: {e}")
+
+    # Group All-EEG scalp-mean pain vs non and difference
+    try:
+        group_contrast_pain_nonpain_scalpmean(
+            powers,
+            events_list,
+            out_dir,
+            baseline=BASELINE,
+            logger=logger,
+        )
+    except Exception as e:
+        logger.warning(f"Group AllEEG pain/non plots failed: {e}")
+
+    # Counts and band-summary TSVs
+    _write_group_pain_counts_from_events(ok_subjects, events_list, out_dir, logger)
+    try:
+        _write_group_band_summary(powers, events_list, out_dir, plateau_window=(plateau_tmin, plateau_tmax), logger=logger)
+    except Exception as e:
+        logger.warning(f"Band summary TSV failed: {e}")
+    try:
+        _write_group_roi_summary(powers, events_list, out_dir, plateau_window=(plateau_tmin, plateau_tmax), roi_map=group_roi_map, logger=logger)
+    except Exception as e:
+        logger.warning(f"ROI summary TSV failed: {e}")
+    logger.info(f"Group analysis completed. Results saved to: {out_dir}")
 def main(subject: str = "001", task: str = DEFAULT_TASK,
          plateau_tmin: float = DEFAULT_PLATEAU_TMIN, plateau_tmax: float = DEFAULT_PLATEAU_TMAX,
          temperature_strategy: str = DEFAULT_TEMPERATURE_STRATEGY) -> None:
-    logger = _setup_logging(subject)
+    logger = get_subject_logger("time_frequency_analysis", subject, LOG_FILE_NAME)
     logger.info(f"=== Time-frequency analysis: sub-{subject}, task-{task} ===")
     plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / "02_time_frequency_analysis"
     _ensure_dir(plots_dir)
@@ -2896,6 +5646,9 @@ def main(subject: str = "001", task: str = DEFAULT_TASK,
         logger.info(msg)
     else:
         print(msg)
+
+    # Baseline QC before applying baseline corrections/contrasts
+    _log_baseline_qc(power, BASELINE, logger)
 
     # Diagnostics: raw Cz and baseline vs plateau QC on un-baselined TFR
     try:
@@ -3119,6 +5872,8 @@ def main(subject: str = "001", task: str = DEFAULT_TASK,
                         contrast_pain_nonpain_rois(roi_tfrs_t, events_t, plots_dir_t, baseline=BASELINE)
                         plot_topomaps_bands_all_trials(power_t, plots_dir_t, baseline=BASELINE, plateau_window=(plateau_tmin, plateau_tmax))
                         contrast_pain_nonpain_topomaps_rois(power_t, events_t, roi_map_all, plots_dir_t, baseline=BASELINE, plateau_window=(plateau_tmin, plateau_tmax))
+    
+    # Subject-level HTML report via mne.Report removed per user request
 
     msg = "Done."
     if logger:
@@ -3130,11 +5885,69 @@ def main(subject: str = "001", task: str = DEFAULT_TASK,
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Time-frequency analysis for one subject")
-    parser.add_argument("--subject", "-s", type=str, required=True, help="BIDS subject label without 'sub-' prefix (e.g., 001)")
+    parser = argparse.ArgumentParser(description="Time-frequency analysis supporting single and multiple subjects")
+
+    # Subject selection (mutually exclusive): --group, --subject(s), --all-subjects
+    sel = parser.add_mutually_exclusive_group(required=False)
+    sel.add_argument(
+        "--group", type=str,
+        help=(
+            "Group to process: 'all' or comma/space-separated subject labels without 'sub-' "
+            "(e.g., '0001,0002,0003')."
+        ),
+    )
+    sel.add_argument(
+        "--subject", "-s", type=str, action="append",
+        help=(
+            "BIDS subject label(s) without 'sub-' prefix (e.g., 0001). "
+            "Can be specified multiple times."
+        ),
+    )
+    sel.add_argument(
+        "--all-subjects", action="store_true",
+        help="Process all available subjects with cleaned epochs files",
+    )
+
     parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label (default from config)")
     parser.add_argument("--plateau_tmin", type=float, default=DEFAULT_PLATEAU_TMIN, help="Plateau window start time in seconds (for topomaps and summaries)")
     parser.add_argument("--plateau_tmax", type=float, default=DEFAULT_PLATEAU_TMAX, help="Plateau window end time in seconds (for topomaps and summaries)")
+    parser.add_argument(
+        "--temperature_strategy", "-T",
+        type=str,
+        choices=["pooled", "per", "both"],
+        default=DEFAULT_TEMPERATURE_STRATEGY,
+        help="Temperature analysis strategy: pooled/per/both (default from config)",
+    )
+
     args = parser.parse_args()
 
-    main(subject=args.subject, task=args.task, plateau_tmin=args.plateau_tmin, plateau_tmax=args.plateau_tmax)
+    # Resolve subjects
+    subjects: Optional[List[str]] = None
+    if args.group is not None:
+        g = args.group.strip().lower()
+        if g in {"all", "*", "@all"}:
+            subjects = _get_available_subjects()
+        else:
+            cand = [s.strip() for s in g.replace(";", ",").replace(" ", ",").split(",") if s.strip()]
+            subjects = []
+            for s in cand:
+                if _find_clean_epochs_path(s, args.task) is not None:
+                    subjects.append(s)
+                else:
+                    print(f"Warning: --group subject '{s}' has no cleaned epochs; skipping")
+    elif args.all_subjects:
+        subjects = _get_available_subjects()
+    elif args.subject:
+        subjects = list(dict.fromkeys(args.subject))  # de-dup preserving order
+
+    if subjects is None or len(subjects) == 0:
+        # Single-subject mode requires --subject exactly one
+        parser_single = argparse.ArgumentParser(add_help=False)
+        # Just to provide a clearer message
+        print("No subjects provided via --group/--all-subjects/--subject. For single subject, pass --subject <ID>.")
+        sys.exit(2)
+
+    if len(subjects) == 1:
+        main(subject=subjects[0], task=args.task, plateau_tmin=args.plateau_tmin, plateau_tmax=args.plateau_tmax, temperature_strategy=args.temperature_strategy)
+    else:
+        main_group(subjects=subjects, task=args.task, plateau_tmin=args.plateau_tmin, plateau_tmax=args.plateau_tmax, temperature_strategy=args.temperature_strategy)
