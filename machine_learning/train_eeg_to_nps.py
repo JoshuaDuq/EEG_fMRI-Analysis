@@ -18,7 +18,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import joblib
 import numpy as np
@@ -280,37 +280,63 @@ def create_run_manifest(
     return manifest_path
 
 
-def identify_missing_events(events: pd.DataFrame, ratings: Sequence[float]) -> List[int]:
-    missing: List[int] = []
-    ev_values = events["vas_final_coded_rating"].tolist()
-    ratings_list = list(ratings)
-    if len(ev_values) < len(ratings_list):
-        raise ValueError(
-            f"Events have fewer rows ({len(ev_values)}) than EEG features ({len(ratings_list)})."
+def _maybe_int(value: Any) -> Optional[int]:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_drop_log_pairs(
+    drop_log_path: Path, events_df: pd.DataFrame, logger: logging.Logger
+) -> Set[Tuple[int, int]]:
+    pairs: Set[Tuple[int, int]] = set()
+    if not drop_log_path.exists():
+        logger.debug("No drop log found at %s; assuming no dropped EEG trials.", drop_log_path)
+        return pairs
+
+    try:
+        drop_df = pd.read_csv(drop_log_path, sep="\t")
+    except Exception as exc:
+        logger.warning("Failed to read drop log %s: %s", drop_log_path, exc)
+        return pairs
+
+    if drop_df.empty:
+        logger.debug("Drop log %s is empty; no dropped EEG trials recorded.", drop_log_path)
+        return pairs
+
+    if {"run", "trial_number"}.issubset(drop_df.columns):
+        for _, row in drop_df.iterrows():
+            run = _maybe_int(row.get("run"))
+            trial = _maybe_int(row.get("trial_number"))
+            if run is None or trial is None:
+                continue
+            pairs.add((run, trial))
+    elif "original_index" in drop_df.columns:
+        for _, row in drop_df.iterrows():
+            idx = _maybe_int(row.get("original_index"))
+            if idx is None:
+                continue
+            if idx < 0 or idx >= len(events_df):
+                logger.warning(
+                    "Drop log index %s out of bounds for events (n=%d).", idx, len(events_df)
+                )
+                continue
+            event_row = events_df.iloc[idx]
+            run = _maybe_int(event_row.get("run"))
+            trial = _maybe_int(event_row.get("trial_number"))
+            if run is None or trial is None:
+                continue
+            pairs.add((run, trial))
+    else:
+        logger.warning(
+            "Drop log %s lacks run/trial identifiers; unable to derive dropped trials.",
+            drop_log_path,
         )
 
-    rating_idx = 0
-    for event_idx, event_rating in enumerate(ev_values):
-        if rating_idx >= len(ratings_list):
-            missing.extend(range(event_idx, len(ev_values)))
-            break
-        if math.isclose(event_rating, ratings_list[rating_idx], rel_tol=1e-5, abs_tol=1e-4):
-            rating_idx += 1
-        else:
-            missing.append(event_idx)
-
-    if rating_idx != len(ratings_list):
-        raise ValueError(
-            "Could not perfectly align events to EEG features (matched "
-            f"{rating_idx} of {len(ratings_list)} ratings)."
-        )
-
-    expected_missing = len(ev_values) - len(ratings_list)
-    if len(missing) != expected_missing:
-        raise ValueError(
-            f"Alignment discrepancy: expected {expected_missing} missing events, found {len(missing)}."
-        )
-    return missing
+    return pairs
 
 
 def select_direct_power_columns(columns: Sequence[str], bands: Sequence[str]) -> List[str]:
@@ -373,10 +399,55 @@ def load_subject_dataset(
     target_values = pd.to_numeric(target_df.iloc[:, 0], errors="coerce")
     events_df = pd.read_csv(events_path, sep="\t")
 
-    missing_indices = identify_missing_events(events_df, target_values.tolist())
+    if len(events_df) < len(target_values):
+        raise ValueError(
+            f"Events have fewer rows ({len(events_df)}) than EEG features ({len(target_values)})."
+        )
+
+    drop_log_path = features_dir / "dropped_trials.tsv"
+    dropped_pairs = load_drop_log_pairs(drop_log_path, events_df, logger)
+
+    if not dropped_pairs and len(events_df) > len(target_values):
+        trailing_pairs = {
+            (run, trial)
+            for run, trial in (
+                (
+                    _maybe_int(events_df.iloc[idx].get("run")),
+                    _maybe_int(events_df.iloc[idx].get("trial_number")),
+                )
+                for idx in range(len(target_values), len(events_df))
+            )
+            if run is not None and trial is not None
+        }
+        if trailing_pairs:
+            dropped_pairs.update(trailing_pairs)
+            logger.info(
+                "Drop log %s empty; removed %d trailing events by index to match EEG trials.",
+                drop_log_path,
+                len(trailing_pairs),
+            )
+
+    event_pairs = list(
+        zip(events_df["run"].astype(int).tolist(), events_df["trial_number"].astype(int).tolist())
+    )
+    valid_drop_pairs = dropped_pairs & set(event_pairs)
+    unexpected_pairs = dropped_pairs - valid_drop_pairs
+    if unexpected_pairs:
+        logger.warning(
+            "Drop log listed %d trials not present in EEG events; ignoring those entries.",
+            len(unexpected_pairs),
+        )
+    dropped_pairs = valid_drop_pairs
+
+    drop_mask = np.array([pair in dropped_pairs for pair in event_pairs], dtype=bool)
     dropped_trials: List[Dict[str, float]] = []
-    if missing_indices:
-        dropped_view = events_df.iloc[missing_indices][["run", "trial_number", "stimulus_temp", "vas_final_coded_rating"]]
+    if drop_mask.any():
+        dropped_view = events_df.loc[drop_mask, [
+            "run",
+            "trial_number",
+            "stimulus_temp",
+            "vas_final_coded_rating",
+        ]]
         dropped_trials = [
             {
                 "run": int(row["run"]),
@@ -386,27 +457,30 @@ def load_subject_dataset(
             }
             for _, row in dropped_view.iterrows()
         ]
-        events_aligned = events_df.drop(index=missing_indices).reset_index(drop=True)
-    else:
-        events_aligned = events_df.reset_index(drop=True)
+    events_aligned = events_df.loc[~drop_mask].reset_index(drop=True)
 
     trial_br_df = pd.read_csv(trial_br_path, sep="\t")
-    if missing_indices:
-        # Try to filter out dropped trials from trial_br
-        # Note: If trials were filtered at source (split_events_to_runs.py), they won't exist in trial_br
-        mask = np.ones(len(trial_br_df), dtype=bool)
-        for dropped in dropped_trials:
-            idx = trial_br_df[
-                (trial_br_df["run"] == dropped["run"]) &
-                (trial_br_df["trial_idx_run"] == dropped["trial_number"] - 1)
-            ].index
-            if idx.empty:
-                # Trial already filtered at source - this is expected
-                logger.info(f"  Dropped trial (run={dropped['run']}, trial={dropped['trial_number']}) "
-                           f"already filtered from fMRI outputs")
-            else:
-                mask[idx] = False
-        trial_br_aligned = trial_br_df.loc[mask].reset_index(drop=True)
+    if dropped_pairs:
+        trial_pairs = list(
+            zip(
+                trial_br_df["run"].astype(int).tolist(),
+                (trial_br_df["trial_idx_run"].astype(int) + 1).tolist(),
+            )
+        )
+        trial_drop_mask = np.array([pair in dropped_pairs for pair in trial_pairs], dtype=bool)
+        if trial_drop_mask.any():
+            trial_br_aligned = trial_br_df.loc[~trial_drop_mask].reset_index(drop=True)
+        else:
+            trial_br_aligned = trial_br_df.reset_index(drop=True)
+
+        removed_pairs = {pair for pair, flag in zip(trial_pairs, trial_drop_mask) if flag}
+        missing_in_fmri = dropped_pairs - removed_pairs
+        for run, trial_number in sorted(missing_in_fmri):
+            logger.info(
+                "  Dropped trial (run=%s, trial=%s) already filtered from fMRI outputs.",
+                run,
+                trial_number,
+            )
     else:
         trial_br_aligned = trial_br_df.reset_index(drop=True)
 
