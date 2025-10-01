@@ -169,12 +169,20 @@ def combine_betas_fixed_effects(beta_paths: List[Path],
     mask = np.any(beta_data != 0, axis=-1)
     
     if variance_method == 'uniform':
-        # Simple mean (equal weights)
-        combined_data = np.mean(beta_data, axis=-1)
-        
-        # Variance of mean: var(mean) = mean(var) / n
-        # Using sample variance across runs as estimate
-        combined_var = np.var(beta_data, axis=-1, ddof=1) / n_runs
+        if n_runs == 1:
+            # Single-run case: fall back to spatial variance estimation to avoid
+            # undefined sample variance with ddof=1.
+            combined_data = beta_data[..., 0].astype(np.float64, copy=False)
+            combined_var = np.asarray(
+                estimate_variance(beta_imgs[0], mask), dtype=np.float64
+            )
+        else:
+            # Simple mean (equal weights)
+            combined_data = np.mean(beta_data, axis=-1)
+
+            # Variance of mean: var(mean) = mean(var) / n
+            # Using sample variance across runs as estimate
+            combined_var = np.var(beta_data, axis=-1, ddof=1) / n_runs
         
     elif variance_method == 'spatial':
         # Estimate variance for each run using spatial smoothness
