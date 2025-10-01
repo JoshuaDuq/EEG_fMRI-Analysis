@@ -123,6 +123,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def normalize_gamma_grid(values: Sequence[Union[str, float]]) -> List[Union[str, float]]:
+    """Validate and deduplicate gamma values while preserving order.
+
+    Accepts numeric inputs (as floats or strings) and the special keywords
+    ``"scale"`` and ``"auto"`` used by `sklearn.svm.SVR`.
+    """
+
+    if not values:
+        raise ValueError("Gamma grid must include at least one value.")
+
+    normalized: List[Union[str, float]] = []
+    seen: set = set()
+    for raw in values:
+        item: Union[str, float]
+        if isinstance(raw, str):
+            candidate = raw.strip().lower()
+            if candidate in {"scale", "auto"}:
+                item = candidate
+            else:
+                try:
+                    item = float(raw)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid gamma value '{raw}'.") from exc
+        elif isinstance(raw, (int, float)):
+            item = float(raw)
+        else:
+            raise TypeError(f"Gamma grid entries must be str or float, got {type(raw)!r}.")
+
+        if isinstance(item, float):
+            if item <= 0:
+                raise ValueError("Gamma grid numeric values must be positive.")
+            key = ("float", item)
+        else:
+            key = ("str", item)
+
+        if key not in seen:
+            seen.add(key)
+            normalized.append(item)
+
+    if not normalized:
+        raise ValueError("Gamma grid must include at least one value after normalization.")
+
+    return normalized
+
+
 def make_svm_builder(cache_size: float):
     def builder(random_state: int, _n_jobs: int) -> Pipeline:
         return Pipeline(
