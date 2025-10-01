@@ -14,12 +14,8 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 # Load centralized configuration
-try:  # support both `python -m eeg_pipeline.merge_behavior_to_events` and import
-    from .config_loader import EEGConfig
-    from .alignment_utils import trim_behavioral_to_events_strict
-except Exception:  # pragma: no cover
-    from config_loader import EEGConfig
-    from alignment_utils import trim_behavioral_to_events_strict
+from utils.config_loader import EEGConfig
+from utils.alignment_utils import trim_behavioral_to_events_strict
 
 config = EEGConfig()
 
