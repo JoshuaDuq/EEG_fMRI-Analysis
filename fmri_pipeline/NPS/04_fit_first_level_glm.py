@@ -373,34 +373,65 @@ def compute_regressor_snr(glm: FirstLevelModel,
         bold_img = nib.load(str(bold_path))
         mask_img = nib.load(str(mask_path))
         
-        # Extract data
+        # Extract data (timepoints x voxels)
         bold_data = apply_mask(bold_img, mask_img)
-        
+
+        # Standardize BOLD signals once to enable fast correlation estimates
+        bold_data = np.asarray(bold_data, dtype=np.float64)
+        n_timepoints = bold_data.shape[0]
+
+        # Guard against degenerate time series
+        if n_timepoints < 2:
+            raise ValueError("At least two time points are required to compute regressor SNR")
+
+        bold_mean = bold_data.mean(axis=0)
+        bold_centered = bold_data - bold_mean
+        bold_std = bold_centered.std(axis=0, ddof=1)
+        valid_voxels = bold_std > 0
+
+        bold_z = np.zeros_like(bold_centered)
+        if np.any(valid_voxels):
+            bold_z[:, valid_voxels] = bold_centered[:, valid_voxels] / bold_std[valid_voxels]
+
         # Get design matrix
         design = glm.design_matrices_[0]
-        
+
         # Compute variance explained by each regressor
         snr_data = []
-        
+
         for col in design.columns:
             if col.startswith('drift') or col == 'constant':
                 continue  # Skip drift and constant
-            
+
             # Get regressor
-            regressor = design[col].values
-            
-            # Compute correlation with BOLD signal
-            corr_with_bold = np.corrcoef(regressor, bold_data.T)[0, 1:]
-            mean_corr = np.mean(np.abs(corr_with_bold))
-            
+            regressor = np.asarray(design[col].values, dtype=np.float64)
+            reg_mean = regressor.mean()
+            reg_std_unbiased = regressor.std(ddof=1)
+            reg_range = float(regressor.max() - regressor.min())
+
+            if (
+                np.isclose(reg_range, 0.0)
+                or not np.isfinite(reg_std_unbiased)
+                or reg_std_unbiased <= 0
+                or np.isclose(reg_std_unbiased, 0.0)
+            ):
+                mean_corr = 0.0
+            else:
+                reg_z = (regressor - reg_mean) / reg_std_unbiased
+                corr_with_bold = reg_z @ bold_z / (n_timepoints - 1)
+                mean_corr = float(np.nanmean(np.abs(corr_with_bold)))
+
             snr_data.append({
                 'regressor': col,
                 'mean_abs_correlation': mean_corr,
-                'regressor_std': regressor.std(),
-                'regressor_range': regressor.max() - regressor.min()
+                'regressor_std': float(regressor.std()),
+                'regressor_range': reg_range
             })
-        
+
         snr_df = pd.DataFrame(snr_data)
+        if not snr_df.empty:
+            snr_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            snr_df.fillna(0.0, inplace=True)
         return snr_df
         
     except Exception as e:
