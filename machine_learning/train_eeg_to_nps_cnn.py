@@ -408,6 +408,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_device_request(requested: str, logger) -> str:
+    """Resolve CLI device request to an available torch device string."""
+
+    normalized = requested.lower()
+    if normalized not in {"auto", "cpu", "cuda"}:
+        raise ValueError(f"Unsupported device option '{requested}'.")
+
+    if normalized == "auto":
+        if torch.cuda.is_available():
+            logger.info("CUDA available; selecting GPU device.")
+            return "cuda"
+        logger.info("CUDA unavailable; falling back to CPU device.")
+        return "cpu"
+
+    if normalized == "cuda":
+        if not torch.cuda.is_available():
+            logger.error("CUDA requested but not available. Use --device cpu or ensure GPU drivers are configured.")
+            raise SystemExit(1)
+        return "cuda"
+
+    return "cpu"
+
+
 def normalize_grid(values: Sequence[Union[int, float]], *, value_type: str) -> List[Union[int, float]]:
     unique_values = []
     for val in values:
@@ -486,6 +509,9 @@ def main() -> None:
         batch_grid,
     )
     logger.info("Max epochs: %d | Patience: %d | Grad clip: %s", args.max_epochs, args.patience, args.grad_clip)
+
+    device = resolve_device_request(args.device, logger)
+    logger.info("Effective training device: %s", device)
 
     eeg_deriv_root = repo_root / "eeg_pipeline" / "bids_output" / "derivatives"
     fmri_outputs_root = repo_root / "fmri_pipeline" / "NPS" / "outputs"
@@ -615,7 +641,7 @@ def main() -> None:
             logger=logger,
         )
 
-    cnn_builder = make_cnn_builder(device=args.device, verbose=args.verbose_cnn)
+    cnn_builder = make_cnn_builder(device=device, verbose=args.verbose_cnn)
 
     param_grid = {
         "cnn__conv_channels": conv_grid,
