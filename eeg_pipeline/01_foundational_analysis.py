@@ -1,860 +1,289 @@
+from __future__ import annotations
+
+"""
+Aperiodic (1/f) control and corrected band power features.
+
+Per-subject:
+- Compute per-trial pre-stimulus PSD (Welch) per channel.
+- Fit log10(PSD) ~ a + b*log10(f) to estimate aperiodic offset (a) and slope (b).
+- Compute aperiodic-corrected band power as residual mean within each band.
+- Save ML-ready features to features folder and basic stats/plots.
+"""
+
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import logging
 
-import matplotlib
-matplotlib.use("Agg")  # headless-friendly
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import mne
-from mne_bids import BIDSPath
+from scipy import stats
 
-# Strict alignment utilities
-from alignment_utils import align_events_to_epochs_strict, validate_alignment
+from utils.config_loader import load_config, get_legacy_constants
+from utils.io_utils import (
+    _find_clean_epochs_path as _find_clean_epochs_path,
+    _load_events_df as _load_events_df,
+    _align_events_to_epochs as _align_events_to_epochs,
+    _pick_target_column as _pick_target_column,
+)
+_C = get_legacy_constants(config)
 
-# Shared I/O helpers (support both script and package execution)
-try:
-    from io_utils import (
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-    )
-except Exception:  # pragma: no cover
-    from .io_utils import (  # type: ignore
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-    )
-
-# Load centralized configuration
-from config_loader import load_config, get_legacy_constants
-try:
-    from logging_utils import get_subject_logger, get_group_logger
-except Exception:  # pragma: no cover
-    from .logging_utils import get_subject_logger, get_group_logger  # type: ignore
-
-config = load_config()
-config.setup_matplotlib()
-
-# Extract legacy constants
-_constants = get_legacy_constants(config)
-try:
-    # Ensure derivatives dataset_description exists for downstream outputs
-    from io_utils import _ensure_derivatives_dataset_description
-except Exception:  # pragma: no cover
-    from .io_utils import _ensure_derivatives_dataset_description  # type: ignore
-_ensure_derivatives_dataset_description()
-
-PROJECT_ROOT = _constants["PROJECT_ROOT"]
-BIDS_ROOT = _constants["BIDS_ROOT"]
-DERIV_ROOT = _constants["DERIV_ROOT"]
-TASK = _constants["TASK"]
-DEFAULT_TASK = TASK
-FIG_DPI = _constants["FIG_DPI"]
-ERP_PICKS = _constants["ERP_PICKS"]
-PAIN_COLUMNS = _constants["PAIN_COLUMNS"]
-TEMPERATURE_COLUMNS = _constants["TEMPERATURE_COLUMNS"]
-
-# Extract parameters from config
-FIG_PAD_INCH = float(config.get("output.pad_inches", 0.02))
-BBOX_INCHES = config.get("output.bbox_inches", "tight")
-PAIN_COLOR = config.get("foundational_analysis.erp.pain_color", "crimson")
-NONPAIN_COLOR = config.get("foundational_analysis.erp.nonpain_color", "navy")
-INCLUDE_TMAX_IN_CROP = bool(config.get("foundational_analysis.erp.include_tmax_in_crop", False))
-DEFAULT_CROP_TMIN = config.get("foundational_analysis.erp.default_crop_tmin", None)
-DEFAULT_CROP_TMAX = config.get("foundational_analysis.erp.default_crop_tmax", None)
-ERP_COMBINE = config.get("foundational_analysis.erp.combine", "gfp")
-PLOTS_SUBDIR = config.get("foundational_analysis.erp.plots_subdir", "01_foundational_analysis")
-LOG_FILE_NAME = config.get("logging.file_names.foundational", "01_foundational_analysis.log")
-COUNTS_FILE_NAME = config.get("foundational_analysis.erp.counts_file_name", "counts_pain.tsv")
-ERP_OUTPUT_FILES = dict(config.get("foundational_analysis.erp.output_files", {
-    "pain_gfp": "erp_pain_binary_gfp.png",
-    "pain_butterfly": "erp_pain_binary_butterfly.png",
-    "temp_gfp": "erp_by_temperature_gfp.png",
-    "temp_butterfly": "erp_by_temperature_butterfly.png",
-    "temp_butterfly_template": "erp_by_temperature_butterfly_{label}.png",
-}))
-
-# Baseline window for ERPs (end at or before 0 s)
-ERP_BASELINE_WINDOW = tuple(config.get("time_frequency_analysis.baseline_window", [-0.2, 0.0]))
+DERIV_ROOT: Path = _C["DERIV_ROOT"]
+TASK: str = _C["TASK"]
+FEATURES_FREQ_BANDS: Dict[str, Tuple[float, float]] = _C["FEATURES_FREQ_BANDS"]
+RATING_COLUMNS: List[str] = _C["RATING_COLUMNS"]
+SAVE_FORMATS = tuple(config.get("output.save_formats", ["png"]))
+FIG_DPI = int(config.get("output.fig_dpi", 300))
 
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-
-def _setup_logging(subject: Optional[str] = None) -> logging.Logger:
-    """Backward-compatible wrapper using centralized logging utils."""
-    if subject is None:
-        return get_group_logger("foundational_analysis", LOG_FILE_NAME)
-    return get_subject_logger("foundational_analysis", subject, LOG_FILE_NAME)
+def _plots_dir(subject: str) -> Path:
+    return DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / "08_aperiodic"
 
 
-def _save_fig(fig: plt.Figure, out_dir: Path, name: str, logger: Optional[logging.Logger] = None) -> None:
-    _ensure_dir(out_dir)
-    out_path = out_dir / name
-    # Annotate footer with units and baseline window for transparency
-    try:
-        bw = ERP_BASELINE_WINDOW
-        foot = f"Units: EEG amplitude (V) | ERP Baseline: [{float(bw[0]):.2f}, {float(bw[1]):.2f}] s | Combine: {ERP_COMBINE}"
+def _stats_dir(subject: str) -> Path:
+    return DERIV_ROOT / f"sub-{subject}" / "eeg" / "stats" / "08_aperiodic"
+
+
+def _features_dir(subject: str) -> Path:
+    return DERIV_ROOT / f"sub-{subject}" / "eeg" / "features"
+
+
+def _save_fig(fig: plt.Figure, base: Path) -> None:
+    base = base.with_suffix("")
+    for ext in SAVE_FORMATS:
         try:
-            fig.text(0.01, 0.01, foot, fontsize=8, alpha=0.8)
+            fig.savefig(base.with_suffix(f".{ext}"), dpi=FIG_DPI, bbox_inches="tight")
         except Exception:
             pass
-    except Exception:
-        pass
-    try:
-        fig.tight_layout(rect=[0, 0.03, 1, 1])
-    except Exception:
-        pass
-    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches=BBOX_INCHES, pad_inches=FIG_PAD_INCH)
     plt.close(fig)
-    msg = f"Saved: {out_path}"
-    if logger:
-        logger.info(msg)
-    else:
-        print(msg)
 
 
-# Removed previous MNE Report construction to simplify outputs per user request.
+def _pick_first(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
 
-def _get_available_subjects() -> List[str]:
-    """Find all available subjects in DERIV_ROOT with cleaned epochs files."""
-    subjects = []
-    if not DERIV_ROOT.exists():
-        return subjects
-    
-    for subj_dir in DERIV_ROOT.glob("sub-*"):
-        if subj_dir.is_dir():
-            subject_id = subj_dir.name[4:]  # Remove 'sub-' prefix
-            # Check if cleaned epochs exist for this subject
-            if _find_clean_epochs_path(subject_id, DEFAULT_TASK) is not None:
-                subjects.append(subject_id)
-    
-    return sorted(subjects)
+def _fit_aperiodic(logf: np.ndarray, logpsd: np.ndarray) -> Tuple[float, float]:
+    # returns (offset a, slope b) for y = a + b*x
+    try:
+        b, a = np.polyfit(logf, logpsd, 1)  # note: np.polyfit returns [slope, intercept]
+        return float(a), float(b)
+    except Exception:
+        return float("nan"), float("nan")
 
 
-def process_single_subject(
+def analyze_subject(
     subject: str,
-    task: str = DEFAULT_TASK,
-    crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
-    crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
-    logger: Optional[logging.Logger] = None
-) -> Tuple[Optional[mne.Epochs], bool]:
-    """Process a single subject and return epochs and success status.
-    
-    Returns
-    -------
-    epochs : mne.Epochs or None
-        The processed epochs, or None if processing failed
-    success : bool
-        True if processing completed successfully
-    """
-    if logger is None:
-        logger = get_subject_logger("foundational_analysis", subject, LOG_FILE_NAME)
-    
-    logger.info(f"=== Processing sub-{subject}, task-{task} ===")
-    
-    # Resolve paths
-    plots_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "plots" / PLOTS_SUBDIR
-    _ensure_dir(plots_dir)
+    task: str = TASK,
+    baseline: Optional[Tuple[Optional[float], Optional[float]]] = None,
+    fmin: float = 2.0,
+    fmax: float = 40.0,
+    n_fft: Optional[int] = None,
+) -> Optional[Path]:
+    plots_dir = _plots_dir(subject)
+    stats_dir = _stats_dir(subject)
+    feats_dir = _features_dir(subject)
+    _ensure_dir(plots_dir); _ensure_dir(stats_dir); _ensure_dir(feats_dir)
 
-    # Load epochs
     epo_path = _find_clean_epochs_path(subject, task)
-    if epo_path is None or not epo_path.exists():
-        logger.error(f"Could not find cleaned epochs file for sub-{subject}, task-{task}")
-        return None, False
-    
-    logger.info(f"Loading epochs: {epo_path}")
-    
-    try:
-        epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
-    except Exception as e:
-        logger.error(f"Failed to load epochs for sub-{subject}: {e}")
-        return None, False
+    if epo_path is None or not Path(epo_path).exists():
+        print(f"No epochs for sub-{subject}, task-{task}")
+        return None
+    epochs = mne.read_epochs(epo_path, preload=True, verbose=False)
 
-    # Load events dataframe and attach as metadata
-    # _load_events_df signature is (subject, task, bids_root?) — do not pass logger here
-    events_df = _load_events_df(subject, task)
-    if events_df is None:
-        logger.warning("Events TSV not found; ERP contrasts will be skipped.")
-    else:
-        logger.info(f"Loaded events: {len(events_df)} rows")
-        try:
-            events_aligned = align_events_to_epochs_strict(events_df, epochs, logger)
-            if events_aligned is not None:
-                epochs.metadata = events_aligned
-                validate_alignment(events_aligned, epochs, logger)
-        except ValueError as e:
-            logger.error(f"Event alignment failed strictly: {e}")
-            return None, False
+    if baseline is None:
+        bwin = config.get("time_frequency_analysis.baseline_window", [-0.5, -0.01])
+        b_start = float(bwin[0])
+        b_end = float(bwin[1]) if float(bwin[1]) <= 0 else 0.0
+        baseline = (b_start, b_end)
+    b_start, b_end = baseline
 
-    # Optional epoch time cropping prior to averaging/plotting
-    if crop_tmin is not None or crop_tmax is not None:
-        epochs = _maybe_crop_epochs(epochs, crop_tmin, crop_tmax, logger)
+    picks = mne.pick_types(epochs.info, eeg=True, meg=False, eog=False, stim=False, exclude="bads")
+    if len(picks) == 0:
+        print("No EEG channels after picks")
+        return None
 
-    # ERP: pain vs non-pain and by temperature (requires metadata)
-    if events_df is not None and epochs.metadata is not None:
-        erp_contrast_pain(epochs, plots_dir, logger)
-        erp_by_temperature(epochs, plots_dir, logger)
+    # Compute PSD per epoch/channel in baseline window
+    psds, freqs = mne.time_frequency.psd_welch(
+        epochs,
+        picks=picks,
+        fmin=float(fmin), fmax=float(fmax),
+        tmin=b_start, tmax=b_end,
+        n_fft=n_fft,
+        n_overlap=None,
+        average='mean',  # average over windows, not epochs
+        verbose=False,
+    )  # psds shape: (n_epochs, n_channels, n_freqs)
+    if psds.ndim != 3:
+        print("Unexpected PSD shape")
+        return None
+    eps = 1e-20
+    logf = np.log10(freqs)
+    logpsd = np.log10(np.maximum(psds, eps))
 
-    logger.info("Single subject processing completed.")
-    return epochs, True
+    n_ep, n_ch, n_fr = logpsd.shape
+    # Fit aperiodic params per (epoch, channel)
+    offset = np.full((n_ep, n_ch), np.nan)
+    slope = np.full((n_ep, n_ch), np.nan)
+    for i in range(n_ep):
+        for j in range(n_ch):
+            a, b = _fit_aperiodic(logf, logpsd[i, j, :])
+            offset[i, j] = a
+            slope[i, j] = b
 
+    # Residual (aperiodic-corrected) spectra
+    resid = np.empty_like(logpsd)
+    for i in range(n_ep):
+        for j in range(n_ch):
+            resid[i, j, :] = logpsd[i, j, :] - (offset[i, j] + slope[i, j] * logf)
 
-def group_erp_contrast_pain(all_epochs: List[mne.Epochs], out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
-    """Create group-level pain vs non-pain ERP contrasts using grand averaging."""
-    if not all_epochs:
-        return
-    
-    pain_evokeds = []
-    nonpain_evokeds = []
-    
-    for epochs in all_epochs:
-        if epochs.metadata is None:
-            continue
-            
-        # Find pain column
-        col = None
-        for candidate in PAIN_COLUMNS:
-            if candidate in epochs.metadata.columns:
-                col = candidate
-                break
-        if col is None:
-            continue
-            
-        # Build selections
-        try:
-            ep_pain = epochs[f"{col} == 1"]
-            ep_non = epochs[f"{col} == 0"]
-        except Exception:
-            try:
-                ep_pain = epochs[np.asarray(pd.to_numeric(epochs.metadata[col], errors="coerce") == 1)]
-                ep_non = epochs[np.asarray(pd.to_numeric(epochs.metadata[col], errors="coerce") == 0)]
-            except Exception:
-                continue
-        
-        if len(ep_pain) > 0:
-            pain_evokeds.append(ep_pain.average(picks=ERP_PICKS))
-        if len(ep_non) > 0:
-            nonpain_evokeds.append(ep_non.average(picks=ERP_PICKS))
-    
-    if len(pain_evokeds) == 0 or len(nonpain_evokeds) == 0:
-        if logger:
-            logger.warning("Group ERP pain contrast: insufficient data across subjects")
-        return
-    
-    # Create grand averages (fallback visualization)
-    grand_pain = mne.grand_average(pain_evokeds, interpolate_bads=True)
-    grand_nonpain = mne.grand_average(nonpain_evokeds, interpolate_bads=True)
-    
-    # GFP contrast
-    try:
-        # Prefer CI shading across subjects when available (newer MNE)
-        try:
-            fig = mne.viz.plot_compare_evokeds(
-                {"painful": pain_evokeds, "non-painful": nonpain_evokeds},
-                picks=ERP_PICKS,
-                combine=ERP_COMBINE,
-                show=False,
-                colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
-                ci=0.95,
-            )
-        except TypeError:
-            # Older MNE without 'ci' or list handling for CI
-            fig = mne.viz.plot_compare_evokeds(
-                {"painful": grand_pain, "non-painful": grand_nonpain},
-                picks=ERP_PICKS,
-                combine=ERP_COMBINE,
-                show=False,
-                colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
-            )
-        if isinstance(fig, list):
-            fig = fig[0]
-        fig.suptitle(f"Group ERP: Pain vs Non-Pain (N={len(pain_evokeds)} subjects)", fontsize=14, fontweight='bold')
-        _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["pain_gfp"], logger)
-    except Exception as e:
-        if logger:
-            logger.error(f"Group ERP pain contrast (GFP) failed: {e}")
-
-    # Butterfly overlay
-    try:
-        fig = mne.viz.plot_compare_evokeds(
-            {"painful": grand_pain, "non-painful": grand_nonpain},
-            picks=ERP_PICKS,
-            combine=None,
-            show=False,
-            colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
-        )
-        if isinstance(fig, list):
-            fig = fig[0]
-        fig.suptitle(f"Group ERP: Pain vs Non-Pain (N={len(pain_evokeds)} subjects)", fontsize=14, fontweight='bold')
-        _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["pain_butterfly"], logger)
-    except Exception as e:
-        if logger:
-            logger.error(f"Group ERP pain contrast (butterfly) failed: {e}")
-
-
-def group_erp_by_temperature(all_epochs: List[mne.Epochs], out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
-    """Create group-level temperature ERP contrasts using grand averaging."""
-    if not all_epochs:
-        return
-    
-    # Collect temperature levels across all subjects
-    temp_evokeds_by_level: Dict[str, List[mne.Evoked]] = {}
-    
-    for epochs in all_epochs:
-        if epochs.metadata is None:
-            continue
-            
-        # Find temperature column
-        col = None
-        for candidate in TEMPERATURE_COLUMNS:
-            if candidate in epochs.metadata.columns:
-                col = candidate
-                break
-        if col is None:
-            continue
-            
-        # Determine unique, sensibly sorted levels
-        levels_series = epochs.metadata[col]
-        try:
-            numeric_levels = pd.to_numeric(levels_series, errors="coerce")
-            if numeric_levels.notna().all():
-                uniq_sorted = np.sort(numeric_levels.unique())
-                represent = {v: str(int(v)) if float(v).is_integer() else str(v) for v in uniq_sorted}
-                use_numeric = True
-            else:
-                raise ValueError
-        except Exception:
-            uniq_sorted = sorted(levels_series.astype(str).unique())
-            use_numeric = False
-        
-        # Process each temperature level
-        for lvl in uniq_sorted:
-            if use_numeric:
-                query = f"{col} == {lvl}"
-                label = represent[lvl]
-            else:
-                lvl_str = str(lvl).replace('"', '\\"')
-                query = f"{col} == \"{lvl_str}\""
-                label = str(lvl)
-            
-            try:
-                ep_temp = epochs[query]
-                if len(ep_temp) > 0:
-                    evoked = ep_temp.average(picks=ERP_PICKS)
-                    if label not in temp_evokeds_by_level:
-                        temp_evokeds_by_level[label] = []
-                    temp_evokeds_by_level[label].append(evoked)
-            except Exception as e:
-                if logger:
-                    logger.warning(f"Temperature level {lvl}: selection/averaging failed: {e}")
-    
-    if not temp_evokeds_by_level:
-        if logger:
-            logger.warning("Group ERP by temperature: No evokeds computed across subjects")
-        return
-    
-    # Create grand averages for each temperature level
-    grand_temp_evokeds: Dict[str, mne.Evoked] = {}
-    for label, evokeds_list in temp_evokeds_by_level.items():
-        if len(evokeds_list) > 0:
-            grand_temp_evokeds[label] = mne.grand_average(evokeds_list, interpolate_bads=True)
-
-    # Plot per-temperature butterfly (grand average across subjects for each level)
-    try:
-        for label, evk in grand_temp_evokeds.items():
-            try:
-                fig = evk.plot(picks=ERP_PICKS, spatial_colors=True, show=False)
-                try:
-                    fig.suptitle(f"Group ERP - Temperature {label}")
-                except Exception:
-                    pass
-                safe_label = (
-                    str(label)
-                    .replace(" ", "_")
-                    .replace("/", "-")
-                    .replace("\\", "-")
-                    .replace(".", "p")
-                    .replace(":", "-")
-                )
-                _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["temp_butterfly_template"].format(label=safe_label), logger)
-            except Exception as e:
-                if logger:
-                    logger.warning(f"Group per-temperature butterfly failed for {label}: {e}")
-    except Exception as e:
-        if logger:
-            logger.warning(f"Group per-temperature butterfly plotting failed: {e}")
-
-    # Combined butterfly overlay across all temperature levels (grand averages)
-    try:
-        if len(grand_temp_evokeds) >= 2:
-            fig = mne.viz.plot_compare_evokeds(
-                grand_temp_evokeds, picks=ERP_PICKS, combine=None, show=False
-            )
-            if isinstance(fig, list):
-                fig = fig[0]
-            try:
-                n_info = ", ".join([f"{k}: N={len(temp_evokeds_by_level[k])}" for k in grand_temp_evokeds.keys()])
-                fig.suptitle(f"Group ERP by Temperature (Butterfly) — {n_info}", fontsize=14, fontweight='bold')
-            except Exception:
-                pass
-            _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["temp_butterfly"], logger)
-    except Exception as e:
-        if logger:
-            logger.warning(f"Group combined temperature butterfly failed: {e}")
-
-    # Plot GFP across temperature levels
-    try:
-        # Prefer CI shading across subjects when available (newer MNE)
-        try:
-            fig = mne.viz.plot_compare_evokeds(
-                temp_evokeds_by_level, picks=ERP_PICKS, combine=ERP_COMBINE, show=False, ci=0.95
-            )
-        except TypeError:
-            fig = mne.viz.plot_compare_evokeds(grand_temp_evokeds, picks=ERP_PICKS, combine=ERP_COMBINE, show=False)
-        if isinstance(fig, list):
-            fig = fig[0]
-        n_subjects_info = ", ".join([f"{k}: N={len(v)}" for k, v in temp_evokeds_by_level.items()])
-        fig.suptitle(f"Group ERP by Temperature ({n_subjects_info} subjects)", fontsize=14, fontweight='bold')
-        _save_fig(fig, out_dir, "group_" + ERP_OUTPUT_FILES["temp_gfp"], logger)
-    except Exception as e:
-        if logger:
-            logger.error(f"Group ERP by temperature (GFP) failed: {e}")
-
-
-def _maybe_crop_epochs(
-    epochs: mne.Epochs, crop_tmin: Optional[float], crop_tmax: Optional[float], logger: Optional[logging.Logger] = None
-) -> mne.Epochs:
-    """Optionally crop epochs in time.
-
-    Notes
-    -----
-    - Uses include_tmax=False to drop the terminal sample, which helps avoid
-      boundary artifacts at the exact epoch end (e.g., stimulus offset).
-    - If a bound is None, the existing epochs.tmin/tmax is kept.
-    """
-    if crop_tmin is None and crop_tmax is None:
-        return epochs
-    tmin = epochs.tmin if crop_tmin is None else float(crop_tmin)
-    tmax = epochs.tmax if crop_tmax is None else float(crop_tmax)
-    # Ensure valid order
-    if tmax <= tmin:
-        raise ValueError(f"Invalid crop window: tmin={tmin}, tmax={tmax}")
-    msg = f"Cropping epochs to [{tmin:.3f}, {tmax:.3f}] s (include_tmax={INCLUDE_TMAX_IN_CROP})"
-    if logger:
-        logger.info(msg)
-    else:
-        print(msg)
-    ep = epochs.copy()
-    # Cropping modifies epoch data; ensure it is loaded into memory
-    if not getattr(ep, "preload", False):
-        ep.load_data()
-    return ep.crop(tmin=tmin, tmax=tmax, include_tmax=INCLUDE_TMAX_IN_CROP)
-
-
-def _write_group_pain_counts(
-    all_epochs: List[mne.Epochs], subjects: List[str], out_dir: Path, logger: Optional[logging.Logger] = None
-) -> None:
-    """Write per-subject trial counts for pain vs non-pain to TSV.
-
-    The output includes columns: subject, n_pain, n_nonpain, n_total.
-    Subjects missing metadata or pain columns are recorded with zeros.
-    """
+    # Band masks
+    band_masks = {b: (freqs >= lo) & (freqs <= hi) for b, (lo, hi) in FEATURES_FREQ_BANDS.items()}
+    # Build features per trial
+    ch_names = [epochs.info["ch_names"][p] for p in picks]
     rows = []
-    for subj, epochs in zip(subjects, all_epochs):
-        n_pain = 0
-        n_non = 0
-        if epochs.metadata is not None:
-            col = None
-            for candidate in PAIN_COLUMNS:
-                if candidate in epochs.metadata.columns:
-                    col = candidate
-                    break
-            if col is not None:
-                vals = pd.to_numeric(epochs.metadata[col], errors="coerce")
-                n_pain = int((vals == 1).sum())
-                n_non = int((vals == 0).sum())
-        rows.append({
-            "subject": subj,
-            "n_pain": n_pain,
-            "n_nonpain": n_non,
-            "n_total": n_pain + n_non,
-        })
-    if not rows:
-        return
-    df = pd.DataFrame(rows)
-    # Add summary row
-    total = df[["n_pain", "n_nonpain", "n_total"]].sum()
-    total_row = {"subject": "TOTAL", **{k: int(v) for k, v in total.to_dict().items()}}
-    df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
-    _ensure_dir(out_dir)
-    out_path = out_dir / COUNTS_FILE_NAME
-    try:
-        df.to_csv(out_path, sep="\t", index=False)
-        if logger:
-            logger.info(f"Saved counts: {out_path}")
-        else:
-            print(f"Saved counts: {out_path}")
-    except Exception as e:
-        if logger:
-            logger.warning(f"Failed to write counts TSV at {out_path}: {e}")
-        else:
-            print(f"Warning: Failed to write counts TSV at {out_path}: {e}")
-
-
-def erp_contrast_pain(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
-    # Prefer MNE metadata-based selection
-    if epochs.metadata is None:
-        msg = "ERP pain contrast: epochs.metadata is missing; skipping."
-        if logger:
-            logger.warning(msg)
-        else:
-            print(msg)
-        return
-    col = None
-    for candidate in PAIN_COLUMNS:
-        if candidate in epochs.metadata.columns:
-            col = candidate
-            break
-    if col is None:
-        msg = "ERP pain contrast: No pain column found in metadata. Skipping."
-        if logger:
-            logger.warning(msg)
-        else:
-            print(msg)
-        return
-
-    # Apply baseline correction on a copy to avoid side effects
-    try:
-        b_start, b_end = float(ERP_BASELINE_WINDOW[0]), float(ERP_BASELINE_WINDOW[1])
-        if b_end > 0:
-            b_end = 0.0
-        epochs = epochs.copy().apply_baseline((b_start, b_end))
-    except Exception as e:
-        if logger:
-            logger.warning(f"Skipping ERP baseline due to error: {e}")
-
-    # Build selections using MNE metadata query
-    try:
-        ep_pain = epochs[f"{col} == 1"]
-    except Exception:
-        # In case types require casting
-        ep_pain = epochs[np.asarray(pd.to_numeric(epochs.metadata[col], errors="coerce") == 1)]
-    try:
-        ep_non = epochs[f"{col} == 0"]
-    except Exception:
-        ep_non = epochs[np.asarray(pd.to_numeric(epochs.metadata[col], errors="coerce") == 0)]
-
-    if len(ep_pain) == 0 or len(ep_non) == 0:
-        msg = "ERP pain contrast: one of the groups has zero trials; skipping."
-        if logger:
-            logger.warning(msg)
-        else:
-            print(msg)
-        return
-
-    ev_pain = ep_pain.average(picks=ERP_PICKS)
-    ev_non = ep_non.average(picks=ERP_PICKS)
-
-    # GFP contrast
-    try:
-        fig = mne.viz.plot_compare_evokeds(
-            {"painful": ev_pain, "non-painful": ev_non},
-            picks=ERP_PICKS,
-            combine=ERP_COMBINE,
-            show=False,
-            colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
-        )
-        if isinstance(fig, list):
-            fig = fig[0]
-        _save_fig(fig, out_dir, ERP_OUTPUT_FILES["pain_gfp"], logger)
-    except Exception as e:
-        msg = f"ERP pain contrast (GFP) failed: {e}"
-        if logger:
-            logger.error(msg)
-        else:
-            print(msg)
-
-    # Butterfly overlay
-    try:
-        fig = mne.viz.plot_compare_evokeds(
-            {"painful": ev_pain, "non-painful": ev_non},
-            picks=ERP_PICKS,
-            combine=None,
-            show=False,
-            colors={"painful": PAIN_COLOR, "non-painful": NONPAIN_COLOR},
-        )
-        if isinstance(fig, list):
-            fig = fig[0]
-        _save_fig(fig, out_dir, ERP_OUTPUT_FILES["pain_butterfly"], logger)
-    except Exception as e:
-        msg = f"ERP pain contrast (butterfly) failed: {e}"
-        if logger:
-            logger.error(msg)
-        else:
-            print(msg)
-
-
-def erp_by_temperature(epochs: mne.Epochs, out_dir: Path, logger: Optional[logging.Logger] = None) -> None:
-    if epochs.metadata is None:
-        msg = "ERP by temperature: epochs.metadata is missing; skipping."
-        if logger:
-            logger.warning(msg)
-        else:
-            print(msg)
-        return
-    col = None
-    for candidate in TEMPERATURE_COLUMNS:
-        if candidate in epochs.metadata.columns:
-            col = candidate
-            break
-    if col is None:
-        msg = "ERP by temperature: No temperature column found in metadata. Skipping."
-        if logger:
-            logger.warning(msg)
-        else:
-            print(msg)
-        return
-
-    # Apply baseline correction on a copy to avoid side effects
-    try:
-        b_start, b_end = float(ERP_BASELINE_WINDOW[0]), float(ERP_BASELINE_WINDOW[1])
-        if b_end > 0:
-            b_end = 0.0
-        epochs = epochs.copy().apply_baseline((b_start, b_end))
-    except Exception as e:
-        if logger:
-            logger.warning(f"Skipping ERP baseline due to error: {e}")
-
-    # Determine unique, sensibly sorted levels
-    levels_series = epochs.metadata[col]
-    try:
-        numeric_levels = pd.to_numeric(levels_series, errors="coerce")
-        if numeric_levels.notna().all():
-            uniq_sorted = np.sort(numeric_levels.unique())
-            represent = {v: str(int(v)) if float(v).is_integer() else str(v) for v in uniq_sorted}
-            use_numeric = True
-        else:
-            raise ValueError
-    except Exception:
-        uniq_sorted = sorted(levels_series.astype(str).unique())
-        use_numeric = False
-
-
-    evokeds: Dict[str, mne.Evoked] = {}
-    for lvl in uniq_sorted:
-        if use_numeric:
-            query = f"{col} == {lvl}"
-            label = represent[lvl]
-        else:
-            # Escape quotes if present in string
-            lvl_str = str(lvl).replace('"', '\\"')
-            query = f"{col} == \"{lvl_str}\""
-            label = str(lvl)
-        try:
-            evokeds[label] = epochs[query].average(picks=ERP_PICKS)
-        except Exception as e:
-            msg = f"Temperature level {lvl}: selection/averaging failed: {e}"
-            if logger:
-                logger.warning(msg)
+    for i in range(n_ep):
+        rec = {}
+        # aperiodic params per channel
+        for j, ch in enumerate(ch_names):
+            rec[f"aper_slope_{ch}"] = float(slope[i, j])
+            rec[f"aper_offset_{ch}"] = float(offset[i, j])
+        # pow raw and corrected per band/channel
+        for b, mask in band_masks.items():
+            if not np.any(mask):
+                for j, ch in enumerate(ch_names):
+                    rec[f"powrawpre_{b}_{ch}"] = np.nan
+                    rec[f"powcorr_{b}_{ch}"] = np.nan
             else:
-                print(msg)
+                for j, ch in enumerate(ch_names):
+                    rec[f"powrawpre_{b}_{ch}"] = float(np.mean(logpsd[i, j, mask]))
+                    rec[f"powcorr_{b}_{ch}"] = float(np.mean(resid[i, j, mask]))
+        rows.append(rec)
+    feat_df = pd.DataFrame(rows)
+    out_feats = feats_dir / "features_aperiodic.tsv"
+    feat_df.to_csv(out_feats, sep="\t", index=False)
 
-    if len(evokeds) == 0:
-        msg = "ERP by temperature: No evokeds computed; skipping plot."
-        if logger:
-            logger.warning(msg)
-        else:
-            print(msg)
-        return
-
-    # One plot per temperature level (Evoked butterfly) with title
-    for label, evk in evokeds.items():
-        try:
-            fig = evk.plot(picks=ERP_PICKS, spatial_colors=True, show=False)
+    # Behavior correlations (channel-averaged summaries)
+    beh_corr = None
+    events = _load_events_df(subject, task)
+    aligned = _align_events_to_epochs(events, epochs)
+    if aligned is not None:
+        rating_col = _pick_first(aligned, RATING_COLUMNS)
+        if rating_col is not None:
+            y = pd.to_numeric(aligned[rating_col], errors="coerce").to_numpy()
+            mask_valid = np.isfinite(y)
+            # Slope/offset averaged across channels
+            slope_mean = np.nanmean(slope, axis=1)
+            offset_mean = np.nanmean(offset, axis=1)
+            rows2 = []
+            def _corr(a):
+                try:
+                    r, p = stats.spearmanr(a[mask_valid], y[mask_valid])
+                    return float(r), float(p), int(mask_valid.sum())
+                except Exception:
+                    return np.nan, np.nan, 0
+            r,p,n = _corr(slope_mean)
+            rows2.append({"metric": "slope_mean", "r": r, "p": p, "n": n})
+            r,p,n = _corr(offset_mean)
+            rows2.append({"metric": "offset_mean", "r": r, "p": p, "n": n})
+            # powcorr band avg across channels
+            for b, mask in band_masks.items():
+                if not np.any(mask):
+                    continue
+                band_resid = np.nanmean(resid[:, :, mask], axis=(1, 2))  # (n_ep,)
+                r,p,n = _corr(band_resid)
+                rows2.append({"metric": f"powcorr_{b}_mean", "r": r, "p": p, "n": n})
+            beh_corr = pd.DataFrame(rows2)
+            beh_corr["q"] = _fdr_bh(beh_corr["p"].to_numpy())
+            out_beh = stats_dir / "aperiodic_behavior_correlations.tsv"
+            beh_corr.to_csv(out_beh, sep="\t", index=False)
+            # Plot bar chart of correlations
             try:
-                fig.suptitle(f"ERP - Temperature {label}")
+                fig, ax = plt.subplots(figsize=(max(6, 1.0 * len(rows2)), 4.0))
+                xs = np.arange(len(rows2))
+                vals = [r["r"] for r in rows2]
+                ax.bar(xs, vals, color="#1f77b4")
+                ax.set_xticks(xs)
+                ax.set_xticklabels([str(r["metric"]) for r in rows2], rotation=45, ha='right')
+                ax.set_ylabel("Spearman r")
+                ax.set_title("Aperiodic/Corrected vs rating (channel-avg)")
+                # Mark significant
+                for i, rec in enumerate(rows2):
+                    if np.isfinite(rec["r"]) and beh_corr.iloc[i]["q"] < 0.05:
+                        ax.text(i, vals[i] + 0.02*np.sign(vals[i] or 1), "*", ha="center", va="bottom")
+                ax.axhline(0, color='k', lw=0.8)
+                plt.tight_layout()
+                _save_fig(fig, plots_dir / "aperiodic_behavior_bar")
             except Exception:
                 pass
-            safe_label = (
-                str(label)
-                .replace(" ", "_")
-                .replace("/", "-")
-                .replace("\\", "-")
-                .replace(".", "p")
-                .replace(":", "-")
-            )
-            _save_fig(fig, out_dir, ERP_OUTPUT_FILES["temp_butterfly_template"].format(label=safe_label), logger)
-        except Exception as e:
-            msg = f"Per-temperature plot failed for {label}: {e}"
-            if logger:
-                logger.error(msg)
-            else:
-                print(msg)
 
-    # Combined butterfly overlay across all temperature levels
+    # Topomaps for mean slope/offset
+    picks_idx = picks
     try:
-        if len(evokeds) >= 2:
-            fig = mne.viz.plot_compare_evokeds(evokeds, picks=ERP_PICKS, combine=None, show=False)
-            if isinstance(fig, list):
-                fig = fig[0]
-            try:
-                fig.suptitle("ERP by Temperature (Butterfly)")
-            except Exception:
-                pass
-            _save_fig(fig, out_dir, ERP_OUTPUT_FILES["temp_butterfly"], logger)
-    except Exception as e:
-        msg = f"ERP by temperature (combined butterfly) failed: {e}"
-        if logger:
-            logger.error(msg)
-        else:
-            print(msg)
+        slope_mean_ch = np.nanmean(slope, axis=0)
+        offset_mean_ch = np.nanmean(offset, axis=0)
+        fig1, ax1 = plt.subplots(1, 2, figsize=(9.0, 3.8))
+        mne.viz.plot_topomap(slope_mean_ch, epochs.info, picks=picks_idx, axes=ax1[0], show=False, contours=6, cmap='RdBu_r')
+        ax1[0].set_title('Aperiodic slope (mean)')
+        mne.viz.plot_topomap(offset_mean_ch, epochs.info, picks=picks_idx, axes=ax1[1], show=False, contours=6, cmap='RdBu_r')
+        ax1[1].set_title('Aperiodic offset (mean)')
+        plt.tight_layout()
+        _save_fig(fig1, plots_dir / "aperiodic_slope_offset_topomap")
+    except Exception:
+        pass
 
-    # Plot GFP across levels
+    print(f"Saved aperiodic features: {out_feats}")
+    return out_feats
+
+
+def _fdr_bh(p: np.ndarray, alpha: float = 0.05) -> np.ndarray:
     try:
-        fig = mne.viz.plot_compare_evokeds(evokeds, picks=ERP_PICKS, combine=ERP_COMBINE, show=False)
-        if isinstance(fig, list):
-            fig = fig[0]
-        _save_fig(fig, out_dir, ERP_OUTPUT_FILES["temp_gfp"], logger)
-    except Exception as e:
-        msg = f"ERP by temperature (GFP) failed: {e}"
-        if logger:
-            logger.error(msg)
-        else:
-            print(msg)
+        from statsmodels.stats.multitest import fdrcorrection as _fdrcorrection
+        _, q = _fdrcorrection(p, alpha=alpha)
+        return q
+    except Exception:
+        # fallback BH
+        p = np.asarray(p, dtype=float)
+        n = p.size
+        order = np.argsort(p)
+        ranked = p[order]
+        q = ranked * n / (np.arange(1, n + 1))
+        for i in range(n - 2, -1, -1):
+            q[i] = min(q[i], q[i + 1])
+        out = np.empty_like(p)
+        out[order] = q
+        return out
 
 
-def main(
-    subjects: Optional[List[str]] = None,
-    all_subjects: bool = False,
-    task: str = DEFAULT_TASK,
-    crop_tmin: Optional[float] = DEFAULT_CROP_TMIN,
-    crop_tmax: Optional[float] = DEFAULT_CROP_TMAX,
-    group: Optional[str] = None,
-) -> None:
-    """Main function for foundational EEG ERP analysis.
-    
-    Supports both single-subject and multi-subject analysis.
-    Creates individual subject plots plus group-level grand average ERPs.
-    """
-    # Determine subjects to process from CLI
-    if group is not None:
-        if group.strip().lower() in {"all", "*", "@all"}:
-            subjects = _get_available_subjects()
-            if not subjects:
-                raise ValueError(f"No subjects with cleaned epochs found in {DERIV_ROOT}")
-        else:
-            # Parse comma/space separated labels
-            cand = [s.strip() for s in group.replace(";", ",").replace(" ", ",").split(",") if s.strip()]
-            if not cand:
-                raise ValueError("--group provided but no valid subject labels parsed")
-            # Filter to those that have data; warn for missing
-            valid = []
-            for s in cand:
-                if _find_clean_epochs_path(s, task) is not None:
-                    valid.append(s)
-                else:
-                    print(f"Warning: --group subject '{s}' has no cleaned epochs; skipping")
-            subjects = valid
-            if not subjects:
-                raise ValueError("--group provided but no valid subjects with data found")
-    else:
-        if all_subjects:
-            subjects = _get_available_subjects()
-            if not subjects:
-                raise ValueError(f"No subjects with cleaned epochs found in {DERIV_ROOT}")
-        elif subjects is None or len(subjects) == 0:
-            raise ValueError(
-                "No subjects specified. Use --group all|A,B,C, or --subject (can repeat) or --all-subjects."
-            )
-    
-    # Setup group logging
-    group_logger = get_group_logger("foundational_analysis", LOG_FILE_NAME)
-    group_logger.info(f"=== Multi-subject foundational analysis: {len(subjects)} subjects, task-{task} ===")
-    group_logger.info(f"Subjects: {', '.join(subjects)}")
-    
-    # Process each subject individually
-    all_epochs = []
-    successful_subjects = []
-    
-    for subject in subjects:
-        group_logger.info(f"--- Processing subject: {subject} ---")
-        epochs, success = process_single_subject(subject, task, crop_tmin, crop_tmax, group_logger)
-        if success and epochs is not None:
-            all_epochs.append(epochs)
-            successful_subjects.append(subject)
-            # Build/update subject report with available plots
-            try:
-                _build_subject_report(subject, group_logger)
-            except Exception as e:
-                group_logger.warning(f"Subject report build failed for {subject}: {e}")
-        else:
-            group_logger.warning(f"Failed to process subject {subject}, excluding from group analysis")
-    
-    # Group-level analysis
-    if len(all_epochs) >= 2:  # Need at least 2 subjects for meaningful group analysis
-        group_logger.info(f"=== Group analysis: {len(successful_subjects)} successful subjects ===")
-        group_plots_dir = DERIV_ROOT / "group" / "eeg" / "plots" / PLOTS_SUBDIR
-        _ensure_dir(group_plots_dir)
-        
-        # Group ERP analyses
-        group_erp_contrast_pain(all_epochs, group_plots_dir, group_logger)
-        group_erp_by_temperature(all_epochs, group_plots_dir, group_logger)
-        # Trial counts summary
-        _write_group_pain_counts(all_epochs, successful_subjects, group_plots_dir, group_logger)
-        
-        group_logger.info(f"Group analysis completed. Results saved to: {group_plots_dir}")
-    else:
-        group_logger.warning(f"Only {len(all_epochs)} subjects processed successfully. Skipping group analysis.")
-    
-    group_logger.info(f"=== Analysis complete ===")
-    if successful_subjects:
-        group_logger.info(f"Successfully processed: {', '.join(successful_subjects)}")
-    failed_subjects = set(subjects) - set(successful_subjects)
-    if failed_subjects:
-        group_logger.warning(f"Failed to process: {', '.join(failed_subjects)}")
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Aperiodic (1/f) analysis and corrected band power features.")
+    p.add_argument("--subject", required=True, help="Subject ID (no 'sub-' prefix)")
+    p.add_argument("--task", type=str, default=TASK, help="BIDS task label")
+    p.add_argument("--baseline", nargs=2, type=float, default=None, help="Baseline window [start end] in seconds (end <= 0)")
+    p.add_argument("--fmin", type=float, default=2.0)
+    p.add_argument("--fmax", type=float, default=40.0)
+    p.add_argument("--n-fft", type=int, default=None)
+    args = p.parse_args()
+    baseline = tuple(args.baseline) if args.baseline is not None else None
+    analyze_subject(
+        subject=args.subject,
+        task=args.task,
+        baseline=baseline,
+        fmin=float(args.fmin),
+        fmax=float(args.fmax),
+        n_fft=(int(args.n_fft) if args.n_fft is not None else None),
+    )
 
 
 if __name__ == "__main__":
-    import argparse
+    main()
 
-    parser = argparse.ArgumentParser(description="Foundational EEG ERP analysis supporting single and multiple subjects")
-    
-    # Subject selection arguments (mutually exclusive)
-    subject_group = parser.add_mutually_exclusive_group()
-    subject_group.add_argument(
-        "--group", type=str,
-        help=(
-            "Group of subjects to process: either 'all' or a comma/space-separated "
-            "list of BIDS labels without 'sub-' (e.g., '0001,0002,0003')."
-        ),
-    )
-    subject_group.add_argument(
-        "--subject", "-s", type=str, action="append",
-        help=(
-            "BIDS subject label(s) without 'sub-' prefix (e.g., 0000). "
-            "Can be specified multiple times for multiple subjects."
-        ),
-    )
-    subject_group.add_argument(
-        "--all-subjects", action="store_true",
-        help="Process all available subjects with cleaned epochs files"
-    )
-    
-    parser.add_argument("--task", "-t", type=str, default=DEFAULT_TASK, help="BIDS task label (default from config)")
-    parser.add_argument("--crop-tmin", type=float, default=DEFAULT_CROP_TMIN, help="ERP epoch crop start time (s)")
-    parser.add_argument("--crop-tmax", type=float, default=DEFAULT_CROP_TMAX, help="ERP epoch crop end time (s)")
-    
-    args = parser.parse_args()
-
-    main(
-        subjects=args.subject, 
-        all_subjects=args.all_subjects, 
-        task=args.task,
-        crop_tmin=args.crop_tmin,
-        crop_tmax=args.crop_tmax,
-        group=args.group,
-    )
