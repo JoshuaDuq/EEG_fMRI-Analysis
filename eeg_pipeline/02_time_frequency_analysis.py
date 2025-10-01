@@ -21,39 +21,25 @@ except Exception:  # fallback handled in helper
 from mne.stats import permutation_cluster_test, permutation_cluster_1samp_test
 
 # Load centralized configuration
-from config_loader import load_config, get_legacy_constants
-try:
-    from logging_utils import get_subject_logger, get_group_logger
-except Exception:  # pragma: no cover
-    from .logging_utils import get_subject_logger, get_group_logger  # type: ignore
-from tfr_utils import compute_adaptive_n_cycles
-from roi_utils import (
+from utils.config_loader import load_config, get_legacy_constants
+from utils.logging_utils import get_subject_logger, get_group_logger
+from utils.tfr_utils import compute_adaptive_n_cycles
+from utils.roi_utils import (
     canonicalize_ch_name as _canonicalize_ch_name,
     find_roi_channels as _find_roi_channels,
     build_rois_from_info as _build_rois,
 )
-
-# Shared I/O helpers (support both script and package execution)
-try:
-    from io_utils import (
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-    )
-except Exception:  # pragma: no cover
-    from .io_utils import (  # type: ignore
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-    )
+from utils.io_utils import (
+    _find_clean_epochs_path as _find_clean_epochs_path,
+    _load_events_df as _load_events_df,
+)
 
 config = load_config()
 config.setup_matplotlib()
 
 # Extract legacy constants
 _constants = get_legacy_constants(config)
-try:
-    from io_utils import _ensure_derivatives_dataset_description
-except Exception:  # pragma: no cover
-    from .io_utils import _ensure_derivatives_dataset_description  # type: ignore
+from utils.io_utils import _ensure_derivatives_dataset_description
 _ensure_derivatives_dataset_description()
 
 PROJECT_ROOT = _constants["PROJECT_ROOT"]
