@@ -11,37 +11,21 @@ import mne
 from mne_bids import BIDSPath
 
 # Strict alignment utilities
-from alignment_utils import align_events_to_epochs_strict, validate_alignment
-
-# Shared I/O helpers (support both script and package execution)
-try:
-    from io_utils import (
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-    )
-except Exception:  # pragma: no cover
-    from .io_utils import (  # type: ignore
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-    )
-
-# Load centralized configuration
-from config_loader import load_config, get_legacy_constants
-try:
-    from logging_utils import get_subject_logger, get_group_logger
-except Exception:  # pragma: no cover
-    from .logging_utils import get_subject_logger, get_group_logger  # type: ignore
+from utils.alignment_utils import align_events_to_epochs_strict, validate_alignment
+from utils.io_utils import (
+    _find_clean_epochs_path as _find_clean_epochs_path,
+    _load_events_df as _load_events_df,
+)
+from utils.config_loader import load_config, get_legacy_constants
+from utils.logging_utils import get_subject_logger, get_group_logger
 
 config = load_config()
 config.setup_matplotlib()
 
 # Extract legacy constants
 _constants = get_legacy_constants(config)
-try:
-    # Ensure derivatives dataset_description exists for downstream outputs
-    from io_utils import _ensure_derivatives_dataset_description
-except Exception:  # pragma: no cover
-    from .io_utils import _ensure_derivatives_dataset_description  # type: ignore
+# Ensure derivatives dataset_description exists for downstream outputs
+from utils.io_utils import _ensure_derivatives_dataset_description
 _ensure_derivatives_dataset_description()
 
 PROJECT_ROOT = _constants["PROJECT_ROOT"]

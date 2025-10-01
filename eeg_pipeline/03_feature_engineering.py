@@ -17,38 +17,22 @@ import math
 # CONFIG
 # Load centralized configuration from YAML
 # ==========================
-from config_loader import load_config, get_legacy_constants
-try:
-    from logging_utils import get_subject_logger
-except Exception:  # pragma: no cover
-    from .logging_utils import get_subject_logger  # type: ignore
-from alignment_utils import align_events_to_epochs_strict, validate_alignment
-
-# Shared I/O helpers (support both script and package execution)
-try:
-    from io_utils import (
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-        _align_events_to_epochs as _align_events_to_epochs,
-        _pick_target_column as _pick_target_column,
-    )
-except Exception:  # pragma: no cover
-    from .io_utils import (  # type: ignore
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-        _align_events_to_epochs as _align_events_to_epochs,
-        _pick_target_column as _pick_target_column,
-    )
+from utils.config_loader import load_config, get_legacy_constants
+from utils.logging_utils import get_subject_logger
+from utils.alignment_utils import align_events_to_epochs_strict, validate_alignment
+from utils.io_utils import (
+    _find_clean_epochs_path as _find_clean_epochs_path,
+    _load_events_df as _load_events_df,
+    _align_events_to_epochs as _align_events_to_epochs,
+    _pick_target_column as _pick_target_column,
+)
 
 # Load configuration
 config = load_config()
 
 # Extract legacy constants for backward compatibility
 _constants = get_legacy_constants(config)
-try:
-    from io_utils import _ensure_derivatives_dataset_description
-except Exception:  # pragma: no cover
-    from .io_utils import _ensure_derivatives_dataset_description  # type: ignore
+from utils.io_utils import _ensure_derivatives_dataset_description
 _ensure_derivatives_dataset_description()
 
 PROJECT_ROOT = _constants["PROJECT_ROOT"]
@@ -60,7 +44,7 @@ FEATURES_FREQ_BANDS = _constants["FEATURES_FREQ_BANDS"]
 CUSTOM_TFR_FREQS = _constants["CUSTOM_TFR_FREQS"]
 BAND_COLORS = _constants.get("BAND_COLORS", {})
 # Import TFR utilities for improved n_cycles calculation
-from tfr_utils import (
+from utils.tfr_utils import (
     compute_adaptive_n_cycles,
     log_tfr_resolution,
     read_tfr_average_with_logratio,

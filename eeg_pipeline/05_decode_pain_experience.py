@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 # Load configuration and apply thread limits early
-from config_loader import load_config, get_legacy_constants
+from utils.config_loader import load_config, get_legacy_constants
 
 config = load_config()
 config.apply_thread_limits()
@@ -48,20 +48,12 @@ from joblib import Parallel, delayed
 # -----------------------------------------------------------------------------
 
 # Import shared I/O helpers from a dedicated utility module
-try:  # packaged import
-    from .io_utils import (
-        _find_clean_epochs_path as _io_find_clean_epochs_path,
-        _load_events_df as _io_load_events_df,
-        _align_events_to_epochs as _io_align_events_to_epochs,
-        _pick_target_column as _io_pick_target_column,
-    )
-except Exception:  # pragma: no cover - direct script execution fallback
-    from io_utils import (
-        _find_clean_epochs_path as _io_find_clean_epochs_path,
-        _load_events_df as _io_load_events_df,
-        _align_events_to_epochs as _io_align_events_to_epochs,
-        _pick_target_column as _io_pick_target_column,
-    )
+from utils.io_utils import (
+    _find_clean_epochs_path as _io_find_clean_epochs_path,
+    _load_events_df as _io_load_events_df,
+    _align_events_to_epochs as _io_align_events_to_epochs,
+    _pick_target_column as _io_pick_target_column,
+)
 
 # Normalized local aliases expected by downstream code
 find_clean_epochs_path = _io_find_clean_epochs_path

@@ -37,40 +37,25 @@ from joblib.externals.loky.process_executor import BrokenProcessPool
 from scipy.stats import t as _student_t
 from scipy.signal import hilbert as _hilbert
 from threadpoolctl import threadpool_limits
-try:  # optional, available in newer sklearn
+try:
     from sklearn.model_selection import StratifiedGroupKFold as _StratifiedGroupKFold  # type: ignore
 except Exception:  # pragma: no cover
     _StratifiedGroupKFold = None  # type: ignore
 
 # Centralized config and helpers
-from config_loader import load_config, get_legacy_constants
-try:
-    from logging_utils import get_subject_logger, get_group_logger
-except Exception:  # pragma: no cover
-    from .logging_utils import get_subject_logger, get_group_logger  # type: ignore
-
-try:
-    from io_utils import (
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-        _align_events_to_epochs as _align_events_to_epochs,
-    )
-except Exception:  # pragma: no cover
-    from .io_utils import (  # type: ignore
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-        _align_events_to_epochs as _align_events_to_epochs,
-    )
-
-try:
-    from roi_utils import build_rois_from_info as _build_rois
-except Exception:  # pragma: no cover
-    from .roi_utils import build_rois_from_info as _build_rois  # type: ignore
+from utils.config_loader import load_config, get_legacy_constants
+from utils.logging_utils import get_subject_logger, get_group_logger
+from utils.io_utils import (
+    _find_clean_epochs_path as _find_clean_epochs_path,
+    _load_events_df as _load_events_df,
+    _align_events_to_epochs as _align_events_to_epochs,
+    _pick_target_column as _pick_target_column,
+)
+from utils.roi_utils import build_rois_from_info as _build_rois
 
 
 config = load_config()
 _C = get_legacy_constants(config)
-
 # Constrain BLAS backends to a single thread to avoid oversubscription during joblib parallelism
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
