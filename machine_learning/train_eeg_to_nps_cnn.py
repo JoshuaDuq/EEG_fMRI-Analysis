@@ -52,6 +52,30 @@ from machine_learning.train_eeg_to_nps import (  # noqa: E402
 MODEL_NAME = "cnn_1d"
 
 
+class _CNNRegressorModule(nn.Module):
+    """Module implementing the 1D CNN architecture."""
+
+    def __init__(self, features: int, channels: int, kernel_size: int, hidden: int, dropout: float) -> None:
+        super().__init__()
+        self.features = features
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, channels, kernel_size, padding=kernel_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.regressor = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(channels * features, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x = self.conv(inputs)
+        return self.regressor(x).squeeze(-1)
+
+
 class TorchCNNRegressor(BaseEstimator, RegressorMixin):
     """Sklearn-compatible 1D CNN regressor implemented with PyTorch."""
 
@@ -95,33 +119,12 @@ class TorchCNNRegressor(BaseEstimator, RegressorMixin):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _build_model(self, n_features: int, kernel_size: int) -> nn.Module:
-        class _Regressor(nn.Module):
-            def __init__(self, features: int, channels: int, ks: int, hidden: int, drop: float) -> None:
-                super().__init__()
-                self.features = features
-                self.conv = nn.Sequential(
-                    nn.Conv1d(1, channels, ks, padding=ks // 2),
-                    nn.ReLU(),
-                    nn.Dropout(drop),
-                )
-                self.regressor = nn.Sequential(
-                    nn.Flatten(),
-                    nn.Linear(channels * features, hidden),
-                    nn.ReLU(),
-                    nn.Dropout(drop),
-                    nn.Linear(hidden, 1),
-                )
-
-            def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-                x = self.conv(inputs)
-                return self.regressor(x).squeeze(-1)
-
-        return _Regressor(
+        return _CNNRegressorModule(
             features=n_features,
             channels=self.conv_channels,
-            ks=kernel_size,
+            kernel_size=kernel_size,
             hidden=self.hidden_units,
-            drop=self.dropout,
+            dropout=self.dropout,
         )
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "TorchCNNRegressor":
