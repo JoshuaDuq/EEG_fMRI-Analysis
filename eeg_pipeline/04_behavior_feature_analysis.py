@@ -22,25 +22,13 @@ from mne_bids import BIDSPath
 # CONFIG
 # Load centralized configuration from YAML
 # ==========================
-from config_loader import load_config, get_legacy_constants
-try:
-    from logging_utils import get_subject_logger, get_group_logger
-except Exception:  # pragma: no cover
-    from .logging_utils import get_subject_logger, get_group_logger  # type: ignore
-
-# Shared I/O helpers (support both script and package execution)
-try:
-    from io_utils import (
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-        _align_events_to_epochs as _align_events_to_epochs,
-    )
-except Exception:  # pragma: no cover
-    from .io_utils import (  # type: ignore
-        _find_clean_epochs_path as _find_clean_epochs_path,
-        _load_events_df as _load_events_df,
-        _align_events_to_epochs as _align_events_to_epochs,
-    )
+from utils.config_loader import load_config, get_legacy_constants
+from utils.logging_utils import get_subject_logger, get_group_logger
+from utils.io_utils import (
+    _find_clean_epochs_path as _find_clean_epochs_path,
+    _load_events_df as _load_events_df,
+    _align_events_to_epochs as _align_events_to_epochs,
+)
 
 # Load configuration
 config = load_config()
@@ -402,10 +390,7 @@ def _setup_group_logging() -> logging.Logger:
 
 
 # ROI utilities centralized to avoid drift across scripts
-try:
-    from roi_utils import build_rois_from_info as _build_rois
-except Exception:  # pragma: no cover - when executed as part of the package
-    from .roi_utils import build_rois_from_info as _build_rois  # type: ignore
+from utils.roi_utils import build_rois_from_info as _build_rois
 
 
 # -----------------------------------------------------------------------------
