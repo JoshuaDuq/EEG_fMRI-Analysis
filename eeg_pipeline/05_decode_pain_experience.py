@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 # Load configuration and apply thread limits early
-from config_loader import load_config
+from utils.config_loader import load_config, get_legacy_constants
 
 config = load_config()
 config.apply_thread_limits()
+STRICT_MODE = bool(config.get("analysis.strict_mode", True))
 
 import numpy as np
 import pandas as pd
@@ -46,24 +47,19 @@ from joblib import Parallel, delayed
 # Project config and helpers
 # -----------------------------------------------------------------------------
 
-# Reuse helpers from feature engineering if available; otherwise load via importlib
-_HAVE_FE_HELPERS = False
-try:
-    # Attempt dynamic import by file path because the filename starts with digits
-    import importlib.util as _ilus
-    _fe_path = (Path(__file__).resolve().parent / "03_feature_engineering.py").resolve()
-    if _fe_path.exists():
-        _spec = _ilus.spec_from_file_location("_fe_helpers", str(_fe_path))
-        if _spec and _spec.loader:  # type: ignore[attr-defined]
-            _fe_mod = _ilus.module_from_spec(_spec)  # type: ignore
-            _spec.loader.exec_module(_fe_mod)  # type: ignore[attr-defined]
-            _find_clean_epochs_path = getattr(_fe_mod, "_find_clean_epochs_path")
-            _load_events_df = getattr(_fe_mod, "_load_events_df")
-            _align_events_to_epochs = getattr(_fe_mod, "_align_events_to_epochs")
-            _pick_target_column = getattr(_fe_mod, "_pick_target_column")
-            _HAVE_FE_HELPERS = True
-except Exception:
-    _HAVE_FE_HELPERS = False
+# Import shared I/O helpers from a dedicated utility module
+from utils.io_utils import (
+    _find_clean_epochs_path as _io_find_clean_epochs_path,
+    _load_events_df as _io_load_events_df,
+    _align_events_to_epochs as _io_align_events_to_epochs,
+    _pick_target_column as _io_pick_target_column,
+)
+
+# Normalized local aliases expected by downstream code
+find_clean_epochs_path = _io_find_clean_epochs_path
+load_events_df_local = _io_load_events_df
+align_events_to_epochs_local = _io_align_events_to_epochs
+pick_target_column_local = _io_pick_target_column
 
 
 # -----------------------------------------------------------------------------
@@ -98,6 +94,35 @@ _BEST_PARAMS_LOGGED: set = set()
 
 # Load externalized configuration
 CONFIG = config.to_legacy_dict()
+
+# Resolve legacy constants early (used by default args later in the file)
+_LEGACY = get_legacy_constants(config)
+TASK = _LEGACY["TASK"]
+DERIV_ROOT = _LEGACY["DERIV_ROOT"]
+RANDOM_STATE = _LEGACY["RANDOM_STATE"]
+
+# Known experimental structure (can be overridden in YAML): 6 runs of 11 trials
+TRIALS_PER_RUN: int = int(config.get("project.trials_per_run", 11))
+RUNS_PER_SUBJECT: int = int(config.get("project.runs_per_subject", 6))
+
+# -----------------------------------------------------------------------------
+# Backward-compatible defaults for best-params logging paths
+# -----------------------------------------------------------------------------
+try:
+    _paths = CONFIG.setdefault("paths", {})
+    _best = _paths.setdefault("best_params", {})
+    _best.setdefault("elasticnet_loso", "decoding/best_params/elasticnet_loso.jsonl")
+    _best.setdefault("rf_loso", "decoding/best_params/rf_loso.jsonl")
+    _best.setdefault("elasticnet_within", "decoding/best_params/elasticnet_within.jsonl")
+    _best.setdefault("rf_within", "decoding/best_params/rf_within.jsonl")
+    _best.setdefault("riemann_loso", "decoding/best_params/riemann_loso.jsonl")
+    # Template expects a {label} placeholder e.g., 'alpha', 'beta', etc.
+    _best.setdefault("riemann_band_template", "decoding/best_params/riemann_{label}_loso.jsonl")
+    _best.setdefault("temperature_only", "decoding/best_params/temperature_only.jsonl")
+except Exception:
+    # If anything goes wrong, continue; downstream code will raise clearer errors
+    pass
+
 
 
 # -----------------------------------------------------------------------------
@@ -199,7 +224,6 @@ def _validate_inputs(func):
 # -----------------------------------------------------------------------------
 
 _handler_lock = threading.Lock()
-_FILE_LOG_HANDLER: Optional[logging.FileHandler] = None
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
@@ -275,6 +299,10 @@ def _setup_file_logging(results_dir: Path, run_id: Optional[str] = None) -> Path
         try:
             if _FILE_LOG_HANDLER is not None:
                 logger.removeHandler(_FILE_LOG_HANDLER)
+                try:
+                    _FILE_LOG_HANDLER.close()
+                except Exception:
+                    pass
         except (AttributeError, ValueError):
             pass
         # Attach a new file handler
@@ -360,6 +388,113 @@ def _read_best_params_jsonl(path: Path) -> dict:
         return best
     return best
 
+def _read_best_params_jsonl_combined(path: Path) -> dict:
+    """Return a combined mapping of best params keyed by fold and by subject.
+
+    - Keys of type int: outer fold index -> params
+    - Keys of type str: held-out subject id -> params
+
+    Uses the 'best_params' field from each JSONL record (refit metric: Pearson r).
+    Falls back to empty dict on errors.
+    """
+    combined: dict = {}
+    if path is None or (not Path(path).exists()):
+        return combined
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                params = rec.get("best_params") or rec.get("best_params_by_r") or {}
+                if not isinstance(params, dict):
+                    continue
+                fold = rec.get("fold")
+                subj = rec.get("subject") or rec.get("heldout_subject") or rec.get("heldout_subject_id")
+                if fold is not None:
+                    try:
+                        combined[int(fold)] = params
+                    except Exception:
+                        pass
+                if subj is not None:
+                    try:
+                        combined[str(subj)] = params
+                    except Exception:
+                        pass
+    except Exception:
+        return combined
+    return combined
+
+
+def _export_best_params_long_table(jsonl_path: Path, save_path: Path) -> None:
+    """Export best-params JSONL to a long-form TSV for reporting.
+
+    Each row: model, fold, subject, criterion (refit_r|grid_best_r|grid_best_neg_mse),
+    param_key, param_value, score (where available).
+    """
+    records = []
+    if jsonl_path is None or (not Path(jsonl_path).exists()):
+        return
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                model = rec.get("model")
+                fold = rec.get("fold")
+                subj = rec.get("subject") or rec.get("heldout_subject") or rec.get("heldout_subject_id")
+                # refit best params (GridSearchCV refit metric)
+                bp = rec.get("best_params")
+                if isinstance(bp, dict):
+                    for k, v in bp.items():
+                        records.append({
+                            "model": model,
+                            "fold": int(fold) if fold is not None else None,
+                            "subject": str(subj) if subj is not None else None,
+                            "criterion": "refit_r",
+                            "param_key": k,
+                            "param_value": v,
+                            "score": None,
+                        })
+                # best by r (explicit)
+                bpr = rec.get("best_params_by_r")
+                if isinstance(bpr, dict):
+                    sc = rec.get("best_score_r")
+                    for k, v in bpr.items():
+                        records.append({
+                            "model": model,
+                            "fold": int(fold) if fold is not None else None,
+                            "subject": str(subj) if subj is not None else None,
+                            "criterion": "grid_best_r",
+                            "param_key": k,
+                            "param_value": v,
+                            "score": float(sc) if sc is not None else None,
+                        })
+                # best by neg_mse (explicit)
+                bpm = rec.get("best_params_by_neg_mse")
+                if isinstance(bpm, dict):
+                    sc = rec.get("best_score_neg_mse")
+                    for k, v in bpm.items():
+                        records.append({
+                            "model": model,
+                            "fold": int(fold) if fold is not None else None,
+                            "subject": str(subj) if subj is not None else None,
+                            "criterion": "grid_best_neg_mse",
+                            "param_key": k,
+                            "param_value": v,
+                            "score": float(sc) if sc is not None else None,
+                        })
+    except Exception:
+        return
+    if records:
+        try:
+            pd.DataFrame(records).to_csv(save_path, sep="\t", index=False)
+        except Exception:
+            pass
+
 
 def compute_enet_coefs_per_fold(X: pd.DataFrame, y: pd.Series, groups: np.ndarray, best_params_map: dict, seed: int) -> np.ndarray:
     """Fit ElasticNet per LOSO fold using logged best params; return coef matrix (n_folds, n_features).
@@ -370,7 +505,16 @@ def compute_enet_coefs_per_fold(X: pd.DataFrame, y: pd.Series, groups: np.ndarra
     logo = LeaveOneGroupOut()
     coefs = []
     for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups), start=1):
-        params = best_params_map.get(fold, {})
+        # Prefer subject-keyed params if available; fallback to fold-keyed
+        try:
+            heldout_subject = str(np.asarray(groups)[test_idx][0])
+        except Exception:
+            heldout_subject = None
+        params = {}
+        if heldout_subject is not None and heldout_subject in best_params_map:
+            params = best_params_map.get(heldout_subject, {})
+        else:
+            params = best_params_map.get(fold, {})
         pipe = _create_elasticnet_pipeline(seed=seed)
         # Apply best parameters if available
         if isinstance(params, dict) and len(params) > 0:
@@ -666,7 +810,14 @@ def compute_rf_permutation_importance_per_fold(
         except (KeyError, ValueError, TypeError):
             n_repeats = 20
     for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups), start=1):
-        rf_params = best_params_map.get(fold, {})
+        try:
+            heldout_subject = str(np.asarray(groups)[test_idx][0])
+        except Exception:
+            heldout_subject = None
+        if heldout_subject is not None and heldout_subject in best_params_map:
+            rf_params = best_params_map.get(heldout_subject, {})
+        else:
+            rf_params = best_params_map.get(fold, {})
         rf = RandomForestRegressor(
             n_estimators=rf_params.get("rf__n_estimators", 500),
             max_depth=rf_params.get("rf__max_depth", None),
@@ -687,7 +838,7 @@ def compute_rf_permutation_importance_per_fold(
                 n_repeats=n_repeats,
                 random_state=seed,
                 n_jobs=1,
-                scoring="r2",
+                scoring=_make_pearsonr_scorer(),
             )
             imps.append(res.importances_mean)
         except (ValueError, MemoryError, RuntimeError) as e:
@@ -703,11 +854,13 @@ def compute_rf_block_permutation_importance_per_fold(
     best_params_map: dict,
     seed: int,
     n_repeats: Optional[int] = None,
+    blocks_all: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Block-aware permutation importance on each LOSO test fold; return (n_folds, n_features).
 
-    Within each test fold, permute each feature *within subject* blocks to preserve per-subject structure.
-    Importance is mean ΔR² over repeats without refitting the model.
+    Uses run-aware blocks inferred from within-subject trial order (e.g., 6×11).
+    For each test fold, permutes each feature within (subject, run) blocks to
+    preserve run structure. Importance is mean ΔR² over repeats without refitting.
     """
     logo = LeaveOneGroupOut()
     imps: List[np.ndarray] = []
@@ -718,7 +871,14 @@ def compute_rf_block_permutation_importance_per_fold(
         except (KeyError, ValueError, TypeError):
             n_repeats = 20
     for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups), start=1):
-        rf_params = best_params_map.get(fold, {})
+        try:
+            heldout_subject = str(np.asarray(groups)[test_idx][0])
+        except Exception:
+            heldout_subject = None
+        if heldout_subject is not None and heldout_subject in best_params_map:
+            rf_params = best_params_map.get(heldout_subject, {})
+        else:
+            rf_params = best_params_map.get(fold, {})
         rf = RandomForestRegressor(
             n_estimators=rf_params.get("rf__n_estimators", 500),
             max_depth=rf_params.get("rf__max_depth", None),
@@ -734,6 +894,15 @@ def compute_rf_block_permutation_importance_per_fold(
             X_train, X_test = X.iloc[train_idx, :], X.iloc[test_idx, :]
             y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
             g_test = np.asarray(groups)[test_idx]
+            # Infer run-aware blocks per row
+            try:
+                if blocks_all is not None and len(blocks_all) == len(groups):
+                    b_test = np.asarray(blocks_all)[test_idx]
+                else:
+                    _blocks_fallback = _infer_blocks_by_runs(groups, trials_per_run=TRIALS_PER_RUN)
+                    b_test = _blocks_fallback[test_idx]
+            except Exception:
+                b_test = None
             pipe.fit(X_train, y_train)
             y_pred_base = pipe.predict(X_test)
             base_r2 = r2_score(y_test.to_numpy(), np.asarray(y_pred_base))
@@ -746,16 +915,26 @@ def compute_rf_block_permutation_importance_per_fold(
                 # permuting within blocks is a no-op. Mark importance as 0 and continue.
                 all_const = True
                 for s in np.unique(g_test):
-                    idxs = np.where(g_test == s)[0]
-                    if len(idxs) > 1:
-                        vals = X_test.iloc[idxs, j].to_numpy()
-                        try:
-                            nunq = pd.Series(vals).nunique(dropna=False)
-                        except (ValueError, MemoryError):
-                            nunq = 2  # treat as non-constant on error
-                        if int(nunq) > 1:
-                            all_const = False
-                            break
+                    # Within each subject, check per-run subsets if available
+                    subj_mask = np.where(g_test == s)[0]
+                    if len(subj_mask) <= 1:
+                        continue
+                    if b_test is None:
+                        idxs_sets = [subj_mask]
+                    else:
+                        idxs_sets = [subj_mask[b_test[subj_mask] == r] for r in np.unique(b_test[subj_mask])]
+                    for idxs in idxs_sets:
+                        if len(idxs) > 1:
+                            vals = X_test.iloc[idxs, j].to_numpy()
+                            try:
+                                nunq = pd.Series(vals).nunique(dropna=False)
+                            except (ValueError, MemoryError):
+                                nunq = 2
+                            if int(nunq) > 1:
+                                all_const = False
+                                break
+                    if not all_const:
+                        break
                 if all_const:
                     deltas_mean[j] = 0.0
                     try:
@@ -764,28 +943,33 @@ def compute_rf_block_permutation_importance_per_fold(
                         pass
                     continue
                 deltas = np.zeros(int(n_repeats), dtype=float)
-                # Convert to numpy for efficient operations
                 X_test_np = X_test.to_numpy()
                 y_test_np = y_test.to_numpy()
-                for r in range(int(n_repeats)):
-                    # Work directly with numpy arrays to avoid DataFrame copying
+                # Precompute per-subject index lists and optionally per-run subsets
+                per_subject = {}
+                for s in np.unique(g_test):
+                    subj_mask = np.where(g_test == s)[0]
+                    if b_test is None:
+                        per_subject[s] = [subj_mask]
+                    else:
+                        per_subject[s] = [subj_mask[b_test[subj_mask] == r] for r in np.unique(b_test[subj_mask])]
+                for rrep in range(int(n_repeats)):
                     X_test_perm = X_test_np.copy()
-                    # permute feature j within each subject block in the test fold
-                    for s in np.unique(g_test):
-                        idxs = np.where(g_test == s)[0]
-                        if len(idxs) > 1:
-                            X_test_perm[idxs, j] = rng.permutation(X_test_perm[idxs, j])
-                    # Convert back to DataFrame only for prediction
+                    # permute feature j within each (subject, run) block in the test fold
+                    for s, idx_sets in per_subject.items():
+                        for idxs in idx_sets:
+                            if len(idxs) > 1:
+                                X_test_perm[idxs, j] = rng.permutation(X_test_perm[idxs, j])
                     X_perm_df = pd.DataFrame(X_test_perm, columns=X_test.columns, index=X_test.index)
-                    y_pred_perm = pipe.predict(X_perm_df)
-                    r2_perm = r2_score(y_test_np, np.asarray(y_pred_perm))
-                    deltas[r] = base_r2 - r2_perm
-                    deltas[r] = deltas[r] if np.isfinite(deltas[r]) else 0.0
-                    # Explicit cleanup
-                    del X_perm_df, y_pred_perm
+                    try:
+                        y_pred_perm = pipe.predict(X_perm_df)
+                        r2_perm = r2_score(y_test_np, np.asarray(y_pred_perm))
+                    except Exception:
+                        r2_perm = np.nan
+                    delta = base_r2 - r2_perm
+                    deltas[rrep] = delta if np.isfinite(delta) else 0.0
+                    del X_perm_df
                 deltas_mean[j] = float(np.mean(deltas))
-                # Cleanup deltas array
-                del deltas
             # Summarize skipped constant-within-block features for this fold (limit preview)
             if len(skipped_feats) > 0:
                 try:
@@ -831,12 +1015,19 @@ def subject_id_decodability_auc_plot(X: pd.DataFrame, groups: np.ndarray, save_p
     n_splits = min(5, max(2, min_n))
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    lr = LogisticRegression(random_state=seed, max_iter=500, multi_class="ovr")
+    # Scale features for this diagnostic classifier
+    from sklearn.pipeline import Pipeline as _SkPipe
+    from sklearn.preprocessing import StandardScaler as _SkScaler
+    lr = _SkPipe([
+        ("scale", _SkScaler()),
+        ("logreg", LogisticRegression(random_state=seed, max_iter=1000, multi_class="ovr"))
+    ])
     proba_list, y_list, pred_list = [], [], []
     all_predictions = []
     
     # Store per-fold results for detailed analysis
     fold_results = []
+    class_labels = None
     
     for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X, groups)):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -845,6 +1036,11 @@ def subject_id_decodability_auc_plot(X: pd.DataFrame, groups: np.ndarray, save_p
             lr.fit(X_train, y_train)
             proba = lr.predict_proba(X_test)
             y_pred = lr.predict(X_test)
+            if class_labels is None:
+                try:
+                    class_labels = lr.named_steps["logreg"].classes_
+                except Exception:
+                    class_labels = np.unique(groups)
             
             proba_list.append(proba)
             y_list.append(y_test)
@@ -852,12 +1048,15 @@ def subject_id_decodability_auc_plot(X: pd.DataFrame, groups: np.ndarray, save_p
             
             # Store fold-level predictions for analysis
             for i, (true_subj, pred_subj, prob_vec) in enumerate(zip(y_test, y_pred, proba)):
+                # Use class_labels derived from the wrapped estimator
+                cls_list = list(class_labels) if class_labels is not None else []
+                proba_map = {f"prob_{cls}": float(prob_vec[j]) for j, cls in enumerate(cls_list)}
                 all_predictions.append({
                     "fold": fold_idx,
                     "true_subject": str(true_subj),
                     "pred_subject": str(pred_subj),
-                    "correct": true_subj == pred_subj,
-                    **{f"prob_{cls}": prob_vec[j] for j, cls in enumerate(lr.classes_)}
+                    "correct": bool(true_subj == pred_subj),
+                    **proba_map,
                 })
                 
         except Exception as e:
@@ -888,7 +1087,7 @@ def subject_id_decodability_auc_plot(X: pd.DataFrame, groups: np.ndarray, save_p
                 y_binary = (Y == subj).astype(int)
                 if len(np.unique(y_binary)) == 2:  # Need both classes present
                     # Get probability for current subject
-                    subj_idx = np.where(lr.classes_ == subj)[0]
+                    subj_idx = np.where(np.asarray(class_labels) == subj)[0] if class_labels is not None else []
                     if len(subj_idx) > 0:
                         p_subj = P[:, subj_idx[0]]
                         try:
@@ -1302,6 +1501,226 @@ def run_shap_rf_global(X: pd.DataFrame, y: pd.Series, feature_names: List[str], 
         logger.warning(f"SHAP plotting failed: {e}")
 
 
+def run_shap_rf_loso(
+    X: pd.DataFrame,
+    y: pd.Series,
+    groups: np.ndarray,
+    feature_names: List[str],
+    best_params_map: dict,
+    plots_dir: Path,
+    seed: int,
+) -> None:
+    """Compute SHAP values within each LOSO fold and aggregate across folds.
+
+    For each fold, fit preprocessing (impute+variance threshold) on training data, fit RF
+    with that fold's best params, and compute SHAP values ONLY on the test subject's rows.
+    SHAP values are padded back to the full feature space (zeros for dropped-variance features)
+    and then concatenated across all folds. Saves a summary beeswarm plot and a compressed
+    .npz containing SHAP values, associated features (as given), and metadata.
+    """
+    try:
+        import shap  # type: ignore
+    except Exception:
+        logger.info("SHAP not installed; skipping fold-wise SHAP analysis.")
+        return
+
+    logo = LeaveOneGroupOut()
+
+    shap_segments: List[np.ndarray] = []
+    feat_segments: List[np.ndarray] = []
+    y_segments: List[np.ndarray] = []
+    idx_segments: List[np.ndarray] = []
+    fold_id_segments: List[np.ndarray] = []
+    heldout_subjects: List[List[str]] = []
+
+    n_features = X.shape[1]
+
+    for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups), start=1):
+        # Prefer subject-keyed params if available; fallback to fold-keyed
+        params = {}
+        if isinstance(best_params_map, dict):
+            try:
+                heldout_subject = str(np.asarray(groups)[test_idx][0])
+            except Exception:
+                heldout_subject = None
+            if heldout_subject is not None and heldout_subject in best_params_map:
+                params = best_params_map.get(heldout_subject, {})
+            else:
+                params = best_params_map.get(fold, {})
+        # Preprocess: impute + variance filter
+        pre = _create_base_preprocessing_pipeline(include_scaling=False)
+        try:
+            X_train = X.iloc[train_idx, :]
+            X_test = X.iloc[test_idx, :]
+            y_train = y.iloc[train_idx]
+            y_test = y.iloc[test_idx]
+        except Exception as e:
+            logger.warning(f"SHAP fold {fold}: indexing failed: {e}")
+            continue
+
+        try:
+            pre.fit(X_train, y_train)
+            X_train_t = pre.transform(X_train)
+            X_test_t = pre.transform(X_test)
+            var_mask = pre.named_steps["var"].get_support(indices=False)
+        except Exception as e:
+            logger.warning(f"SHAP fold {fold}: preprocessing failed: {e}")
+            continue
+
+        # Build RF with per-fold params
+        try:
+            rf = RandomForestRegressor(
+                n_estimators=params.get("rf__n_estimators", 500),
+                max_depth=params.get("rf__max_depth", None),
+                max_features=params.get("rf__max_features", "sqrt"),
+                min_samples_leaf=params.get("rf__min_samples_leaf", 1),
+                random_state=seed + fold,
+                n_jobs=1,
+                bootstrap=True,
+            )
+            rf.fit(X_train_t, y_train.values)
+        except Exception as e:
+            logger.warning(f"SHAP fold {fold}: RF fit failed: {e}")
+            continue
+
+        # Compute SHAP on this fold's test data only
+        try:
+            explainer = shap.TreeExplainer(rf)
+            shap_vals_fold = explainer.shap_values(X_test_t)
+            if isinstance(shap_vals_fold, list):  # defensive; regression should be array
+                shap_vals_fold = np.asarray(shap_vals_fold[0]) if len(shap_vals_fold) > 0 else np.empty_like(X_test_t)
+            shap_vals_fold = np.asarray(shap_vals_fold)
+            # Pad back to full feature space
+            shap_full = np.zeros((X_test.shape[0], n_features), dtype=float)
+            try:
+                shap_full[:, var_mask] = shap_vals_fold
+            except Exception:
+                # Fallback: align by count if mask length matches shap columns
+                if shap_vals_fold.shape[1] == int(np.sum(var_mask)):
+                    shap_full[:, var_mask] = shap_vals_fold
+                else:
+                    logger.warning(f"SHAP fold {fold}: var-mask alignment failed; padding zeros for unmatched features")
+            shap_segments.append(shap_full)
+            # For features to attach for coloring in summary, use raw X; no transform to keep names/scale
+            feat_segments.append(X_test.to_numpy())
+            y_segments.append(y_test.to_numpy())
+            idx_segments.append(np.asarray(test_idx))
+            fold_id_segments.append(np.full(X_test.shape[0], fold, dtype=int))
+            heldout_subjects.append([str(s) for s in np.asarray(groups)[test_idx]])
+        except Exception as e:
+            logger.warning(f"SHAP fold {fold}: SHAP computation failed: {e}")
+            continue
+
+    if len(shap_segments) == 0:
+        logger.warning("No SHAP segments computed; skipping aggregation and plots.")
+        return
+
+    # Concatenate in deterministic order (fold order already deterministic)
+    SHAP = np.vstack(shap_segments)
+    X_explain = np.vstack(feat_segments)
+    y_explain = np.concatenate(y_segments)
+    sample_indices = np.concatenate(idx_segments)
+    fold_ids = np.concatenate(fold_id_segments)
+    subj_ids = np.concatenate([np.asarray(h) for h in heldout_subjects])
+
+    # Aggregate |SHAP| and plot summary
+    try:
+        mean_abs = np.nanmean(np.abs(SHAP), axis=0)
+        order = np.argsort(mean_abs)[::-1]
+        # Beeswarm summary
+        plt.figure(figsize=(8, 6), dpi=150)
+        shap.summary_plot(SHAP, X_explain, feature_names=feature_names, show=False, plot_type="dot")
+        plt.tight_layout()
+        plt.savefig(plots_dir / "rf_shap_loso_summary.png")
+        plt.close()
+
+        # Bar of top features by mean |SHAP|
+        top_n = min(20, len(feature_names))
+        top_idx = order[:top_n]
+        plt.figure(figsize=(8, 5), dpi=150)
+        sns.barplot(x=mean_abs[top_idx], y=[feature_names[i] for i in top_idx], orient="h", color="#264653")
+        plt.xlabel("Mean |SHAP| across LOSO test folds")
+        plt.ylabel("Feature")
+        plt.tight_layout()
+        plt.savefig(plots_dir / "rf_shap_loso_top20.png")
+        plt.close()
+    except Exception as e:
+        logger.warning(f"SHAP LOSO plotting failed: {e}")
+
+    # Export SHAP feature importance (mean |SHAP|) and by-fold breakdown
+    try:
+        shap_abs = np.abs(SHAP)
+        mean_abs = np.nanmean(shap_abs, axis=0)
+        std_abs = np.nanstd(shap_abs, axis=0)
+        rank_order = np.argsort(mean_abs)[::-1]
+        feat_imp_df = pd.DataFrame({
+            "feature_name": [feature_names[i] for i in range(len(feature_names))],
+            "mean_abs_shap": mean_abs,
+            "std_abs_shap": std_abs,
+        })
+        # Add rank (1 = most important)
+        ranks = np.empty_like(rank_order)
+        ranks[rank_order] = np.arange(1, len(rank_order) + 1)
+        feat_imp_df["rank"] = ranks
+        feat_imp_df.sort_values("rank").to_csv(plots_dir / "rf_shap_loso_feature_importance.tsv", sep="\t", index=False)
+
+        # By-fold feature importance (mean |SHAP| within each fold)
+        by_fold_records = []
+        uniq_folds = np.unique(fold_ids)
+        for f in uniq_folds:
+            m = (fold_ids == f)
+            if not np.any(m):
+                continue
+            mean_abs_f = np.nanmean(shap_abs[m, :], axis=0)
+            for j, nm in enumerate(feature_names):
+                by_fold_records.append({
+                    "fold": int(f),
+                    "feature_name": nm,
+                    "mean_abs_shap": float(mean_abs_f[j]),
+                    "n_samples": int(np.sum(m)),
+                })
+        if len(by_fold_records) > 0:
+            pd.DataFrame(by_fold_records).to_csv(plots_dir / "rf_shap_loso_feature_importance_by_fold.tsv", sep="\t", index=False)
+    except Exception as e:
+        logger.warning(f"Failed to export SHAP feature importance TSVs: {e}")
+
+    # Save arrays for reuse
+    try:
+        np.savez_compressed(
+            plots_dir / "rf_shap_loso_values.npz",
+            shap_values=SHAP,
+            X=X_explain,
+            y=y_explain,
+            feature_names=np.asarray(feature_names),
+            sample_indices=sample_indices,
+            fold_ids=fold_ids,
+            subject_ids=subj_ids,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to save LOSO SHAP arrays: {e}")
+
+    # Save a small SHAP meta JSON for reporting
+    try:
+        # Per-fold counts
+        uniq_folds, fold_counts = np.unique(fold_ids, return_counts=True)
+        top_n = min(20, len(feature_names))
+        mean_abs = np.nanmean(np.abs(SHAP), axis=0)
+        order = np.argsort(mean_abs)[::-1][:top_n]
+        top_feats = [feature_names[i] for i in order]
+        meta = {
+            "n_samples": int(SHAP.shape[0]),
+            "n_features": int(SHAP.shape[1]),
+            "n_subjects": int(len(np.unique(subj_ids))),
+            "n_folds": int(len(np.unique(fold_ids))),
+            "fold_counts": {int(f): int(c) for f, c in zip(uniq_folds.tolist(), fold_counts.tolist())},
+            "top_features_by_mean_abs_shap": top_feats,
+        }
+        with open(plots_dir / "rf_shap_loso_summary.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save SHAP LOSO summary JSON: {e}")
+
+
 def _collect_subject_ids_with_features(deriv_root: Path) -> List[str]:
     """Find subjects that have the required feature and target TSVs."""
     subs = []
@@ -1382,7 +1801,8 @@ def load_tabular_features_and_targets(
                     )
                 X = X.loc[:, common]
                 col_template = common  # shrink template to intersection
-
+        # Ensure we only include valid, aligned trials
+        n = len(X)
         X = X.iloc[:n, :]
         y = y.iloc[:n]
 
@@ -1503,6 +1923,34 @@ def _create_block_aware_cv_for_within_subject(blocks: np.ndarray, n_splits: int 
     # GroupKFold doesn't have random_state, but we can shuffle blocks beforehand if needed
     cv = GroupKFold(n_splits=effective_n_splits)
     return cv, effective_n_splits
+
+
+def _compute_within_subject_trial_index(groups: np.ndarray) -> np.ndarray:
+    """Compute per-row within-subject trial indices from the order in `groups`.
+
+    Returns an array t where t[i] is the 0-based trial index for that row within its subject.
+    Assumes rows are ordered as originally concatenated (per subject, in-order).
+    """
+    groups = np.asarray(groups)
+    trial_idx = np.zeros(len(groups), dtype=int)
+    counters = {}
+    for i, s in enumerate(groups):
+        c = counters.get(s, 0)
+        trial_idx[i] = c
+        counters[s] = c + 1
+    return trial_idx
+
+
+def _infer_blocks_by_runs(groups: np.ndarray, trials_per_run: int = None) -> np.ndarray:
+    """Infer block/run IDs from within-subject trial indices.
+
+    Uses known run structure (e.g., 6 runs of 11 trials) to assign a block id per row.
+    """
+    if trials_per_run is None:
+        trials_per_run = TRIALS_PER_RUN
+    trial_idx = _compute_within_subject_trial_index(groups)
+    blocks = (trial_idx // int(max(1, trials_per_run))).astype(int)
+    return blocks
 
 
 def _log_cv_adjacency_info(indices: np.ndarray, fold_name: str = "") -> None:
@@ -1871,8 +2319,9 @@ def plot_permutation_null_hist(y_true: np.ndarray, y_pred: np.ndarray, groups: n
     plt.hist(null_rs, bins=30, alpha=0.7, color="#bdb2ff", edgecolor="white")
     plt.axvline(obs_r, color="red", linestyle="--", 
                 label=f"observed r={obs_r:.3f}\n95% CI: [{obs_r_ci[0]:.3f}, {obs_r_ci[1]:.3f}]\np={p_val:.3g}")
-    plt.xlabel("Null pooled r (within-subject shuffles)")
+    plt.xlabel("Null pooled r (within-subject shuffles; diagnostic only)")
     plt.ylabel("Count")
+    plt.title("Diagnostic permutation (no selection correction)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(save_path)
@@ -1890,7 +2339,7 @@ def plot_learning_curve_rf(X: pd.DataFrame, y: pd.Series, groups: np.ndarray, re
     logo = LeaveOneGroupOut()
 
     _rf_best_path = best_params_path or (results_dir / CONFIG["paths"]["best_params"]["rf_loso"])
-    best_params_map = _read_best_params_jsonl(_rf_best_path)
+    best_params_map = _read_best_params_jsonl_combined(_rf_best_path)
 
     r_list = []
     r2_list = []
@@ -1909,6 +2358,7 @@ def plot_learning_curve_rf(X: pd.DataFrame, y: pd.Series, groups: np.ndarray, re
             take_idx = np.array(sorted(set(take_idx)))
 
             # Build RF with best params for this fold if available
+            # Prefer fold-key for learning curve (subject mapping not aligned here)
             rf_params = best_params_map.get(fold, {})
             rf = RandomForestRegressor(n_estimators=rf_params.get("rf__n_estimators", 500),
                                        max_depth=rf_params.get("rf__max_depth", None),
@@ -1974,18 +2424,18 @@ def plot_learning_curve_en(X: pd.DataFrame, y: pd.Series, groups: np.ndarray, re
             # Build ElasticNet with best params for this fold if available
             en_params = best_params_map.get(fold, {})
             en_cfg = CONFIG["models"]["elasticnet"]
-            en = ElasticNet(
-                alpha=en_params.get("regressor__regressor__alpha", 1.0),
-                l1_ratio=en_params.get("regressor__regressor__l1_ratio", 0.5),
-                max_iter=en_cfg["max_iter"],
-                tol=en_cfg["tol"],
-                selection=en_cfg["selection"],
-                random_state=seed
-            )
-            # Create pipeline with scaling and feature selection like the main pipeline
-            pipe = _create_base_preprocessing_pipeline(include_scaling=True)
-            pipe.steps.append(("feature_selection", SelectFromModel(en, threshold="median")))
-            pipe.steps.append(("regressor", TransformedTargetRegressor(regressor=en, transformer=PowerTransformer(method="yeo-johnson", standardize=True))))
+            # Create pipeline consistent with the main ElasticNet pipeline (no extra feature selection)
+            pipe = _create_elasticnet_pipeline(seed=seed)
+            # Apply same max_iter/tol/selection tuning
+            pipe.named_steps["regressor"].regressor.max_iter = en_cfg["max_iter"]
+            pipe.named_steps["regressor"].regressor.tol = en_cfg["tol"]
+            pipe.named_steps["regressor"].regressor.selection = en_cfg["selection"]
+            # Set per-fold best params if available
+            try:
+                if isinstance(en_params, dict) and len(en_params) > 0:
+                    pipe.set_params(**en_params)
+            except Exception:
+                pass
             
             pipe.fit(X.iloc[take_idx], y.iloc[take_idx])
             y_pred = pipe.predict(X.iloc[test_idx])
@@ -2371,7 +2821,17 @@ def _loso_predictions_with_fixed_params(
         X_train, X_test = X.iloc[train_idx, :], X.iloc[test_idx, :]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         pipe = clone(pipe_template)
-        params = best_params_map.get(fold, {}) if isinstance(best_params_map, dict) else {}
+        # Prefer subject-keyed params if available; fallback to fold-keyed
+        params = {}
+        try:
+            heldout_subject = str(np.asarray(groups)[test_idx][0])
+        except Exception:
+            heldout_subject = None
+        if isinstance(best_params_map, dict):
+            if heldout_subject is not None and heldout_subject in best_params_map:
+                params = best_params_map.get(heldout_subject, {})
+            else:
+                params = best_params_map.get(fold, {})
         try:
             if isinstance(params, dict) and len(params) > 0:
                 pipe.set_params(**params)
@@ -2455,22 +2915,15 @@ def _within_subject_kfold_predictions(
     scoring = {'r': _make_pearsonr_scorer(), 'neg_mse': 'neg_mean_squared_error'}
     refit_metric = 'r'
     
-    # Extract block information for block-aware CV if deriv_root is provided
-    block_ids = None
-    if deriv_root is not None:
-        try:
-            # Create minimal meta DataFrame for block extraction
-            meta = pd.DataFrame({
-                'subject_id': groups,
-                'trial_id': np.arange(len(groups))
-            })
-            _, _, block_ids = _aggregate_temperature_trial_and_block(meta, deriv_root, task)
-            logger.info(f"Block-aware within-subject CV: extracted block info for {len(np.unique(block_ids[~pd.isna(block_ids)]))} unique blocks")
-        except Exception as e:
-            logger.warning(f"Block extraction failed for within-subject CV: {e}. Falling back to trial-level splits.")
-            block_ids = None
+    # Prefer block-aware CV using known run structure (6 runs x 11 trials by default)
+    try:
+        blocks_all = _infer_blocks_by_runs(groups, trials_per_run=TRIALS_PER_RUN)
+        logger.info("Within-subject CV: using run-aware blocks inferred from trial order (trials_per_run=%d)" % TRIALS_PER_RUN)
+    except Exception as e:
+        logger.warning(f"Run-aware block inference failed: {e}")
+        blocks_all = None
 
-    # Build outer folds: for each subject, use block-aware CV when possible
+    # Build outer folds: for each subject, prefer block-aware CV; enforce in strict mode
     folds: List[Tuple[int, np.ndarray, np.ndarray, str]] = []
     fold_counter = 0
     unique_subs = [str(s) for s in np.unique(groups)]
@@ -2488,8 +2941,8 @@ def _within_subject_kfold_predictions(
         
         # Try block-aware CV first
         use_block_cv = False
-        if block_ids is not None:
-            blocks_s = block_ids[idx_s]
+        if blocks_all is not None:
+            blocks_s = blocks_all[idx_s]
             block_cv, effective_splits = _create_block_aware_cv_for_within_subject(
                 blocks_s, n_splits=n_splits, random_state=seed
             )
@@ -2503,10 +2956,14 @@ def _within_subject_kfold_predictions(
                     folds.append((fold_counter, train_idx, test_idx, s))
         
         if not use_block_cv:
-            # Fall back to trial-level KFold
-            stable = int(hashlib.sha1(str(s).encode()).hexdigest(), 16) % 1_000_000
-            kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed + stable)
-            logger.info(f"Subject {s}: using trial-level KFold ({n_splits} splits)")
+            if STRICT_MODE:
+                logger.warning(
+                    f"Subject {s}: missing/insufficient block info; skipping within-subject CV in strict mode to avoid leakage."
+                )
+                continue
+            # Fall back to contiguous KFold (no shuffling) to reduce leakage
+            kf = KFold(n_splits=n_splits, shuffle=False)
+            logger.warning(f"Subject {s}: using contiguous trial-level KFold ({n_splits} splits); results may be optimistic.")
             for tr_local, te_local in kf.split(idx_s):
                 fold_counter += 1
                 train_idx = idx_s[tr_local]
@@ -2537,8 +2994,8 @@ def _within_subject_kfold_predictions(
             # Try block-aware inner CV first if block info available
             inner_cv_used = "trial-level"
             cv_splits = None
-            if block_ids is not None:
-                blocks_train = block_ids[train_idx]
+            if blocks_all is not None:
+                blocks_train = blocks_all[train_idx]
                 block_inner_cv, effective_inner_splits = _create_block_aware_cv_for_within_subject(
                     blocks_train, n_splits=n_splits_inner, random_state=seed + fold
                 )
@@ -2994,116 +3451,11 @@ def load_epochs_targets_groups(
     and an empty channel list placeholder (legacy return kept for compatibility).
     Channel selection must be done fold-wise downstream to avoid leakage.
     """
-    if not _HAVE_FE_HELPERS:
-        # Provide minimal local fallbacks if helpers cannot be imported
-        from mne_bids import BIDSPath  # type: ignore
-        import pandas as _pd
-        import numpy as _np
-
-        def __fallback_find_clean_epochs_path(subj: str, task: str):
-            bp = BIDSPath(
-                subject=subj,
-                task=task,
-                datatype="eeg",
-                processing="clean",
-                suffix="epo",
-                extension=".fif",
-                root=deriv_root,
-                check=False,
-            )
-            p = bp.fpath
-            if p and Path(p).exists():
-                return p
-            p2 = deriv_root / f"sub-{subj}" / "eeg" / f"sub-{subj}_task-{task}_proc-clean_epo.fif"
-            if p2.exists():
-                return p2
-            subj_dir = deriv_root / f"sub-{subj}"
-            for c in sorted(subj_dir.rglob(f"sub-{subj}_task-{task}*epo.fif")):
-                return c
-            return None
-
-        def __fallback_load_events_df(subj: str, task: str):
-            ebp = BIDSPath(
-                subject=subj,
-                task=task,
-                datatype="eeg",
-                suffix="events",
-                extension=".tsv",
-                root=Path(deriv_root).parents[1],  # bids_root
-                check=False,
-            )
-            p = ebp.fpath
-            if p is None:
-                p = Path(deriv_root).parents[1] / f"sub-{subj}" / "eeg" / f"sub-{subj}_task-{task}_events.tsv"
-            if p.exists():
-                try:
-                    return _pd.read_csv(p, sep="\t")
-                except Exception:
-                    return None
-            return None
-
-        def __fallback_align_events_to_epochs(events_df, epochs):
-            if events_df is None:
-                return None
-            sel = getattr(epochs, "selection", None)
-            if sel is not None and len(sel) == len(epochs):
-                try:
-                    if len(events_df) > int(_np.max(sel)):
-                        return events_df.iloc[sel].reset_index(drop=True)
-                except Exception:
-                    pass
-            if "sample" in events_df.columns and isinstance(getattr(epochs, "events", None), _np.ndarray):
-                try:
-                    samples = epochs.events[:, 0]
-                    out = events_df.set_index("sample").reindex(samples)
-                    if len(out) == len(epochs) and not out.isna().all(axis=1).any():
-                        return out.reset_index()
-                except Exception:
-                    pass
-            # Critical failure: Cannot guarantee alignment
-            logger.critical(f"CRITICAL: Unable to align events to epochs reliably. "
-                           f"Events: {len(events_df)} rows, Epochs: {len(epochs)} epochs. "
-                           f"This would result in invalid correlations due to trial misalignment.")
-            
-            raise ValueError(
-                f"Cannot guarantee events-to-epochs alignment for reliable analysis. "
-                f"Events DataFrame ({len(events_df)} rows) cannot be reliably aligned to "
-                f"epochs ({len(epochs)} epochs). This is a critical failure that would "
-                f"invalidate all behavioral correlations."
-            )
-
-        def __fallback_pick_target_column(df):
-            candidates = [
-                "vas_final_coded_rating",
-                "vas_final_rating",
-                "vas_rating",
-                "pain_intensity",
-                "pain_rating",
-                "rating",
-                "pain_binary_coded",
-                "pain_binary",
-                "pain",
-            ]
-            for c in candidates:
-                if c in df.columns:
-                    return c
-            for c in df.columns:
-                cl = c.lower()
-                if ("vas" in cl or "rating" in cl) and df[c].dtype != "O":
-                    return c
-            return None
-
-        # Select fallbacks
-        find_clean_epochs_path = __fallback_find_clean_epochs_path
-        load_events_df_local = __fallback_load_events_df
-        align_events_to_epochs_local = __fallback_align_events_to_epochs
-        pick_target_column_local = __fallback_pick_target_column
-    else:
-        # Use helpers imported from 03_feature_engineering.py at module scope
-        find_clean_epochs_path = _find_clean_epochs_path  # type: ignore[name-defined]
-        load_events_df_local = _load_events_df  # type: ignore[name-defined]
-        align_events_to_epochs_local = _align_events_to_epochs  # type: ignore[name-defined]
-        pick_target_column_local = _pick_target_column  # type: ignore[name-defined]
+    # Use shared helpers imported from io_utils
+    find_clean_epochs_path = _io_find_clean_epochs_path  # type: ignore[name-defined]
+    load_events_df_local = _io_load_events_df  # type: ignore[name-defined]
+    align_events_to_epochs_local = _io_align_events_to_epochs  # type: ignore[name-defined]
+    pick_target_column_local = _io_pick_target_column  # type: ignore[name-defined]
 
     import mne  # local import to limit overhead when only running RF model
 
@@ -3307,10 +3659,10 @@ def loso_riemann_regression(
         np.random.seed(seed + fold)
         pyrandom.seed(seed + fold)
 
-        # Find intersection of EEG channels across all training subjects in this fold
+        # Find intersection of EEG channels across training subjects in this fold
         train_subs_seq = [trial_records[i][0] for i in train_idx]
         train_subjects = list({s for s in train_subs_seq if s is not None})
-        
+
         # Get EEG channel names for each training subject
         train_subject_eeg_chs = {}
         for s in train_subjects:
@@ -3318,14 +3670,14 @@ def loso_riemann_regression(
                 ch for ch in subj_to_epochs[s].info["ch_names"]
                 if subj_to_epochs[s].get_channel_types(picks=[ch])[0] == "eeg"
             ]
-        
+
         # Find intersection of channels across all training subjects
         if len(train_subjects) == 1:
-            common_chs = train_subject_eeg_chs[train_subjects[0]]
+            common_chs_train = train_subject_eeg_chs[train_subjects[0]]
         else:
-            common_chs = list(set.intersection(*[set(train_subject_eeg_chs[s]) for s in train_subjects]))
-        
-        if not common_chs:
+            common_chs_train = list(set.intersection(*[set(train_subject_eeg_chs[s]) for s in train_subjects]))
+
+        if not common_chs_train:
             logger.warning(f"Fold {fold}: No common EEG channels across training subjects. Skipping fold.")
             return {
                 "fold": fold,
@@ -3335,45 +3687,60 @@ def loso_riemann_regression(
                 "test_idx": test_idx.tolist(),
                 "best_params_rec": None,
             }
-        
-        # Sort channels for consistency
-        common_chs = sorted(common_chs)
-        logger.info(f"Fold {fold}: Using {len(common_chs)} common EEG channels across {len(train_subjects)} training subjects.")
-        
-        # Project all subjects (train and test) onto the EXACT common channel space
+
+        # Intersect with the held-out subject's available channels to avoid fold aborts
+        test_subject = trial_records[int(test_idx[0])][0]
+        test_eeg_chs = [
+            ch for ch in subj_to_epochs[test_subject].info["ch_names"]
+            if subj_to_epochs[test_subject].get_channel_types(picks=[ch])[0] == "eeg"
+        ]
+        common_chs_fold = sorted([ch for ch in common_chs_train if ch in set(test_eeg_chs)])
+
+        # Minimum channel threshold to ensure stable tangent-space (configurable)
+        try:
+            min_ch = int(CONFIG["analysis"]["riemann"].get("min_channels_for_fold", 32))
+        except Exception:
+            min_ch = 32
+        if len(common_chs_fold) < max(8, min_ch):
+            logger.warning(
+                f"Fold {fold}: common channels with test subject too few (n={len(common_chs_fold)} < {max(8, min_ch)}). Skipping fold."
+            )
+            return {
+                "fold": fold,
+                "y_true": y_all_arr[test_idx].tolist(),
+                "y_pred": np.full(len(test_idx), np.nan, dtype=float).tolist(),
+                "groups": groups_arr[test_idx].tolist(),
+                "test_idx": test_idx.tolist(),
+                "best_params_rec": None,
+            }
+
+        logger.info(
+            f"Fold {fold}: Using {len(common_chs_fold)} EEG channels (train∩test) across {len(train_subjects)} training subjects."
+        )
+
+        # Project all subjects (train and test) onto the EXACT fold channel space
         # Critical: Enforce identical channel dimensionality for TangentSpace consistency
         subjects_in_fold = list({trial_records[i][0] for i in np.concatenate([train_idx, test_idx])})
         aligned_epochs: Dict[str, "mne.Epochs"] = {}
         for s in subjects_in_fold:
-            # Check if subject has ALL required channels from training intersection
-            subject_chs = subj_to_epochs[s].info["ch_names"]
-            missing_chs = [ch for ch in common_chs if ch not in subject_chs]
-            
-            if missing_chs:
-                logger.error(f"Fold {fold}: Subject {s} missing {len(missing_chs)}/{len(common_chs)} required channels: {missing_chs[:5]}{'...' if len(missing_chs) > 5 else ''}")
-                logger.error(f"Fold {fold}: Cannot maintain tangent-space dimensionality consistency. Skipping fold.")
-                return {
-                    "fold": fold,
-                    "y_true": y_all_arr[test_idx].tolist(),
-                    "y_pred": np.full(len(test_idx), np.nan, dtype=float).tolist(),
-                    "groups": groups_arr[test_idx].tolist(),
-                    "test_idx": test_idx.tolist(),
-                    "best_params_rec": None,
-                }
-            
-            # All channels present - safe to pick exact training intersection
             try:
-                aligned_epochs[s] = subj_to_epochs[s].copy().pick(common_chs)
+                aligned_epochs[s] = subj_to_epochs[s].copy().pick(common_chs_fold)
             except Exception as e:
-                logger.error(f"Fold {fold}: Failed to pick channels for subject {s} despite availability check: {e}")
-                return {
-                    "fold": fold,
-                    "y_true": y_all_arr[test_idx].tolist(),
-                    "y_pred": np.full(len(test_idx), np.nan, dtype=float).tolist(),
-                    "groups": groups_arr[test_idx].tolist(),
-                    "test_idx": test_idx.tolist(),
-                    "best_params_rec": None,
-                }
+                # As a robust fallback, try aligning to pivot channels (adds/interpolates missing)
+                try:
+                    aligned_epochs[s] = _align_epochs_to_pivot_chs(subj_to_epochs[s], common_chs_fold)
+                except Exception as e2:
+                    logger.error(
+                        f"Fold {fold}: Failed to align subject {s} to fold channels. pick_err={e}; align_err={e2}"
+                    )
+                    return {
+                        "fold": fold,
+                        "y_true": y_all_arr[test_idx].tolist(),
+                        "y_pred": np.full(len(test_idx), np.nan, dtype=float).tolist(),
+                        "groups": groups_arr[test_idx].tolist(),
+                        "test_idx": test_idx.tolist(),
+                        "best_params_rec": None,
+                    }
 
         # Assemble X_train, X_test keeping (n_trials, n_ch, n_times)
         # Drop NaN targets only
@@ -3543,13 +3910,15 @@ def loso_riemann_regression(
 
         per_subj.to_csv(results_dir / CONFIG["paths"]["per_subject_metrics"]["riemann_loso"], sep="\t", index=False)
 
-        # Save Riemann LOSO test indices explicitly
+        # Save Riemann LOSO test indices explicitly (include heldout_subject_id)
         try:
-            pd.DataFrame({
-                "group": np.asarray(groups_ordered),
+            idx_df = pd.DataFrame({
+                "subject_id": np.asarray(groups_ordered),
+                "heldout_subject_id": np.asarray(groups_ordered),
                 "fold": fold_ids,
                 "trial_index": test_indices_order,
-            }).to_csv(results_dir / CONFIG["paths"]["indices"]["riemann_loso"], sep="\t", index=False)
+            })
+            idx_df.to_csv(results_dir / CONFIG["paths"]["indices"]["riemann_loso"], sep="\t", index=False)
         except Exception as e:
             logger.warning(f"Failed to save Riemann LOSO indices: {e}")
 
@@ -3717,6 +4086,13 @@ def riemann_visualize_cov_bins(
     finally:
         plt.close(fig)
 
+    # Export numerical matrices (global visualization)
+    try:
+        dfD = pd.DataFrame(D, index=ch_names, columns=ch_names)
+        dfD.to_csv(plots_dir / "riemann_cov_diff_matrix_global.tsv", sep="\t")
+    except Exception as e:
+        logger.warning(f"Failed to export global covariance difference matrix TSV: {e}")
+
     # Node strength topomap (sum |off-diagonal| per node)
     A = D.copy()
     np.fill_diagonal(A, 0.0)
@@ -3731,6 +4107,212 @@ def riemann_visualize_cov_bins(
         plt.savefig(plots_dir / "riemann_node_strength_topomap.png")
     finally:
         plt.close(fig2)
+
+    try:
+        ns_df = pd.DataFrame({"channel": ch_names, "node_strength": node_strength})
+        ns_df.to_csv(plots_dir / "riemann_node_strength_global.tsv", sep="\t", index=False)
+    except Exception as e:
+        logger.warning(f"Failed to export global node strength TSV: {e}")
+
+
+def riemann_visualize_cov_bins_per_fold(
+    deriv_root: Path,
+    subjects: Optional[List[str]] = None,
+    task: str = TASK,
+    plots_dir: Path = None,
+    plateau_window: Optional[Tuple[float, float]] = (3.0, 10.5),
+) -> None:
+    """Fold-aware covariance-difference visualizations without leakage.
+
+    For each LOSO fold, determines the common EEG channel set using TRAINING subjects only,
+    computes high-vs-low covariance differences using only training data, and saves fold-specific
+    heatmaps and node-strength topomaps. Aggregates node strength across folds by channel name
+    and saves an overall topomap.
+    """
+    if plots_dir is None:
+        return
+    if not _check_pyriemann():
+        logger.warning("pyriemann not installed; skipping per-fold Riemann visualizations.")
+        return
+    try:
+        from pyriemann.estimation import Covariances
+        from pyriemann.utils.mean import mean_riemann
+    except Exception:
+        logger.warning("pyriemann unavailable for visualization; skipping.")
+        return
+
+    tuples, _ = load_epochs_targets_groups(deriv_root, subjects=subjects, task=task)
+    if not tuples:
+        logger.warning("No subjects found for per-fold Riemann visualization.")
+        return
+
+    # Build subject lists
+    sub_ids = [sub for sub, _, _ in tuples]
+    subj_map = {sub: (epochs, y) for sub, epochs, y in tuples}
+
+    # Aggregation containers across folds
+    agg_ns_sum: dict = {}
+    agg_ns_count: dict = {}
+
+    for i_test, test_sub in enumerate(sub_ids, start=1):
+        train_subs = [s for s in sub_ids if s != test_sub]
+        if len(train_subs) == 0:
+            continue
+
+        # Determine training-only channel intersection
+        try:
+            train_sets = []
+            for s in train_subs:
+                ep, _y = subj_map[s]
+                train_sets.append({ch for ch in ep.info["ch_names"] if ep.get_channel_types(picks=[ch])[0] == "eeg"})
+            common_train = sorted(list(set.intersection(*train_sets))) if len(train_sets) > 1 else sorted(list(train_sets[0]))
+        except Exception:
+            common_train = []
+        if len(common_train) == 0:
+            logger.warning(f"Per-fold viz: no common training channels for fold {i_test} (test={test_sub}); skipping.")
+            continue
+
+        # Canonical order from the first training subject
+        try:
+            first_ep = subj_map[train_subs[0]][0]
+            first_eeg_order = [ch for ch in first_ep.info["ch_names"] if first_ep.get_channel_types(picks=[ch])[0] == "eeg"]
+            canonical = [ch for ch in first_eeg_order if ch in set(common_train)]
+        except Exception:
+            canonical = common_train
+        if len(canonical) == 0:
+            continue
+
+        # Gather training data (crop to plateau)
+        subj_data = []
+        for s in train_subs:
+            epochs, y = subj_map[s]
+            ep_use = epochs.copy().pick(canonical)
+            try:
+                ep_use.reorder_channels(canonical)
+            except Exception:
+                pass
+            if plateau_window is not None:
+                tmin, tmax = plateau_window
+                try:
+                    ep_use.crop(tmin=tmin, tmax=tmax)
+                except Exception:
+                    pass
+            X = ep_use.get_data(picks="eeg")
+            if len(X) != len(y):
+                logger.warning(f"Per-fold viz: X-y mismatch for {s}; skipping.")
+                continue
+            yv = pd.to_numeric(y, errors="coerce").to_numpy()
+            subj_data.append((s, X, yv))
+        if not subj_data:
+            continue
+
+        # Compute tertiles from TRAINING y only
+        y_all = np.concatenate([v[2] for v in subj_data])
+        y_all = y_all[np.isfinite(y_all)]
+        if len(y_all) < 4:
+            continue
+        q_low = float(np.percentile(y_all, 33.3))
+        q_high = float(np.percentile(y_all, 66.7))
+
+        cov_means_low = []
+        cov_means_high = []
+        for s, X, yv in subj_data:
+            mask_low = np.isfinite(yv) & (yv <= q_low)
+            mask_high = np.isfinite(yv) & (yv >= q_high)
+            if mask_low.sum() >= 2:
+                cov_low = Covariances(estimator="oas").transform(X[mask_low])
+                cov_means_low.append(mean_riemann(cov_low))
+            if mask_high.sum() >= 2:
+                cov_high = Covariances(estimator="oas").transform(X[mask_high])
+                cov_means_high.append(mean_riemann(cov_high))
+        if len(cov_means_low) == 0 or len(cov_means_high) == 0:
+            continue
+
+        M_low = mean_riemann(np.stack(cov_means_low))
+        M_high = mean_riemann(np.stack(cov_means_high))
+        D = M_high - M_low
+
+        # Plot fold-specific matrix
+        fig, ax = plt.subplots(1, 1, figsize=(6.5, 5.5), dpi=150)
+        try:
+            sns.heatmap(
+                D, ax=ax, cmap="RdBu_r", center=0.0, square=True,
+                xticklabels=canonical, yticklabels=canonical, cbar_kws={"label": "Δ covariance (high - low)"}
+            )
+            ax.set_title(
+                f"Covariance difference (train-only)\nFold {i_test} held-out {test_sub}"
+            )
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"riemann_cov_diff_matrix_fold-{i_test:02d}.png")
+        finally:
+            plt.close(fig)
+
+        # Node strength and topomap for this fold
+        A = D.copy()
+        np.fill_diagonal(A, 0.0)
+        node_strength = np.sum(np.abs(A), axis=1)
+
+        # Aggregate across folds by channel name
+        for ch, val in zip(canonical, node_strength):
+            agg_ns_sum[ch] = agg_ns_sum.get(ch, 0.0) + float(val)
+            agg_ns_count[ch] = agg_ns_count.get(ch, 0) + 1
+
+        info_plot = mne.create_info(canonical, sfreq=1000.0, ch_types="eeg")
+        try:
+            try:
+                info_plot.set_montage(mne.channels.make_standard_montage("standard_1005"))
+            except Exception:
+                info_plot.set_montage(mne.channels.make_standard_montage("standard_1020"))
+        except Exception:
+            pass
+        fig2, ax2 = plt.subplots(1, 1, figsize=(4.5, 4.2), dpi=150)
+        try:
+            mne.viz.plot_topomap(node_strength, info_plot, axes=ax2, show=False, contours=6, cmap="Reds")
+            ax2.set_title(
+                f"Node strength |Δcov| (train-only)\nFold {i_test} held-out {test_sub}"
+            )
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"riemann_node_strength_topomap_fold-{i_test:02d}.png")
+        finally:
+            plt.close(fig2)
+
+        # Export per-fold node strength TSV
+        try:
+            pd.DataFrame({"channel": canonical, "node_strength": node_strength}) \
+                .to_csv(plots_dir / f"riemann_node_strength_fold-{i_test:02d}.tsv", sep="\t", index=False)
+        except Exception as e:
+            logger.warning(f"Failed to export per-fold node strength TSV for fold {i_test}: {e}")
+
+    # Aggregated node strength across folds
+    if len(agg_ns_sum) > 0:
+        ch_list = sorted(agg_ns_sum.keys())
+        vals = np.array([agg_ns_sum[ch] / max(1, agg_ns_count.get(ch, 1)) for ch in ch_list], dtype=float)
+        info_agg = mne.create_info(ch_list, sfreq=1000.0, ch_types="eeg")
+        try:
+            try:
+                info_agg.set_montage(mne.channels.make_standard_montage("standard_1005"))
+            except Exception:
+                info_agg.set_montage(mne.channels.make_standard_montage("standard_1020"))
+        except Exception:
+            pass
+        figA, axA = plt.subplots(1, 1, figsize=(5.0, 4.4), dpi=150)
+        try:
+            mne.viz.plot_topomap(vals, info_agg, axes=axA, show=False, contours=6, cmap="Reds")
+            axA.set_title("Node strength |Δcov| mean across folds (train-only)")
+            plt.tight_layout()
+            plt.savefig(plots_dir / "riemann_node_strength_topomap_train_only_mean_across_folds.png")
+        finally:
+            plt.close(figA)
+
+        # Export aggregated node strength across folds
+        try:
+            pd.DataFrame({
+                "channel": ch_list,
+                "mean_node_strength": vals,
+                "n_folds": [int(agg_ns_count[ch]) for ch in ch_list],
+            }).to_csv(plots_dir / "riemann_node_strength_train_only_mean_across_folds.tsv", sep="\t", index=False)
+        except Exception as e:
+            logger.warning(f"Failed to export aggregated node strength TSV: {e}")
 
 
 def run_riemann_band_limited_decoding(
@@ -4483,6 +5065,19 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
 
     inner_splits = int(CONFIG["cv"]["inner_splits"])
 
+    # Precompute run block ids across all trials for audit indices (prefer explicit from events)
+    blocks_source = "unknown"
+    try:
+        _, _, blocks_all = _aggregate_temperature_trial_and_block(meta, deriv_root, task)
+        blocks_source = "events"
+    except Exception:
+        try:
+            blocks_all = _infer_blocks_by_runs(groups, trials_per_run=TRIALS_PER_RUN)
+            blocks_source = "inferred"
+        except Exception:
+            blocks_all = None
+            blocks_source = "missing"
+
     # Elastic Net nested LOSO
     # Paths for best-params logs (prepared per mode)
     best_params_en_path = _prepare_best_params_path(
@@ -4507,6 +5102,12 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
 
     # Save predictions
     _ensure_dir(results_dir)
+    _extra_cols = {}
+    try:
+        if blocks_all is not None:
+            _extra_cols["run_id"] = (blocks_all[np.asarray(test_indices_en)] + 1).tolist()
+    except Exception:
+        pass
     pred_en = pd.DataFrame({
         "subject_id": groups_ordered_en,
         "trial_id": meta.loc[test_indices_en, "trial_id"].values,
@@ -4514,6 +5115,7 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
         "y_pred": y_pred_en,
         "fold": fold_ids_en,
         "model": "ElasticNet",
+        **_extra_cols,
     })
     _ensure_dir((results_dir / CONFIG["paths"]["predictions"]["elasticnet_loso"]).parent)
     pred_en.to_csv(results_dir / CONFIG["paths"]["predictions"]["elasticnet_loso"], sep="\t", index=False)
@@ -4521,11 +5123,20 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     per_subj_en.to_csv(results_dir / CONFIG["paths"]["per_subject_metrics"]["elasticnet_loso"], sep="\t", index=False)
     # Save ElasticNet LOSO test indices explicitly
     try:
+        extra = {"blocks_source": blocks_source}
+        if blocks_all is not None:
+            extra["run_id"] = (blocks_all[np.asarray(test_indices_en)] + 1).tolist()
         idx_en = pd.DataFrame({
             "subject_id": groups_ordered_en,
             "trial_id": meta.loc[test_indices_en, "trial_id"].values,
             "fold": fold_ids_en,
+            **extra,
         })
+        # Add explicit heldout_subject_id for clarity (equals subject_id in LOSO)
+        try:
+            idx_en["heldout_subject_id"] = idx_en["subject_id"].astype(str)
+        except Exception:
+            pass
         _ensure_dir((results_dir / CONFIG["paths"]["indices"]["elasticnet_loso"]).parent)
         idx_en.to_csv(results_dir / CONFIG["paths"]["indices"]["elasticnet_loso"], sep="\t", index=False)
     except Exception as e:
@@ -4553,6 +5164,10 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
             f"avg_r_Fz={pooled_wen['avg_subject_r_fisher_z']:.3f}"
         )
 
+        # Add run_id when available for auditability
+        _extra_cols = {}
+        if blocks_all is not None:
+            _extra_cols["run_id"] = (blocks_all[np.asarray(test_indices_wen)] + 1).tolist()
         pred_wen = pd.DataFrame({
             "subject_id": groups_ordered_wen,
             "trial_id": meta.loc[test_indices_wen, "trial_id"].values,
@@ -4560,6 +5175,7 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
             "y_pred": y_pred_wen,
             "fold": fold_ids_wen,
             "model": "ElasticNet_WithinKFold",
+            **_extra_cols,
         })
         _ensure_dir((results_dir / CONFIG["paths"]["predictions"]["elasticnet_within"]).parent)
         pred_wen.to_csv(results_dir / CONFIG["paths"]["predictions"]["elasticnet_within"], sep="\t", index=False)
@@ -4572,10 +5188,14 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
 
         # Save ElasticNet within-subject KFold test indices explicitly
         try:
+            extra = {}
+            if blocks_all is not None:
+                extra["run_id"] = (blocks_all[np.asarray(test_indices_wen)] + 1).tolist()
             idx_wen = pd.DataFrame({
                 "subject_id": groups_ordered_wen,
                 "trial_id": meta.loc[test_indices_wen, "trial_id"].values,
                 "fold": fold_ids_wen,
+                **extra,
             })
             _ensure_dir((results_dir / CONFIG["paths"]["indices"]["elasticnet_within"]).parent)
             idx_wen.to_csv(results_dir / CONFIG["paths"]["indices"]["elasticnet_within"], sep="\t", index=False)
@@ -4624,6 +5244,12 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
         f"avg_r_Fz={pooled_rf['avg_subject_r_fisher_z']:.3f}"
     )
 
+    _extra_cols = {}
+    try:
+        if blocks_all is not None:
+            _extra_cols["run_id"] = (blocks_all[np.asarray(test_indices_rf)] + 1).tolist()
+    except Exception:
+        pass
     pred_rf = pd.DataFrame({
         "subject_id": groups_ordered_rf,
         "trial_id": meta.loc[test_indices_rf, "trial_id"].values,
@@ -4631,6 +5257,7 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
         "y_pred": y_pred_rf,
         "fold": fold_ids_rf,
         "model": "RandomForest",
+        **_extra_cols,
     })
     _ensure_dir((results_dir / CONFIG["paths"]["predictions"]["rf_loso"]).parent)
     pred_rf.to_csv(results_dir / CONFIG["paths"]["predictions"]["rf_loso"], sep="\t", index=False)
@@ -4641,11 +5268,19 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
 
     # Save RF LOSO test indices explicitly
     try:
+        extra = {"blocks_source": blocks_source}
+        if blocks_all is not None:
+            extra["run_id"] = (blocks_all[np.asarray(test_indices_rf)] + 1).tolist()
         idx_rf = pd.DataFrame({
             "subject_id": groups_ordered_rf,
             "trial_id": meta.loc[test_indices_rf, "trial_id"].values,
             "fold": fold_ids_rf,
+            **extra,
         })
+        try:
+            idx_rf["heldout_subject_id"] = idx_rf["subject_id"].astype(str)
+        except Exception:
+            pass
         _ensure_dir((results_dir / CONFIG["paths"]["indices"]["rf_loso"]).parent)
         idx_rf.to_csv(results_dir / CONFIG["paths"]["indices"]["rf_loso"], sep="\t", index=False)
     except Exception as e:
@@ -4671,6 +5306,9 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
             f"avg_r_Fz={pooled_wrf['avg_subject_r_fisher_z']:.3f}"
         )
 
+        _extra_cols = {}
+        if blocks_all is not None:
+            _extra_cols["run_id"] = (blocks_all[np.asarray(test_indices_wrf)] + 1).tolist()
         pred_wrf = pd.DataFrame({
             "subject_id": groups_ordered_wrf,
             "trial_id": meta.loc[test_indices_wrf, "trial_id"].values,
@@ -4678,6 +5316,7 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
             "y_pred": y_pred_wrf,
             "fold": fold_ids_wrf,
             "model": "RandomForest_WithinKFold",
+            **_extra_cols,
         })
         _ensure_dir((results_dir / CONFIG["paths"]["predictions"]["rf_within"]).parent)
         pred_wrf.to_csv(results_dir / CONFIG["paths"]["predictions"]["rf_within"], sep="\t", index=False)
@@ -4690,10 +5329,14 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
 
         # Save RF within-subject KFold test indices explicitly
         try:
+            extra = {}
+            if blocks_all is not None:
+                extra["run_id"] = (blocks_all[np.asarray(test_indices_wrf)] + 1).tolist()
             idx_wrf = pd.DataFrame({
                 "subject_id": groups_ordered_wrf,
                 "trial_id": meta.loc[test_indices_wrf, "trial_id"].values,
                 "fold": fold_ids_wrf,
+                **extra,
             })
             _ensure_dir((results_dir / CONFIG["paths"]["indices"]["rf_within"]).parent)
             idx_wrf.to_csv(results_dir / CONFIG["paths"]["indices"]["rf_within"], sep="\t", index=False)
@@ -4751,7 +5394,8 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     except Exception as e:
         logger.warning(f"ElasticNet learning curve plotting failed: {e}")
 
-    # Determine best EEG model by pooled Pearson r
+    # Determine best EEG model by pooled Pearson r (for reporting). For permutation
+    # testing, we will use a max-statistic across models to avoid selection bias.
     best_model_name = None
     best_pooled = None
     y_true_best = None
@@ -4777,22 +5421,50 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     except Exception as e:
         logger.warning(f"Failed to select best model for permutation tests: {e}")
 
-    # Quick (non-refit) permutation null using best model predictions
+    # Quick (non-refit) permutation null using best model predictions (diagnostic only)
     try:
         if y_true_best is not None and y_pred_best is not None and groups_ordered_best is not None:
-            p_perm = plot_permutation_null_hist(np.asarray(y_true_best), np.asarray(y_pred_best), np.asarray(groups_ordered_best),
-                                                plots_dir / "permutation_null_hist.png", n_perm=int(CONFIG["analysis"]["n_perm_quick"]), seed=seed)
-            logger.info(f"Permutation test (no-refit) p-value (pooled r, {best_model_name}): {p_perm:.4g}")
+            p_perm = plot_permutation_null_hist(
+                np.asarray(y_true_best), np.asarray(y_pred_best), np.asarray(groups_ordered_best),
+                plots_dir / "diagnostic_permutation_null_hist.png", n_perm=int(CONFIG["analysis"]["n_perm_quick"]), seed=seed
+            )
+            logger.info(f"Diagnostic permutation (no-refit, no selection correction) p-value (pooled r, {best_model_name}): {p_perm:.4g}")
     except Exception as e:
         logger.warning(f"permutation null plotting failed: {e}")
 
-    # Refit-based permutation null (within-subject shuffles, LOSO refit using fixed best-model params)
+    # Refit-based permutation null using max-statistic across models to avoid selection bias
     try:
-        if best_params_path is not None and best_pipe_template is not None and best_pooled is not None:
-            best_params_map = _read_best_params_jsonl(best_params_path)
+        # We need both models and their logged params to run max-statistic null properly
+        have_en = 'pooled_en' in locals()
+        have_rf = 'pooled_rf' in locals()
+        if have_en or have_rf:
             n_perm_refit = int(CONFIG["analysis"]["n_perm_refit"])
             perm_jobs = int(CONFIG["analysis"].get("perm_refit_n_jobs", 1)) if isinstance(CONFIG.get("analysis"), dict) else 1
-            def _one_perm(i: int) -> float:
+
+            # Observed max |r| across available models
+            obs_candidates = []
+            if have_en:
+                obs_candidates.append(float(pooled_en.get("pearson_r", np.nan)))
+            if have_rf:
+                obs_candidates.append(float(pooled_rf.get("pearson_r", np.nan)))
+            obs_r_max = float(np.nanmax(np.abs(np.asarray(obs_candidates, float)))) if len(obs_candidates) > 0 else float('nan')
+
+            # Read best params maps (combined by fold and subject)
+            best_params_en_map = _read_best_params_jsonl_combined(_prepare_best_params_path(
+                results_dir / CONFIG["paths"]["best_params"]["elasticnet_loso"], BEST_PARAMS_MODE, RUN_ID
+            )) if have_en else {}
+            best_params_rf_map = _read_best_params_jsonl_combined(_prepare_best_params_path(
+                results_dir / CONFIG["paths"]["best_params"]["rf_loso"], BEST_PARAMS_MODE, RUN_ID
+            )) if have_rf else {}
+
+            # Optionally run full nested CV within each permutation (expensive)
+            use_nested = False
+            try:
+                use_nested = bool(CONFIG["analysis"].get("perm_refit_use_nested_cv", False))
+            except Exception:
+                use_nested = False
+
+            def _one_perm_max(i: int) -> float:
                 rng_i = np.random.default_rng(seed + 12345 + i)
                 y_perm = y_all.to_numpy().copy()
                 for g in np.unique(groups):
@@ -4800,14 +5472,41 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
                     if len(idx) > 1:
                         y_perm[idx] = rng_i.permutation(y_perm[idx])
                 y_perm_series = pd.Series(y_perm)
-                y_true_p, y_pred_p, groups_p, _, _ = _loso_predictions_with_fixed_params(
-                    X_all, y_perm_series, groups, best_pipe_template, best_params_map, seed=seed + 1000 + i, outer_n_jobs=outer_n_jobs,
-                )
-                r_p, _ = _safe_pearsonr(y_true_p, y_pred_p)
-                return float(r_p) if np.isfinite(r_p) else 0.0
+
+                vals = []
+                if have_en:
+                    if use_nested:
+                        y_true_e, y_pred_e, _, _, _ = _nested_loso_predictions(
+                            X=X_all, y=y_perm_series, groups=groups,
+                            pipe=enet_pipe, param_grid=enet_grid,
+                            inner_cv_splits=inner_splits, n_jobs=n_jobs, seed=seed + 2000 + i,
+                            best_params_log_path=None, model_name="ElasticNet", outer_n_jobs=outer_n_jobs,
+                        )
+                    else:
+                        y_true_e, y_pred_e, _, _, _ = _loso_predictions_with_fixed_params(
+                            X_all, y_perm_series, groups, enet_pipe, best_params_en_map, seed=seed + 2000 + i, outer_n_jobs=outer_n_jobs,
+                        )
+                    r_e, _ = _safe_pearsonr(y_true_e, y_pred_e)
+                    vals.append(float(r_e) if np.isfinite(r_e) else 0.0)
+                if have_rf:
+                    if use_nested:
+                        y_true_r, y_pred_r, _, _, _ = _nested_loso_predictions(
+                            X=X_all, y=y_perm_series, groups=groups,
+                            pipe=rf_pipe, param_grid=rf_grid,
+                            inner_cv_splits=inner_splits, n_jobs=n_jobs, seed=seed + 3000 + i,
+                            best_params_log_path=None, model_name="RandomForest", outer_n_jobs=outer_n_jobs,
+                        )
+                    else:
+                        y_true_r, y_pred_r, _, _, _ = _loso_predictions_with_fixed_params(
+                            X_all, y_perm_series, groups, rf_pipe, best_params_rf_map, seed=seed + 3000 + i, outer_n_jobs=outer_n_jobs,
+                        )
+                    r_r, _ = _safe_pearsonr(y_true_r, y_pred_r)
+                    vals.append(float(r_r) if np.isfinite(r_r) else 0.0)
+
+                return float(np.max(np.abs(vals))) if len(vals) > 0 else 0.0
 
             if perm_jobs > 1:
-                null_list = Parallel(n_jobs=perm_jobs, prefer="processes")(delayed(_one_perm)(i) for i in range(n_perm_refit))
+                null_list = Parallel(n_jobs=perm_jobs, prefer="processes")(delayed(_one_perm_max)(i) for i in range(n_perm_refit))
                 null_rs = np.asarray(null_list, dtype=float)
             else:
                 null_rs = np.zeros(n_perm_refit, dtype=float)
@@ -4819,16 +5518,25 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
                         if len(idx) > 1:
                             y_perm[idx] = rng.permutation(y_perm[idx])
                     y_perm_series = pd.Series(y_perm)
-                    y_true_p, y_pred_p, groups_p, _, _ = _loso_predictions_with_fixed_params(
-                        X_all, y_perm_series, groups, best_pipe_template, best_params_map, seed=seed + 1000 + i, outer_n_jobs=outer_n_jobs,
-                    )
-                    r_p, _ = _safe_pearsonr(y_true_p, y_pred_p)
-                    null_rs[i] = float(r_p) if np.isfinite(r_p) else 0.0
+                    vals = []
+                    if have_en:
+                        y_true_e, y_pred_e, _, _, _ = _loso_predictions_with_fixed_params(
+                            X_all, y_perm_series, groups, enet_pipe, best_params_en_map, seed=seed + 2000 + i, outer_n_jobs=outer_n_jobs,
+                        )
+                        r_e, _ = _safe_pearsonr(y_true_e, y_pred_e)
+                        vals.append(float(r_e) if np.isfinite(r_e) else 0.0)
+                    if have_rf:
+                        y_true_r, y_pred_r, _, _, _ = _loso_predictions_with_fixed_params(
+                            X_all, y_perm_series, groups, rf_pipe, best_params_rf_map, seed=seed + 3000 + i, outer_n_jobs=outer_n_jobs,
+                        )
+                        r_r, _ = _safe_pearsonr(y_true_r, y_pred_r)
+                        vals.append(float(r_r) if np.isfinite(r_r) else 0.0)
+                    null_rs[i] = float(np.max(np.abs(vals))) if len(vals) > 0 else 0.0
 
-            obs_r = float(best_pooled.get("pearson_r", np.nan))
-            # Two-sided p-value for |r|
+            obs_r = obs_r_max
+            # Two-sided p-value for |r|max
             p_refit_two_sided = float((np.sum(np.abs(null_rs) >= abs(obs_r)) + 1) / (len(null_rs) + 1))
-            # One-sided p-values (assuming positive correlation expected)
+            # One-sided p-values (assuming positive correlation expected) on max-statistic
             p_refit_one_sided_pos = float((np.sum(null_rs >= obs_r) + 1) / (len(null_rs) + 1))
             p_refit_one_sided_neg = float((np.sum(null_rs <= obs_r) + 1) / (len(null_rs) + 1))
             
@@ -4852,15 +5560,18 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
             _ensure_dir((results_dir / CONFIG["paths"]["summaries"]["permutation_refit_summary"]).parent)
             with open(results_dir / CONFIG["paths"]["summaries"]["permutation_refit_summary"], "w", encoding="utf-8") as f:
                 json.dump({
-                    "model": best_model_name,
+                    "statistic": "max_abs_r_across_models",
                     "observed_r": obs_r,
                     "n_perm": int(n_perm_refit),
                     "p_two_sided_abs_r": p_refit_two_sided,
                     "p_one_sided_positive": p_refit_one_sided_pos,
                     "p_one_sided_negative": p_refit_one_sided_neg,
                     "null_distribution_stats": null_stats,
+                    "models_considered": [m for m in ["ElasticNet" if have_en else None, "RandomForest" if have_rf else None] if m is not None],
+                    "selection_correction": "max_statistic",
+                    "approximation": ("nested_cv" if use_nested else "fixed_params"),
                 }, f, indent=2)
-            logger.info(f"Saved refit-based permutation null for {best_model_name} (p_two_sided={p_refit_two_sided:.4g}, p_one_sided_pos={p_refit_one_sided_pos:.4g})")
+            logger.info(f"Saved refit-based permutation null (max-statistic across models) p_two_sided={p_refit_two_sided:.4g}, p_one_sided_pos={p_refit_one_sided_pos:.4g}")
     except Exception as e:
         logger.warning(f"Refit-based permutation null failed: {e}")
     try:
@@ -4885,8 +5596,8 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     # Interpretability analyses: ElasticNet coefs, RF permutation importance, stability, SHAP
     if 'pooled_en' in locals() or 'pooled_rf' in locals():
         # Read best params per fold
-        best_params_en_map = _read_best_params_jsonl(best_params_en_path)
-        best_params_rf_map = _read_best_params_jsonl(best_params_rf_path)
+        best_params_en_map = _read_best_params_jsonl_combined(best_params_en_path)
+        best_params_rf_map = _read_best_params_jsonl_combined(best_params_rf_path)
 
         # Elastic Net: per-fold coefficients and band-aggregated topomaps
         if 'pooled_en' in locals():
@@ -4912,7 +5623,7 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
         if 'pooled_rf' in locals():
             try:
                 rf_imps = compute_rf_block_permutation_importance_per_fold(
-                    X=X_all, y=y_all, groups=np.asarray(groups), best_params_map=best_params_rf_map, seed=seed, n_repeats=int(CONFIG["analysis"]["rf_perm_importance_repeats"])
+                    X=X_all, y=y_all, groups=np.asarray(groups), best_params_map=best_params_rf_map, seed=seed, n_repeats=int(CONFIG["analysis"]["rf_perm_importance_repeats"]), blocks_all=blocks_all
                 )
                 mean_imps = np.nanmean(rf_imps, axis=0)
                 plot_rf_perm_importance_bar(mean_imps, feat_names, plots_dir / "rf_block_permutation_importance_top20.png", top_n=20)
@@ -4935,16 +5646,16 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
             except Exception as e:
                 logger.warning(f"RF permutation importance failed with unexpected error: {e}")
 
-        # Optional SHAP analysis for a global RF model
+        # SHAP analysis computed within LOSO folds (methodologically sound)
         if 'pooled_rf' in locals() and CONFIG["flags"]["run_shap"]:
             try:
-                run_shap_rf_global(X_all, y_all, feat_names, best_params_rf_map, plots_dir, seed)
+                run_shap_rf_loso(X_all, y_all, np.asarray(groups), feat_names, best_params_rf_map, plots_dir, seed)
             except ImportError:
                 logger.info("SHAP not installed; skipping SHAP analysis")
             except (MemoryError, RuntimeError) as e:
-                logger.error(f"RF SHAP analysis failed: {e}")
+                logger.error(f"RF SHAP LOSO analysis failed: {e}")
             except Exception as e:
-                logger.warning(f"RF SHAP analysis failed with unexpected error: {e}")
+                logger.warning(f"RF SHAP LOSO analysis failed with unexpected error: {e}")
     else:
         logger.info("Skipping interpretability analyses: no models available")
 
@@ -4991,6 +5702,17 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
                 outer_n_jobs=outer_n_jobs,
             )
             pooled_t, per_subj_t = compute_metrics(y_true_t, y_pred_t, np.asarray(groups_t))
+            extra = {}
+            try:
+                # Prefer run inference from trial order for consistency
+                blocks_run_all = _infer_blocks_by_runs(groups, trials_per_run=TRIALS_PER_RUN)
+                extra["run_id"] = (blocks_run_all[np.asarray(test_idx_t)] + 1).tolist()
+            except Exception:
+                # Fallback to blocks_all if available from aggregator scope
+                try:
+                    extra["run_id"] = (blocks_all[np.asarray(test_idx_t)] + 1).tolist()  # type: ignore[name-defined]
+                except Exception:
+                    pass
             pred_t = pd.DataFrame({
                 "subject_id": groups_t,
                 "trial_id": meta.loc[test_idx_t, "trial_id"].values,
@@ -4999,6 +5721,7 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
                 "fold": fold_ids_t,
                 "model": "TemperatureOnly",
                 "temperature": temps_all[np.asarray(test_idx_t)],
+                **extra,
             })
             _ensure_dir((results_dir / CONFIG["paths"]["predictions"]["temperature_only"]).parent)
             pred_t.to_csv(results_dir / CONFIG["paths"]["predictions"]["temperature_only"], sep="\t", index=False)
@@ -5246,6 +5969,12 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     y_true_bg, y_pred_bg, groups_bg, test_idx_bg, fold_bg = _loso_baseline_predictions(y_all, groups, mode="global")
     pooled_bg, per_subj_bg = compute_metrics(y_true_bg, y_pred_bg, np.asarray(groups_bg))
     logger.info(f"Baseline (global mean) pooled: r={pooled_bg['pearson_r']:.3f}, R2={pooled_bg['r2']:.3f}")
+    extra = {}
+    try:
+        blocks_run_all = _infer_blocks_by_runs(groups, trials_per_run=TRIALS_PER_RUN)
+        extra["run_id"] = (blocks_run_all[np.asarray(test_idx_bg)] + 1).tolist()
+    except Exception:
+        pass
     pred_bg = pd.DataFrame({
         "subject_id": groups_bg,
         "trial_id": meta.loc[test_idx_bg, "trial_id"].values,
@@ -5253,6 +5982,7 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
         "y_pred": y_pred_bg,
         "fold": fold_bg,
         "model": "BaselineGlobal",
+        **extra,
     })
     _ensure_dir((results_dir / CONFIG["paths"]["predictions"]["baseline_global"]).parent)
     pred_bg.to_csv(results_dir / CONFIG["paths"]["predictions"]["baseline_global"], sep="\t", index=False)
@@ -5260,11 +5990,22 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     per_subj_bg.to_csv(results_dir / CONFIG["paths"]["per_subject_metrics"]["baseline_global"], sep="\t", index=False)
     # Save Baseline Global LOSO test indices
     try:
+        extra = {}
+        try:
+            blocks_run_all = _infer_blocks_by_runs(groups, trials_per_run=TRIALS_PER_RUN)
+            extra["run_id"] = (blocks_run_all[np.asarray(test_idx_bg)] + 1).tolist()
+        except Exception:
+            pass
         idx_bg = pd.DataFrame({
             "subject_id": groups_bg,
             "trial_id": meta.loc[test_idx_bg, "trial_id"].values,
             "fold": fold_bg,
+            **extra,
         })
+        try:
+            idx_bg["heldout_subject_id"] = idx_bg["subject_id"].astype(str)
+        except Exception:
+            pass
         _ensure_dir((results_dir / CONFIG["paths"]["indices"]["baseline_global"]).parent)
         idx_bg.to_csv(results_dir / CONFIG["paths"]["indices"]["baseline_global"], sep="\t", index=False)
     except Exception as e:
@@ -5296,10 +6037,27 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     # Riemannian covariance-based insights (if available)
     if _check_pyriemann():
         try:
-            riemann_visualize_cov_bins(deriv_root=deriv_root, subjects=subjects, task=task, plots_dir=plots_dir,
-                                       plateau_window=tuple(CONFIG["analysis"]["riemann"]["plateau_window"]))
+            # Preferred: train-only per-fold visualizations (no leakage)
+            riemann_visualize_cov_bins_per_fold(
+                deriv_root=deriv_root,
+                subjects=subjects,
+                task=task,
+                plots_dir=plots_dir,
+                plateau_window=tuple(CONFIG["analysis"]["riemann"]["plateau_window"]),
+            )
         except Exception as e:
-            logger.warning(f"Riemann visualization failed: {e}")
+            logger.warning(f"Per-fold Riemann visualization failed: {e}")
+        try:
+            # Supplementary global visualization (minor leakage; for exploratory viewing)
+            riemann_visualize_cov_bins(
+                deriv_root=deriv_root,
+                subjects=subjects,
+                task=task,
+                plots_dir=plots_dir,
+                plateau_window=tuple(CONFIG["analysis"]["riemann"]["plateau_window"]),
+            )
+        except Exception as e:
+            logger.warning(f"Global Riemann visualization failed: {e}")
         try:
             run_riemann_band_limited_decoding(
                 deriv_root=deriv_root,
@@ -5385,6 +6143,41 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
     except Exception as e:
         logger.warning(f"Building all_metrics_wide.tsv failed: {e}")
 
+    # Export combined best-params maps (by subject and fold) for auditability
+    try:
+        en_combined = _read_best_params_jsonl_combined(best_params_en_path)
+        rf_combined = _read_best_params_jsonl_combined(best_params_rf_path)
+        with open(results_dir / "best_params_elasticnet_combined.json", "w", encoding="utf-8") as f:
+            json.dump(en_combined, f, indent=2)
+        with open(results_dir / "best_params_rf_combined.json", "w", encoding="utf-8") as f:
+            json.dump(rf_combined, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to export combined best-params maps: {e}")
+
+    # Export long-form best params tables for reporting
+    try:
+        _export_best_params_long_table(best_params_en_path, results_dir / "best_params_elasticnet_long.tsv")
+        _export_best_params_long_table(best_params_rf_path, results_dir / "best_params_rf_long.tsv")
+    except Exception as e:
+        logger.warning(f"Failed to export long-form best params tables: {e}")
+
+    # Export blocks source provenance
+    try:
+        # Compute basic per-subject block counts for reporting
+        blk_info = {"source": blocks_source}
+        if blocks_all is not None and hasattr(meta, "subject_id"):
+            blk_counts = {}
+            for sid in pd.unique(meta["subject_id"].astype(str)):
+                rows = meta.index[meta["subject_id"].astype(str) == sid].to_numpy()
+                if len(rows) > 0:
+                    vals = np.asarray(blocks_all)[rows]
+                    blk_counts[str(sid)] = int(len(pd.unique(vals)))
+            blk_info["unique_blocks_per_subject"] = blk_counts
+        with open(results_dir / "blocks_source.json", "w", encoding="utf-8") as f:
+            json.dump(blk_info, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to export blocks source info: {e}")
+
     # Summary JSON
     summary = {
         "BaselineGlobal": pooled_bg,
@@ -5413,11 +6206,31 @@ def main(subjects: Optional[List[str]] = None, task: str = TASK, n_jobs: int = -
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG feature correlations")
+    parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG decoding (script 05)")
     subj_group = parser.add_mutually_exclusive_group(required=True)
     subj_group.add_argument("--subjects", nargs="*", help="Subject IDs to process (e.g., 001 002)")
     subj_group.add_argument("--all-subjects", action="store_true", help="Process all subjects with available features")
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
+    # General compute controls
+    parser.add_argument("--n_jobs", type=int, default=-1, help="Inner CV parallelism (default: -1)")
+    parser.add_argument("--outer_n_jobs", type=int, default=1, help="Parallel outer LOSO folds (default: 1)")
+    # Analysis knobs
+    parser.add_argument("--n_perm_quick", type=int, default=int(CONFIG.get("analysis", {}).get("n_perm_quick", 1000)), help="Quick permutation iterations")
+    parser.add_argument("--n_perm_refit", type=int, default=int(CONFIG.get("analysis", {}).get("n_perm_refit", 500)), help="Refit-based permutation iterations")
+    parser.add_argument("--rf_perm_repeats", type=int, default=int(CONFIG.get("analysis", {}).get("rf_perm_importance_repeats", 20)), help="RF permutation importance repeats")
+    parser.add_argument("--perm_refit_n_jobs", type=int, default=int(CONFIG.get("analysis", {}).get("perm_refit_n_jobs", 1)), help="Refit permutation parallelism")
+    parser.add_argument("--bootstrap_n", type=int, default=int(CONFIG.get("analysis", {}).get("bootstrap_n", 1000)), help="Bootstrap iterations for CIs")
+    parser.add_argument("--inner_splits", type=int, default=int(CONFIG.get("cv", {}).get("inner_splits", 5)), help="Inner CV splits")
+    # Viz/interpretability
+    parser.add_argument("--montage", default=str(CONFIG.get("viz", {}).get("montage", "standard_1005")), help="Montage: standard name or bids:[electrodes.tsv] or bids_auto")
+    parser.add_argument("--coef_agg", choices=["abs", "signed"], default=str(CONFIG.get("viz", {}).get("coef_agg", "abs")).lower(), help="ElasticNet coef aggregation")
+    # Feature flags
+    parser.add_argument("--no-within", action="store_true", help="Disable within-subject KFold analysis")
+    parser.add_argument("--no-riemann", action="store_true", help="Disable Riemann decoding analyses")
+    parser.add_argument("--no-shap", action="store_true", help="Disable SHAP analysis")
+    # Best-params behavior and run info
+    parser.add_argument("--best-params-mode", choices=["append", "truncate", "run_scoped"], default=str(BEST_PARAMS_MODE), help="How to record CV best params")
+    parser.add_argument("--run-id", default=None, help="Optional run identifier to tag outputs")
     args = parser.parse_args()
 
     # seeds
@@ -5425,7 +6238,12 @@ if __name__ == "__main__":
     pyrandom.seed(RANDOM_STATE)
 
     # Apply CLI configs
-    RUN_ID = None
+    RUN_ID = args.run_id
+    # Sync best-params mode
+    try:
+        globals()["BEST_PARAMS_MODE"] = str(args.best_params_mode)
+    except Exception:
+        pass
     CONFIG["analysis"]["n_perm_quick"] = int(args.n_perm_quick)
     CONFIG["analysis"]["n_perm_refit"] = int(args.n_perm_refit)
     CONFIG["analysis"]["rf_perm_importance_repeats"] = int(args.rf_perm_repeats)

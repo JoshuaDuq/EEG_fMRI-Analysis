@@ -1,0 +1,335 @@
+# ============================================================================
+# FMRI PIPELINE CONFIGURATION FILE
+# ============================================================================
+# Central configuration for all fMRI analysis scripts
+# Single source of truth for paths, parameters, and analysis settings
+
+# ============================================================================
+# PATH CONFIGURATION
+# ============================================================================
+
+# Core directories (relative to fmri_pipeline root or absolute paths)
+bids_root: "../BIDS/dataset"
+fmriprep_root: "../bids_output"  # fMRIPrep outputs are in bids_output/, not derivatives/fmriprep
+derivatives_root: "../bids_output/derivatives"  # For custom derivatives (GLM outputs, etc.)
+eeg_derivatives_root: "C:/Users/joshu/EEG_fMRI_Analysis/eeg_pipeline/bids_output/derivatives"
+
+# Resource files
+resources:
+  # NPS weights for pain signature scoring
+  nps_weights_path: "resources/weights_NSF_grouppred_cvpcr.nii.gz"
+  # Reference template space (3mm MNI152NLin2009cAsym via TemplateFlow/nilearn)
+  reference_space: "MNI152NLin2009cAsym"
+  reference_resolution: "03"  # res-03 (3mm isotropic) - for NPS mask generation
+
+# ============================================================================
+# SUBJECT & RUN CONFIGURATION
+# ============================================================================
+
+subjects: ["sub-0001"]  # Add additional subjects as: ["sub-0001", "sub-0002", ...]
+
+# Task and run specification
+task: "pain"  # Task name used in BIDS filenames
+runs: [1, 2, 3, 4, 5, 6]  # Pain task runs (run-01 through run-06)
+
+# Additional tasks (not used in main GLM but present in BIDS)
+tasks:
+  rest:
+    name: "rest"
+    acq: "p2s33mm"
+    runs: [1]  # Single resting-state run
+
+# ============================================================================
+# BIDS FILE NAMING CONVENTIONS
+# ============================================================================
+
+# Standard BIDS suffixes
+suffixes:
+  events: "_events.tsv"
+  confounds: "_desc-confounds_timeseries.tsv"
+  bold_preproc: "_space-{space}_res-{res}_desc-preproc_bold.nii.gz"
+  bold_mask: "_space-{space}_res-{res}_desc-brain_mask.nii.gz"
+  anat_preproc: "_acq-{acq}_space-{space}_res-{res}_desc-preproc_T1w.nii.gz"
+  
+# Anatomical and functional MRI space
+space: "MNI152NLin2009cAsym"  # Standard space for all analyses
+resolution: "2"  # Resolution in mm (fMRIPrep outputs are res-2 = 2mm isotropic)
+anat_acquisition: "mprageipat2"  # Anatomical acquisition label
+
+# ============================================================================
+# MRI ACQUISITION PARAMETERS
+# ============================================================================
+
+acquisition_params:
+  tr: 0.9  # Repetition time in seconds (900ms)
+  echo_time: 0.02  # TE = 20ms
+  flip_angle: 56  # degrees
+  multiband_factor: 3  # SMS acceleration
+  slice_timing: true  # Slice timing available in BIDS JSON
+  
+# ============================================================================
+# GLM CONFIGURATION
+# ============================================================================
+
+glm:
+  # Basic GLM settings
+  tr: 0.9  # Repetition time (must match acquisition.tr)
+  hrf_model: "spm"  # Options: "spm", "spm + derivative", "glover", "fir"
+  
+  # Temporal filtering
+  high_pass_sec: 128  # High-pass filter cutoff in seconds (SPM default)
+  drift_model: "cosine"  # Drift removal method
+  
+  # Hemodynamic response
+  hrf:
+    model: "spm"  # SPM canonical HRF (Nilearn accepts: 'spm', 'spm + derivative', 'glover', 'fir')
+    include_derivative: false  # Set true for "spm + derivative"
+    include_dispersion: false  # Set true for dispersion derivative
+  
+  # Event modeling
+  stim_dur_sec: 12.5  # Heat stimulus duration in seconds (approx 12.5s)
+  
+  # Temperature conditions (6 levels)
+  temp_labels: 
+    - "temp44p3"  # 44.3°C
+    - "temp45p3"  # 45.3°C
+    - "temp46p3"  # 46.3°C
+    - "temp47p3"  # 47.3°C
+    - "temp48p3"  # 48.3°C
+    - "temp49p3"  # 49.3°C
+  
+  # Temperature mapping (label -> Celsius)
+  temp_celsius_mapping:
+    temp44p3: 44.3
+    temp45p3: 45.3
+    temp46p3: 46.3
+    temp47p3: 47.3
+    temp48p3: 48.3
+    temp49p3: 49.3
+  
+  # Nuisance events to include as separate regressors
+  nuisance_events: 
+    - "decision"  # Pain Yes/No question period
+    - "rating"    # VAS rating period
+    - "delay"     # Optional: delay between stimulus and decision (if using --no_delay in split_events_to_runs.py, remove this)
+  
+  # Contrasts to compute
+  contrasts:
+    # Simple main effects
+    - name: "all_pain"
+      type: "t"
+      weights: [1, 1, 1, 1, 1, 1]  # Average across all temperatures
+    - name: "high_vs_low_temp"
+      type: "t"
+      weights: [-1, -1, -1, 1, 1, 1]  # High (47-49°C) vs Low (44-46°C)
+    - name: "linear_temp"
+      type: "t"
+      weights: [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]  # Linear temperature trend
+    - name: "quadratic_temp"
+      type: "t"
+      weights: [1, -1, -2, -2, -1, 1]  # Quadratic temperature trend
+  
+# ============================================================================
+# CONFOUND REGRESSION
+# ============================================================================
+
+confounds:
+  # Standard 24-parameter motion model (6 motion + derivatives + quadratics)
+  motion_24_params:
+    - "trans_x"
+    - "trans_y"
+    - "trans_z"
+    - "rot_x"
+    - "rot_y"
+    - "rot_z"
+    - "trans_x_derivative1"
+    - "trans_y_derivative1"
+    - "trans_z_derivative1"
+    - "rot_x_derivative1"
+    - "rot_y_derivative1"
+    - "rot_z_derivative1"
+    - "trans_x_power2"
+    - "trans_y_power2"
+    - "trans_z_power2"
+    - "rot_x_power2"
+    - "rot_y_power2"
+    - "rot_z_power2"
+    - "trans_x_derivative1_power2"
+    - "trans_y_derivative1_power2"
+    - "trans_z_derivative1_power2"
+    - "rot_x_derivative1_power2"
+    - "rot_y_derivative1_power2"
+    - "rot_z_derivative1_power2"
+  
+  # Motion outlier detection (fMRIPrep automatic scrubbing indicators)
+  motion_outlier_prefix: "motion_outlier"  # Columns starting with this prefix
+  
+  # Additional physiological confounds (optional)
+  # Uncomment to include:
+  # physiological:
+  #   - "global_signal"
+  #   - "csf"
+  #   - "white_matter"
+  
+  # CompCor components (optional - highly recommended for task fMRI)
+  compcor:
+    enabled: true
+    method: "acompcor"  # Options: "acompcor", "tcompcor", "both"
+    n_components: 5  # Number of aCompCor components to include
+    # If method="both", specify separate counts:
+    # acompcor_components: 5
+    # tcompcor_components: 5
+  
+  # Framewise displacement threshold (optional scrubbing)
+  fd_threshold: null  # Set to numeric value (e.g., 0.5) to enable scrubbing
+
+# ============================================================================
+# NPS SCORING CONFIGURATION
+# ============================================================================
+
+nps:
+  # Scoring method
+  score_grid_policy: "resample_betas_to_weights"  
+  # Options:
+  #   - "resample_betas_to_weights": Resample beta maps to NPS grid (recommended)
+  #   - "resample_weights_to_betas": Resample NPS weights to beta map grid
+  
+  # Scale factor adjustment for resolution mismatch
+  apply_scale_factor_if_2mm: true  # Apply 27/8 scale when scoring 2mm betas against 3mm weights
+  
+  # FDR correction for statistical inference (used in Step1_NPS.py mask building)
+  fdr_q: 0.05  # Target FDR q-value for unthresholded maps
+  q_label: "q0p05"  # Label for output filenames
+  
+  # Bootstrap parameters for uncertainty estimation
+  bootstrap:
+    enabled: false  # Set true to enable bootstrap CIs
+    n_resamples: 10000
+    ci_method: "percentile"  # Options: "percentile", "bca"
+
+# ============================================================================
+# ANALYSIS OUTPUT CONFIGURATION
+# ============================================================================
+
+outputs:
+  # GLM outputs
+  glm_dir: "derivatives/glm"  # First-level GLM outputs
+  group_dir: "derivatives/group"  # Group-level analyses
+  
+  # NPS outputs
+  nps_dir: "derivatives/nps_scores"  # NPS signature scores
+  masks_dir: "derivatives/reference_masks"  # Pain masks from Neurosynth
+  
+  # Figures and reports
+  figures_dir: "derivatives/figures"
+  reports_dir: "derivatives/reports"
+  
+  # File formats
+  save_nifti: true  # Save statistical maps as NIfTI
+  save_tsv: true    # Save tabular results as TSV
+  save_json: true   # Save metadata as JSON
+  save_figures: true  # Generate and save figures
+  
+  # Figure settings
+  figure_dpi: 300
+  figure_formats: ["png", "svg"]  # Save both raster and vector formats
+
+# ============================================================================
+# COMPUTATIONAL RESOURCES
+# ============================================================================
+
+parallelization:
+  # Thread allocation
+  glm_threads: 1  # Number of threads for GLM fitting (Nilearn can parallelize)
+  io_threads: 4   # Number of threads for I/O operations
+  
+  # Job parallelization
+  n_jobs: 1  # Number of parallel jobs (-1 for all cores, but be careful with nested parallelism)
+  
+  # Memory management
+  memory_limit: null  # Set to string like "8GB" to limit memory usage
+
+# ============================================================================
+# QUALITY CONTROL
+# ============================================================================
+
+qc:
+  # Framewise displacement summary
+  fd_summary: true
+  fd_plot: true
+  
+  # Coverage checks
+  min_brain_coverage: 0.8  # Minimum fraction of brain coverage required
+  
+  # Motion thresholds (for reporting, not exclusion)
+  motion_thresholds:
+    fd_mean_warn: 0.3  # Warn if mean FD > 0.3mm
+    fd_max_warn: 2.0   # Warn if max FD > 2.0mm
+    
+  # Design matrix visualization
+  plot_design_matrix: true
+  plot_contrast_matrix: true
+
+# ============================================================================
+# BEHAVIORAL DATA INTEGRATION
+# ============================================================================
+
+behavioral:
+  # Columns from events files to use in analyses
+  rating_column: "vas_0_200"  # VAS ratings (0-200 scale)
+  pain_binary_column: "pain_binary"  # Binary pain Yes/No
+  temperature_column: "temp_celsius"  # Stimulus temperature in Celsius
+  trial_index_column: "trial_index"  # Trial number within run
+  block_column: "block"  # Run/block number
+  
+  # Parametric modulation
+  parametric_modulation:
+    enabled: false  # Set true to add parametric modulators
+    modulators:
+      - column: "vas_0_200"
+        demean: true  # Demean modulator before GLM
+        orthogonalize: true  # Orthogonalize w.r.t. main regressor
+
+# ============================================================================
+# PREPROCESSING VALIDATION
+# ============================================================================
+
+preprocessing:
+  # Expected fMRIPrep outputs to verify
+  required_files:
+    - "space-{space}_desc-preproc_bold.nii.gz"
+    - "space-{space}_desc-brain_mask.nii.gz"
+    - "desc-confounds_timeseries.tsv"
+    - "events.tsv"  # From split_events_to_runs.py
+  
+  # Smoothing (if not done by fMRIPrep)
+  smoothing:
+    enabled: false  # Set true to smooth preprocessed data
+    fwhm: 6.0  # Full-width half-maximum in mm
+
+# ============================================================================
+# LOGGING & DEBUGGING
+# ============================================================================
+
+logging:
+  level: "INFO"  # Options: "DEBUG", "INFO", "WARNING", "ERROR"
+  console: true
+  file: true
+  log_dir: "logs"
+
+# ============================================================================
+# METADATA
+# ============================================================================
+
+metadata:
+  project_name: "EEG_fMRI_Pain_Study"
+  description: "Thermal pain fMRI with simultaneous EEG"
+  citation: "Add study citation here"
+  
+  # Version tracking
+  config_version: "1.0.0"
+  pipeline_version: "1.0.0"
+  
+  # Contact
+  investigator: "Your Name"
+  institution: "Centre de recherche CERVO"

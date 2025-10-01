@@ -304,8 +304,8 @@ def get_legacy_constants(config: EEGConfig) -> Dict[str, Any]:
         # Frequency bands
         # Prefer new per-script bands, fall back to legacy top-level if present
         "FEATURES_FREQ_BANDS": (config.get("time_frequency_analysis.bands") or config.frequency_bands),
-        # Default now includes theta to ensure analyses and plots cover it
-        "POWER_BANDS_TO_USE": config.get("power.bands_to_use", ["theta", "alpha", "beta", "gamma"]),
+        # Default now includes delta and theta to ensure analyses and plots cover low-frequency bands
+        "POWER_BANDS_TO_USE": config.get("power.bands_to_use", ["delta", "theta", "alpha", "beta", "gamma"]),
         
         # Event columns
         "PSYCH_TEMP_COLUMNS": config.get("event_columns.temperature", []),
@@ -371,5 +371,5 @@ def get_legacy_constants(config: EEGConfig) -> Dict[str, Any]:
         "PLATEAU_START": config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])[0],
         "PLATEAU_END": config.get("time_frequency_analysis.plateau_window", [3.0, 10.0])[1],
         "TARGET_COLUMNS": config.get("event_columns.rating", []),
-        "POWER_BANDS": config.get("power.bands_to_use", ["theta", "alpha", "beta", "gamma"]),
+        "POWER_BANDS": config.get("power.bands_to_use", ["delta", "theta", "alpha", "beta", "gamma"]),
     }

@@ -17,6 +17,13 @@ import numpy as np
 import pandas as pd
 import mne
 
+try:  # prefer package-relative import
+    from .config_loader import load_config  # type: ignore
+except Exception:  # pragma: no cover
+    from config_loader import load_config
+
+_STRICT_MODE = bool(load_config().get("analysis.strict_mode", True))
+
 
 def align_events_to_epochs_strict(
     events_df: Optional[pd.DataFrame], 
@@ -101,8 +108,16 @@ def align_events_to_epochs_strict(
             
     # Method 3: Check if lengths already match and order is likely correct
     if len(events_df) == len(epochs):
-        logger.warning("Assuming events and epochs are already aligned (same length). "
-                      "This is risky without explicit verification.")
+        msg = (
+            "Events and epochs lengths match but no reliable key (selection/sample) "+
+            "was found for alignment."
+        )
+        if _STRICT_MODE:
+            logger.critical(msg + " Strict mode is enabled; refusing implicit alignment.")
+            raise ValueError(
+                msg + " Enable a reliable alignment key (epochs.selection or events 'sample')."
+            )
+        logger.warning(msg + " Proceeding due to strict_mode=False.")
         return events_df.copy()
     
     # Critical failure: Cannot guarantee alignment

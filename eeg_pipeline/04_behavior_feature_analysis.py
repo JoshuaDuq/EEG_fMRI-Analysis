@@ -1,25 +1,18 @@
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import itertools
 import logging
 
 import matplotlib
 matplotlib.use("Agg")  # headless-friendly
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.cm import ScalarMappable
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MaxNLocator, AutoMinorLocator, StrMethodFormatter
 import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy import stats
 from scipy.ndimage import gaussian_filter1d
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 import mne
 from mne_bids import BIDSPath
 
@@ -29,7 +22,13 @@ from mne_bids import BIDSPath
 # CONFIG
 # Load centralized configuration from YAML
 # ==========================
-from config_loader import load_config, get_legacy_constants
+from utils.config_loader import load_config, get_legacy_constants
+from utils.logging_utils import get_subject_logger, get_group_logger
+from utils.io_utils import (
+    _find_clean_epochs_path as _find_clean_epochs_path,
+    _load_events_df as _load_events_df,
+    _align_events_to_epochs as _align_events_to_epochs,
+)
 
 # Load configuration
 config = load_config()
@@ -58,13 +57,18 @@ BOOTSTRAP_DEFAULT = _constants["BOOTSTRAP_DEFAULT"]
 N_PERM_DEFAULT = _constants["N_PERM_DEFAULT"]
 DO_GROUP_DEFAULT = _constants["DO_GROUP_DEFAULT"]
 GROUP_ONLY_DEFAULT = _constants["GROUP_ONLY_DEFAULT"]
-BUILD_REPORTS_DEFAULT = _constants["BUILD_REPORTS_DEFAULT"]
 BAND_COLORS = _constants["BAND_COLORS"]
+
+# Global strict mode: abort on misalignment or length mismatches instead of trimming
+STRICT_MODE = bool(config.get("analysis.strict_mode", True))
 
 # Behavior analysis config (important parameters)
 BEHAV_FDR_ALPHA = float(config.get("behavior_analysis.statistics.fdr_alpha", 0.05))
 BEHAV_MIN_CORR_SAMPLES = int(config.get("behavior_analysis.statistics.min_correlation_samples", 10))
 BEHAV_BOOTSTRAP_N = int(config.get("behavior_analysis.statistics.bootstrap_n", 1000))
+
+# Visualization annotation toggles
+ANNOTATE_FDR = bool(config.get("behavior_analysis.visualization.annotate_fdr_note", True))
 
 # Spline smoothing parameters for diagnostics
 SPLINE_SMOOTHING_FRAC = float(config.get("behavior_analysis.spline.smoothing_factor", 0.3))
@@ -88,15 +92,28 @@ def _sanitize(name: str) -> str:
 
 
 def _save_fig(fig: matplotlib.figure.Figure, path_base: Path | str, formats: Tuple[str, ...] = SAVE_FORMATS) -> None:
-    """Save figure to multiple formats at FIG_DPI and close.
-
-    If path_base already has a suffix, it will be stripped and replaced.
-    """
+    """Save figure to multiple formats at FIG_DPI and close with footer annotations."""
     base = Path(path_base)
     if base.suffix:
         base = base.with_suffix("")
+    # Add footer with baseline window and FDR alpha for transparency
+    try:
+        bwin = tuple(config.get("time_frequency_analysis.baseline_window", [-5.0, -0.01]))
+        foot = f"Baseline: [{float(bwin[0]):.2f}, {float(bwin[1]):.2f}] s | FDR alpha: {BEHAV_FDR_ALPHA}"
+        try:
+            fig.text(0.01, 0.01, foot, fontsize=8, alpha=0.8)
+        except Exception:
+            pass
+    except Exception:
+        pass
     for ext in formats:
-        fig.savefig(base.with_suffix(f".{ext}"), dpi=FIG_DPI, bbox_inches="tight")
+        try:
+            fig.savefig(base.with_suffix(f".{ext}"), dpi=FIG_DPI, bbox_inches="tight")
+        except Exception:
+            try:
+                fig.savefig(base.with_suffix(f".{ext}"), dpi=FIG_DPI)
+            except Exception:
+                pass
     plt.close(fig)
 
 
@@ -110,7 +127,7 @@ def _get_band_color(band: str) -> str:
             return str(BAND_COLORS[band])
     except Exception:
         pass
-    fallback = {"theta": "purple", "alpha": "green", "beta": "orange", "gamma": "red"}
+    fallback = {"delta": "#4169e1", "theta": "purple", "alpha": "green", "beta": "orange", "gamma": "red"}
     return fallback.get(band, "#1f77b4")
 
 def _logratio_to_pct(v):
@@ -144,97 +161,13 @@ def _find_connectivity_path(subject: str, task: str) -> Path:
     return tsv_path
 
 
-def _find_clean_epochs_path(subject: str, task: str) -> Optional[Path]:
-    bp = BIDSPath(
-        subject=subject,
-        task=task,
-        datatype="eeg",
-        processing="clean",
-        suffix="epo",
-        extension=".fif",
-        root=DERIV_ROOT,
-        check=False,
-    )
-    p1 = bp.fpath
-    if p1 and p1.exists():
-        return p1
-    p2 = DERIV_ROOT / f"sub-{subject}" / "eeg" / f"sub-{subject}_task-{task}_proc-clean_epo.fif"
-    if p2.exists():
-        return p2
-    subj_eeg_dir = DERIV_ROOT / f"sub-{subject}" / "eeg"
-    if subj_eeg_dir.exists():
-        cands = sorted(subj_eeg_dir.glob(f"sub-{subject}_task-{task}*epo.fif"))
-        for c in cands:
-            if "proc-clean" in c.name or "proc-cleaned" in c.name or "clean" in c.name:
-                return c
-        if cands:
-            return cands[0]
-    subj_dir = DERIV_ROOT / f"sub-{subject}"
-    if subj_dir.exists():
-        for c in sorted(subj_dir.rglob(f"sub-{subject}_task-{task}*epo.fif")):
-            return c
-    return None
+## _find_clean_epochs_path imported from io_utils
 
 
-def _load_events_df(subject: str, task: str) -> Optional[pd.DataFrame]:
-    ebp = BIDSPath(
-        subject=subject,
-        task=task,
-        datatype="eeg",
-        suffix="events",
-        extension=".tsv",
-        root=BIDS_ROOT,
-        check=False,
-    )
-    p = ebp.fpath or (BIDS_ROOT / f"sub-{subject}" / "eeg" / f"sub-{subject}_task-{task}_events.tsv")
-    try:
-        return pd.read_csv(p, sep="\t") if p.exists() else None
-    except Exception as e:
-        print(f"Warning: failed to read events TSV at {p}: {e}")
-        return None
+## _load_events_df imported from io_utils
 
 
-def _align_events_to_epochs(events_df: Optional[pd.DataFrame], epochs: mne.Epochs) -> Optional[pd.DataFrame]:
-    """Align events rows to epochs order using selection/sample heuristics.
-
-    Mirrors logic from feature engineering to ensure behavioral vectors align to
-    epochs even if there are row-count mismatches or ordering differences."""
-    if events_df is None or len(events_df) == 0:
-        return None
-    if len(epochs) == 0:
-        return pd.DataFrame()
-
-    logger = logging.getLogger("align_events")
-
-    # 1) Try epochs.selection to reindex
-    if hasattr(epochs, "selection") and epochs.selection is not None:
-        sel = epochs.selection
-        try:
-            if len(events_df) > int(np.max(sel)):
-                logger.debug(f"Successfully aligned events using epochs.selection ({len(sel)} epochs)")
-                return events_df.iloc[sel].reset_index(drop=True)
-        except (IndexError, ValueError, TypeError) as e:
-            logger.warning(f"Failed to align events using epochs.selection: {e}")
-            
-    # 2) Use sample column to reindex to epochs.events
-    if "sample" in events_df.columns and isinstance(getattr(epochs, "events", None), np.ndarray):
-        try:
-            samples = epochs.events[:, 0]
-            out = events_df.set_index("sample").reindex(samples)
-            if len(out) == len(epochs) and not out.isna().all(axis=1).any():
-                logger.debug(f"Successfully aligned events using sample column ({len(out)} epochs)")
-                return out.reset_index()
-        except (KeyError, IndexError, ValueError) as e:
-            logger.warning(f"Failed to align events using sample column: {e}")
-            
-    # 3) Critical failure: cannot guarantee alignment
-    logger.critical(f"CRITICAL: Unable to align events to epochs reliably. "
-                   f"Events: {len(events_df)} rows, Epochs: {len(epochs)} epochs. "
-                   f"This could result in completely invalid correlations due to trial misalignment.")
-    raise ValueError(f"Cannot guarantee events-to-epochs alignment for reliable analysis. "
-                    f"Events DataFrame ({len(events_df)} rows) cannot be reliably aligned to "
-                    f"epochs ({len(epochs)} epochs). This is a critical failure that would "
-                    f"invalidate all behavioral correlations.")
+## _align_events_to_epochs imported from io_utils
 
 
 def _pick_first_column(df: Optional[pd.DataFrame], candidates: List[str]) -> Optional[str]:
@@ -244,6 +177,152 @@ def _pick_first_column(df: Optional[pd.DataFrame], candidates: List[str]) -> Opt
         if c in df.columns:
             return c
     return None
+
+
+
+def _canonical_covariate_name(name: Optional[str]) -> Optional[str]:
+    """Map covariate column variants to canonical labels.
+
+    Standardizes known aliases such that pooled design matrices share the same
+    column names across subjects.
+    """
+    if name is None:
+        return None
+    n = str(name).lower()
+    temp_aliases = {c.lower() for c in PSYCH_TEMP_COLUMNS}
+    trial_aliases = {"trial", "trial_number", "trial_index"}
+    if n in temp_aliases:
+        return "temperature"
+    if n in trial_aliases:
+        return "trial"
+    return n
+
+
+
+def _build_covariate_matrices(
+    df_events: Optional[pd.DataFrame],
+    partial_covars: Optional[List[str]],
+    temp_col: Optional[str],
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """Construct design matrices for partial correlations.
+
+    Returns ``(Z_full, Z_temp)`` where ``Z_full`` includes all covariates and
+    ``Z_temp`` drops the temperature column (when present) for temperature
+    correlations.
+    """
+    if df_events is None:
+        return None, None
+
+    covars = []
+    name_map: Dict[str, str] = {}
+    if partial_covars:
+        for c in partial_covars:
+            if c in df_events.columns:
+                covars.append(c)
+                name_map[c] = _canonical_covariate_name(c)
+            else:
+                canon = _canonical_covariate_name(c)
+                if canon == "temperature":
+                    tcol = _pick_first_column(df_events, PSYCH_TEMP_COLUMNS)
+                    if tcol is not None:
+                        covars.append(tcol)
+                        name_map[tcol] = canon
+                elif canon == "trial":
+                    tcol = _pick_first_column(df_events, ["trial", "trial_number", "trial_index"])
+                    if tcol is not None:
+                        covars.append(tcol)
+                        name_map[tcol] = canon
+    else:
+        tcol = _pick_first_column(df_events, PSYCH_TEMP_COLUMNS)
+        if tcol is not None:
+            covars.append(tcol)
+            name_map[tcol] = "temperature"
+        trialc = _pick_first_column(df_events, ["trial", "trial_number", "trial_index", "run", "block"])
+        if trialc is not None:
+            covars.append(trialc)
+            name_map[trialc] = _canonical_covariate_name(trialc)
+
+    if not covars:
+        return None, None
+    Z = pd.DataFrame()
+    for c in covars:
+        if c in df_events.columns:
+
+            Z[name_map.get(c, c)] = pd.to_numeric(df_events[c], errors="coerce")
+    if Z.empty:
+        return None, None
+    temp_col_can = _canonical_covariate_name(temp_col) if temp_col else None
+    Z_temp = Z.drop(columns=[temp_col_can], errors="ignore") if temp_col_can else Z.copy()
+
+    if Z_temp.shape[1] == 0:
+        Z_temp = None
+    return Z, Z_temp
+
+
+def _partial_corr_xy_given_Z(
+    x: pd.Series, y: pd.Series, Z: pd.DataFrame, method: str
+) -> Tuple[float, float, int]:
+    """Compute partial correlation of ``x`` and ``y`` controlling for ``Z``."""
+    df_full = pd.concat([x.rename("x"), y.rename("y"), Z], axis=1)
+    df = df_full.dropna()
+    if len(df) < 5 or df["y"].nunique() <= 1:
+        return np.nan, np.nan, 0
+    if method == "spearman":
+        xr = stats.rankdata(df["x"].to_numpy())
+        yr = stats.rankdata(df["y"].to_numpy())
+        Zr = (
+            np.column_stack([stats.rankdata(df[c].to_numpy()) for c in Z.columns])
+            if len(Z.columns)
+            else np.empty((len(df), 0))
+        )
+        Xd = np.column_stack([np.ones(len(df)), Zr])
+        bx = np.linalg.lstsq(Xd, xr, rcond=None)[0]
+        by = np.linalg.lstsq(Xd, yr, rcond=None)[0]
+        x_res = xr - Xd.dot(bx)
+        y_res = yr - Xd.dot(by)
+        r_p, p_p = stats.pearsonr(x_res, y_res)
+    else:
+        Xd = np.column_stack([np.ones(len(df)), df[Z.columns].to_numpy()])
+        bx = np.linalg.lstsq(Xd, df["x"].to_numpy(), rcond=None)[0]
+        by = np.linalg.lstsq(Xd, df["y"].to_numpy(), rcond=None)[0]
+        x_res = df["x"].to_numpy() - Xd.dot(bx)
+        y_res = df["y"].to_numpy() - Xd.dot(by)
+        r_p, p_p = stats.pearsonr(x_res, y_res)
+    return float(r_p), float(p_p), int(len(df))
+
+
+def _partial_residuals_xy_given_Z(
+    x: pd.Series, y: pd.Series, Z: pd.DataFrame, method: str
+) -> Tuple[pd.Series, pd.Series, int]:
+    """Compute partial residuals of ``x`` and ``y`` after regressing out ``Z``."""
+    df_full = pd.concat([x.rename("x"), y.rename("y"), Z], axis=1)
+    df = df_full.dropna()
+    if len(df) < 5 or df["y"].nunique() <= 1:
+        return pd.Series(dtype=float), pd.Series(dtype=float), 0
+    if method == "spearman":
+        xr = stats.rankdata(df["x"].to_numpy())
+        yr = stats.rankdata(df["y"].to_numpy())
+        Zr = (
+            np.column_stack([stats.rankdata(df[c].to_numpy()) for c in Z.columns])
+            if len(Z.columns)
+            else np.empty((len(df), 0))
+        )
+        Xd = np.column_stack([np.ones(len(df)), Zr])
+        bx = np.linalg.lstsq(Xd, xr, rcond=None)[0]
+        by = np.linalg.lstsq(Xd, yr, rcond=None)[0]
+        x_res = xr - Xd.dot(bx)
+        y_res = yr - Xd.dot(by)
+    else:
+        Xd = np.column_stack([np.ones(len(df)), df[Z.columns].to_numpy()])
+        bx = np.linalg.lstsq(Xd, df["x"].to_numpy(), rcond=None)[0]
+        by = np.linalg.lstsq(Xd, df["y"].to_numpy(), rcond=None)[0]
+        x_res = df["x"].to_numpy() - Xd.dot(bx)
+        y_res = df["y"].to_numpy() - Xd.dot(by)
+    return (
+        pd.Series(x_res, index=df.index),
+        pd.Series(y_res, index=df.index),
+        int(len(df)),
+    )
 
 
 def _features_dir(subject: str) -> Path:
@@ -263,7 +342,8 @@ def _group_stats_dir() -> Path:
 
 
 def _group_plots_dir() -> Path:
-    return DERIV_ROOT / "group" / "eeg" / "plots"
+    # Keep plots organized under a script-specific subfolder (mirrors subject-level)
+    return DERIV_ROOT / "group" / "eeg" / "plots" / "04_behavior_feature_analysis"
 
 
 def _load_features_and_targets(subject: str, task: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], pd.Series, mne.Info]:
@@ -300,68 +380,17 @@ def _load_features_and_targets(subject: str, task: str) -> Tuple[pd.DataFrame, O
 
 
 def _setup_logging(subject: str) -> logging.Logger:
-    """Set up logging with console and file handlers for behavior feature analysis."""
-    logger = logging.getLogger(f"behavior_analysis_sub_{subject}")
-    logger.setLevel(logging.INFO)
-    # Avoid duplicate handlers if already set
-    if logger.handlers:
-        return logger
-    
-    # Create formatters
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    # File handler
-    log_dir = _plots_dir(subject).parent / "logs"  # e.g., derivatives/sub-001/eeg/logs/
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / LOG_FILE_NAME
-    file_handler = logging.FileHandler(log_file, mode='w')  # Overwrite each run
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
-    return logger
+    """Backward-compatible wrapper using centralized logging utils."""
+    return get_subject_logger("behavior_analysis", subject, LOG_FILE_NAME)
 
 
-# ROI utilities (replicate minimal logic to avoid importing numbered module names)
-
-def _roi_definitions() -> Dict[str, List[str]]:
-    # Reuse global ROIs from time_frequency_analysis section for consistency
-    rois = config.get('time_frequency_analysis.rois', {
-        "Frontal": [r"^(Fpz|Fp[12]|AFz|AF[3-8]|Fz|F[1-8])$"],
-        "Central": [r"^(Cz|C[1-6])$"],
-        "Parietal": [r"^(Pz|P[1-8])$"],
-        "Occipital": [r"^(Oz|O[12]|POz|PO[3-8])$"],
-        "Temporal": [r"^(T7|T8|TP7|TP8|FT7|FT8)$"],
-        "Sensorimotor": [r"^(FC[234]|FCz)$", r"^(C[234]|Cz)$", r"^(CP[234]|CPz)$"],
-    })
-    return {roi: list(pats) for roi, pats in rois.items()}
+def _setup_group_logging() -> logging.Logger:
+    """Backward-compatible wrapper using centralized logging utils."""
+    return get_group_logger("behavior_analysis", LOG_FILE_NAME)
 
 
-def _build_rois(info: mne.Info) -> Dict[str, List[str]]:
-    import re
-    chs = info["ch_names"]
-    roi_map: Dict[str, List[str]] = {}
-    for roi, pats in _roi_definitions().items():
-        found: List[str] = []
-        for pat in pats:
-            rx = re.compile(pat, flags=re.IGNORECASE)
-            found.extend([ch for ch in chs if rx.match(ch)])
-        # preserve order, deduplicate
-        seen = set()
-        ordered: List[str] = []
-        for ch in chs:
-            if ch in found and ch not in seen:
-                seen.add(ch)
-                ordered.append(ch)
-        if ordered:
-            roi_map[roi] = ordered
-    return roi_map
+# ROI utilities centralized to avoid drift across scripts
+from utils.roi_utils import build_rois_from_info as _build_rois
 
 
 # -----------------------------------------------------------------------------
@@ -399,16 +428,66 @@ def plot_psychometrics(subject: str, task: str = TASK) -> None:
             r = rating[mask]
             fig, ax = plt.subplots(figsize=(4.5, 3.5))
             sns.regplot(x=t, y=r, scatter_kws={"s": 25, "alpha": 0.7}, line_kws={"color": "k"}, ax=ax)
-            ax.set_xlabel(f"Temperature ({temp_col})")
-            ax.set_ylabel(f"Rating ({rating_col})")
+            
+            # Create presentable axis labels without underscores
+            temp_label = temp_col.replace('_', ' ').title()
+            rating_label = rating_col.replace('_', ' ').title()
+            
+            ax.set_xlabel(f"Temperature")
+            ax.set_ylabel(f"Rating")
             ax.set_title("Rating vs Temperature")
-            _save_fig(fig, plots_dir / "psychometric_rating_vs_temp")
-            # Save Pearson and Spearman
-            pr, pp = stats.pearsonr(t, r)
+            ax.grid(True, alpha=0.3)
+            
+            # Calculate and format statistics
             sr, sp = stats.spearmanr(t, r, nan_policy="omit")
+            
+            # Format p-value properly
+            if sp < 0.001:
+                p_text = "p < .001"
+            elif sp < 0.01:
+                p_text = f"p < .01"
+            elif sp < 0.05:
+                p_text = f"p < .05"
+            else:
+                p_text = f"p = {sp:.3f}"
+            
+            # Add statistical annotation to the plot
+            stats_text = f'ρ = {sr:.3f}, {p_text}'
+            ax.text(0.02, 0.95, stats_text, transform=ax.transAxes,
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                   fontweight='bold', fontsize=10)
+
+            # Align x-axis ticks with actual temperature values to match dots
+            try:
+                t_vals = np.asarray(t, dtype=float)
+                uniq = np.unique(np.round(t_vals, 6))
+                # If temperatures take on a small number of discrete values, use them as ticks
+                if uniq.size <= 12:
+                    ax.set_xticks(uniq)
+                    # If all are integers, force integer locator to prevent half-step misalignment
+                    if np.allclose(uniq, uniq.astype(int)):
+                        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+                        ax.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+                    else:
+                        # Otherwise show up to 2 decimals for readability
+                        ax.xaxis.set_major_formatter(StrMethodFormatter("{x:.2f}"))
+                # Set tight x-limits with a small margin to avoid tick/point edge clipping
+                if np.isfinite(t_vals).any():
+                    xmin = np.nanmin(t_vals)
+                    xmax = np.nanmax(t_vals)
+                    if np.isfinite(xmin) and np.isfinite(xmax) and xmax > xmin:
+                        pad = 0.02 * (xmax - xmin) if xmax - xmin > 0 else 0.5
+                        ax.set_xlim(xmin - pad, xmax + pad)
+            except Exception:
+                pass
+            
+            _save_fig(fig, plots_dir / "psychometric_rating_vs_temp")
+            plt.close(fig)
+            
+            # Save Spearman only (consistent metric)
             pd.DataFrame({
-                "metric": ["pearson_r", "pearson_p", "spearman_r", "spearman_p"],
-                "value": [pr, pp, sr, sp],
+                "metric": ["spearman_r", "spearman_p"],
+                "value": [sr, sp],
             }).to_csv(stats_dir / "psychometric_rating_vs_temp_stats.tsv", sep="\t", index=False)
 
 # -----------------------------------------------------------------------------
@@ -454,6 +533,268 @@ def _bh_adjust(pvals: np.ndarray) -> np.ndarray:
     q[order] = q_sorted
     return q
 
+# -----------------------------------------------------------------------------
+# Shared visualization utilities
+# -----------------------------------------------------------------------------
+
+
+def _sig_color(p: float) -> str:
+    """Return a color based on statistical significance."""
+    return "#C42847" if (np.isfinite(p) and p < 0.05) else "#666666"
+
+
+def _fisher_ci_r(r: float, n: int, alpha: float = 0.05) -> Tuple[float, float]:
+    """Fisher z-transform based confidence interval for correlations."""
+    if not np.isfinite(r) or n < 4:
+        return np.nan, np.nan
+    r = float(np.clip(r, -0.999999, 0.999999))
+    z = np.arctanh(r)
+    se = 1.0 / np.sqrt(n - 3)
+    zcrit = float(stats.norm.ppf(1 - alpha / 2.0))
+    lo = z - zcrit * se
+    hi = z + zcrit * se
+    return float(np.tanh(lo)), float(np.tanh(hi))
+
+
+def _bootstrap_corr_ci(
+    x: pd.Series,
+    y: pd.Series,
+    method: str,
+    n_boot: int = 1000,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[float, float]:
+    """Bootstrap confidence interval for Spearman correlation (consistent metric)."""
+    dfb = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
+    if n_boot <= 0 or len(dfb) < 5:
+        return np.nan, np.nan
+    if rng is None:
+        rng = np.random.default_rng(42)
+    Xv = dfb["x"].to_numpy()
+    Yv = dfb["y"].to_numpy()
+    N = len(dfb)
+    vals: List[float] = []
+    for _ in range(int(n_boot)):
+        idx = rng.integers(0, N, size=N)
+        xb = Xv[idx]
+        yb = Yv[idx]
+        # Always compute Spearman correlation
+        rb, _ = stats.spearmanr(xb, yb, nan_policy="omit")
+        if np.isfinite(rb):
+            vals.append(float(rb))
+    if not vals:
+        return np.nan, np.nan
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+
+def _generate_correlation_scatter(
+    x_data: pd.Series,
+    y_data: pd.Series,
+    x_label: str,
+    y_label: str,
+    title_prefix: str,
+    band_color: str,
+    output_path: Path,
+    *,
+    method_code: str = "spearman",
+    Z_covars: Optional[pd.DataFrame] = None,
+    covar_names: Optional[List[str]] = None,
+    bootstrap_ci: int = 0,
+    rng: Optional[np.random.Generator] = None,
+    is_partial_residuals: bool = False,
+    roi_channels: Optional[List[str]] = None,
+    logger: Optional[logging.Logger] = None,
+    annotated_stats: Optional[Tuple[float, float, int]] = None,
+    annot_ci: Optional[Tuple[float, float]] = None,
+    stats_tag: Optional[str] = None,
+) -> Tuple[float, float, int]:
+    """Generate correlation scatter plots with marginal histograms and stats.
+
+    Returns the correlation coefficient, p-value and effective sample size.
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    if len(x_data) != len(y_data):
+        if STRICT_MODE:
+            raise ValueError(
+                f"Strict mode: length mismatch in correlation inputs (x={len(x_data)}, y={len(y_data)})."
+            )
+        logger.warning(
+            f"Data length mismatch: x={len(x_data)}, y={len(y_data)}. Using overlap for correlation."
+        )
+    n_len = min(len(x_data), len(y_data))
+    x = x_data.iloc[:n_len] if hasattr(x_data, "iloc") else x_data[:n_len]
+    y = y_data.iloc[:n_len] if hasattr(y_data, "iloc") else y_data[:n_len]
+
+    if is_partial_residuals:
+        m = pd.Series([True] * len(x), index=x.index if hasattr(x, "index") else range(len(x)))
+        n_eff = len(x)
+        x_clean = x
+        y_clean = y
+    else:
+        m = x.notna() & y.notna()
+        n_eff = int(m.sum())
+        x_clean = x[m]
+        y_clean = y[m]
+
+    if n_eff < 5:
+        return np.nan, np.nan, n_eff
+
+    if is_partial_residuals:
+        # Always use Spearman for direct correlations
+        r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
+        r_part, p_part, n_part = np.nan, np.nan, 0
+    else:
+        # Always use Spearman for direct correlations
+        r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
+        r_part, p_part, n_part = np.nan, np.nan, 0
+        if Z_covars is not None and len(Z_covars) > 0:
+            n_len_pt = min(len(x), len(y), len(Z_covars))
+            r_part, p_part, n_part = _partial_corr_xy_given_Z(
+                x.iloc[:n_len_pt], y.iloc[:n_len_pt], Z_covars.iloc[:n_len_pt], method_code
+            )
+
+    # Use bootstrap CI for Spearman when requested
+    if bootstrap_ci > 0:
+        ci = _bootstrap_corr_ci(x_clean, y_clean, method_code, n_boot=int(bootstrap_ci), rng=rng)
+    else:
+        ci = (np.nan, np.nan)
+
+    fig = plt.figure(figsize=(8, 6))
+    gs = fig.add_gridspec(
+        2,
+        2,
+        width_ratios=[4, 1],
+        height_ratios=[1, 4],
+        hspace=0.15,
+        wspace=0.15,
+        left=0.1,
+        right=0.95,
+        top=0.80,
+        bottom=0.12,
+    )
+    ax_main = fig.add_subplot(gs[1, 0])
+    ax_histx = fig.add_subplot(gs[0, 0], sharex=ax_main)
+    ax_histy = fig.add_subplot(gs[1, 1], sharey=ax_main)
+    ax_histx.tick_params(labelbottom=False)
+    ax_histy.tick_params(labelleft=False)
+
+    line_color = _sig_color(p)
+    sns.regplot(
+        x=x_clean,
+        y=y_clean,
+        ax=ax_main,
+        ci=95,
+        scatter_kws={"s": 30, "alpha": 0.7, "color": band_color, "edgecolor": "white", "linewidths": 0.3},
+        line_kws={"color": line_color, "lw": 1.5},
+    )
+
+    ax_histx.hist(x_clean, bins=15, color=band_color, alpha=0.7, edgecolor="white", linewidth=0.5)
+    try:
+        from scipy.stats import gaussian_kde
+
+        if len(x_clean) > 3:
+            kde_x = gaussian_kde(x_clean)
+            x_range = np.linspace(x_clean.min(), x_clean.max(), 100)
+            kde_vals = kde_x(x_range)
+            hist_counts, _ = np.histogram(x_clean, bins=15)
+            kde_scale = hist_counts.max() / kde_vals.max() if kde_vals.max() > 0 else 1
+            ax_histx.plot(x_range, kde_vals * kde_scale, color="darkblue", linewidth=1.5, alpha=0.8)
+    except (ImportError, ValueError, ZeroDivisionError):
+        pass
+
+    ax_histy.hist(
+        y_clean,
+        bins=15,
+        orientation="horizontal",
+        color=band_color,
+        alpha=0.7,
+        edgecolor="white",
+        linewidth=0.5,
+    )
+    try:
+        from scipy.stats import gaussian_kde
+
+        if len(y_clean) > 3:
+            kde_y = gaussian_kde(y_clean)
+            y_range = np.linspace(y_clean.min(), y_clean.max(), 100)
+            kde_vals_y = kde_y(y_range)
+            hist_counts_y, _ = np.histogram(y_clean, bins=15)
+            kde_scale_y = hist_counts_y.max() / kde_vals_y.max() if kde_vals_y.max() > 0 else 1
+            ax_histy.plot(kde_vals_y * kde_scale_y, y_range, color="darkblue", linewidth=1.5, alpha=0.8)
+    except (ImportError, ValueError, ZeroDivisionError):
+        pass
+
+    ax_main.set_xlabel(x_label)
+    ax_main.set_ylabel(y_label)
+
+    show_pct_axis = False
+    if not is_partial_residuals and "log10(power" in x_label:
+        show_pct_axis = True
+    elif is_partial_residuals and "residuals of log10(power" in x_label:
+        show_pct_axis = True
+
+    if show_pct_axis:
+        try:
+            ax_pct = ax_histx.secondary_xaxis("top", functions=(_logratio_to_pct, _pct_to_logratio))
+            ax_pct.set_xlabel("Power Change (%)", fontsize=9)
+            # Use a few more major ticks and clean integer labels; add minor ticks for readability
+            ax_pct.xaxis.set_major_locator(MaxNLocator(nbins=7))
+            ax_pct.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+            ax_pct.xaxis.set_minor_locator(AutoMinorLocator(2))
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    # Stats box and channel annotation are handled below (figure-level)
+
+    # Figure-level title and stats box for top-of-figure placement
+    # Decide which stats to annotate (allows group-level overrides)
+    r_disp, p_disp, n_disp = r, p, n_eff
+    if annotated_stats is not None:
+        try:
+            r_disp, p_disp, n_disp = annotated_stats
+        except Exception:
+            pass
+    try:
+        label = "Spearman \u03c1"
+    except Exception:
+        label = "r"
+    # Prefer externally provided CI if available
+    ci_disp = annot_ci if (annot_ci is not None) else ci
+    ci_str = ""
+    if ci_disp is not None and np.all(np.isfinite(ci_disp)):
+        ci_str = f"\nCI [{ci_disp[0]:.2f}, {ci_disp[1]:.2f}]"
+    tag_str = f" {stats_tag}" if stats_tag else ""
+    stats_text = f"{label}{tag_str} = {r_disp:.3f}\np = {p_disp:.3f}\nn = {n_disp}{ci_str}"
+    fig.text(
+        0.98,
+        0.94,
+        stats_text,
+        fontsize=10,
+        va="top",
+        ha="right",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+    # Optional ROI channels annotation (if provided)
+    if roi_channels:
+        try:
+            chan_text = "Channels: " + ", ".join(roi_channels[:10])
+            fig.text(
+                0.02,
+                0.94,
+                chan_text,
+                fontsize=8,
+                va="top",
+                ha="left",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+            )
+        except Exception:
+            pass
+    # True figure-level title at top
+    fig.suptitle(title_prefix, fontsize=12, fontweight="bold", y=0.975)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+    return float(r), float(p), int(n_eff)
 
 
 # -----------------------------------------------------------------------------
@@ -580,18 +921,13 @@ def correlate_power_roi_stats(
         df = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
         if len(df) < 5:
             return np.nan
-        if method == "spearman" and df["y"].nunique() > 5:
-            obs, _ = stats.spearmanr(df["x"], df["y"], nan_policy="omit")
-        else:
-            obs, _ = stats.pearsonr(df["x"], df["y"])
+        # Always compute Spearman correlation for permutations
+        obs, _ = stats.spearmanr(df["x"], df["y"], nan_policy="omit")
         ge = 1
         y_vals = df["y"].to_numpy()
         for _ in range(int(n_perm)):
             y_pi = y_vals[rng.permutation(len(y_vals))]
-            if method == "spearman" and df["y"].nunique() > 5:
-                rp, _ = stats.spearmanr(df["x"], y_pi, nan_policy="omit")
-            else:
-                rp, _ = stats.pearsonr(df["x"], y_pi)
+            rp, _ = stats.spearmanr(df["x"], y_pi, nan_policy="omit")
             if np.abs(rp) >= np.abs(obs) - 1e-12:
                 ge += 1
         return ge / (int(n_perm) + 1)
@@ -656,12 +992,9 @@ def correlate_power_roi_stats(
             m = x.notna() & y_r.notna()
             n_eff = int(m.sum())
             if n_eff >= 5:
-                if use_spearman and y_r.nunique() > 5:
-                    r, p = stats.spearmanr(x[m], y_r[m], nan_policy="omit")
-                    method = "spearman"
-                else:
-                    r, p = stats.pearsonr(x[m], y_r[m])
-                    method = "pearson"
+                # Always use Spearman
+                r, p = stats.spearmanr(x[m], y_r[m], nan_policy="omit")
+                method = "spearman"
 
                 # Partial correlation given multi-covariates (if available)
                 r_part = np.nan
@@ -686,19 +1019,14 @@ def correlate_power_roi_stats(
                 # CIs for r: Fisher z for Pearson; bootstrap for Spearman
                 ci_low = np.nan
                 ci_high = np.nan
-                if method == "pearson" and n_eff >= 4:
-                    ci_low, ci_high = _fisher_ci(r, n_eff)
-                elif bootstrap and n_eff >= 5:
+                if bootstrap and n_eff >= 5:
                     idx = np.where(m.to_numpy())[0]
                     boots: List[float] = []
                     for _ in range(int(bootstrap)):
                         bidx = rng.choice(idx, size=len(idx), replace=True)
                         xb = x.iloc[bidx]
                         yb = y_r.iloc[bidx]
-                        if method == "spearman" and yb.nunique() > 5:
-                            rb, _ = stats.spearmanr(xb, yb, nan_policy="omit")
-                        else:
-                            rb, _ = stats.pearsonr(xb, yb)
+                        rb, _ = stats.spearmanr(xb, yb, nan_policy="omit")
                         boots.append(rb)
                     if boots:
                         ci_low, ci_high = np.percentile(boots, [2.5, 97.5])
@@ -758,28 +1086,20 @@ def correlate_power_roi_stats(
                 m2 = x2.notna() & t2.notna()
                 n_eff2 = int(m2.sum())
                 if n_eff2 >= 5:
-                    if use_spearman and t2.nunique() > 5:
-                        r2, p2 = stats.spearmanr(x2[m2], t2[m2], nan_policy="omit")
-                        method2 = "spearman"
-                    else:
-                        r2, p2 = stats.pearsonr(x2[m2], t2[m2])
-                        method2 = "pearson"
-                    # CI: Fisher for Pearson, bootstrap for Spearman
+                    # Always use Spearman
+                    r2, p2 = stats.spearmanr(x2[m2], t2[m2], nan_policy="omit")
+                    method2 = "spearman"
+                    # CI: bootstrap for Spearman
                     ci2_low = np.nan
                     ci2_high = np.nan
-                    if method2 == "pearson" and n_eff2 >= 4:
-                        ci2_low, ci2_high = _fisher_ci(r2, n_eff2)
-                    elif bootstrap and n_eff2 >= 5:
+                    if bootstrap and n_eff2 >= 5:
                         idx2 = np.where(m2.to_numpy())[0]
                         boots2: List[float] = []
                         for _ in range(int(bootstrap)):
                             bidx2 = rng.choice(idx2, size=len(idx2), replace=True)
                             xb = x2.iloc[bidx2]
                             tb = t2.iloc[bidx2]
-                            if method2 == "spearman" and tb.nunique() > 5:
-                                rb, _ = stats.spearmanr(xb, tb, nan_policy="omit")
-                            else:
-                                rb, _ = stats.pearsonr(xb, tb)
+                            rb, _ = stats.spearmanr(xb, tb, nan_policy="omit")
                             boots2.append(rb)
                         if boots2:
                             ci2_low, ci2_high = np.percentile(boots2, [2.5, 97.5])
@@ -956,20 +1276,13 @@ def correlate_power_topomaps(
             Z_valid = Z[valid_mask] if Z is not None else None
             
             # Compute correlation vs rating
-            corr_method = "spearman" if use_spearman else "pearson"
+            corr_method = "spearman"
             try:
-                r, p = stats.spearmanr(x_valid, y_valid) if use_spearman else stats.pearsonr(x_valid, y_valid)
+                r, p = stats.spearmanr(x_valid, y_valid)
                 
                 # Confidence interval
                 ci_lo, ci_hi = np.nan, np.nan
-                if not use_spearman:  # Pearson CI via Fisher z-transform
-                    n_valid = len(x_valid)
-                    if n_valid > 3:
-                        z = np.arctanh(r)
-                        se = 1 / np.sqrt(n_valid - 3)
-                        z_lo, z_hi = z - 1.96 * se, z + 1.96 * se
-                        ci_lo, ci_hi = np.tanh(z_lo), np.tanh(z_hi)
-                elif bootstrap > 0:  # Spearman bootstrap CI
+                if bootstrap > 0:  # Spearman bootstrap CI
                     def _boot_spearman(x, y, rng):
                         idx = rng.choice(len(x), size=len(x), replace=True)
                         return stats.spearmanr(x[idx], y[idx])[0]
@@ -980,7 +1293,7 @@ def correlate_power_topomaps(
                 r_partial, p_partial = np.nan, np.nan
                 if Z_valid is not None and Z_valid.shape[1] > 0:
                     try:
-                        r_partial, p_partial = _partial_corr_xy_given_Z(x_valid.values, y_valid.values, Z_valid, use_spearman=use_spearman)
+                        r_partial, p_partial = _partial_corr_xy_given_Z(x_valid.values, y_valid.values, Z_valid, 'spearman')
                     except Exception:
                         pass
                 
@@ -990,7 +1303,7 @@ def correlate_power_topomaps(
                     null_rs = []
                     for _ in range(n_perm):
                         y_perm = rng.permutation(y_valid)
-                        r_perm = stats.spearmanr(x_valid, y_perm)[0] if use_spearman else stats.pearsonr(x_valid, y_perm)[0]
+                        r_perm = stats.spearmanr(x_valid, y_perm)[0]
                         null_rs.append(r_perm)
                     p_perm = (np.sum(np.abs(null_rs) >= np.abs(r)) + 1) / (n_perm + 1)
                 
@@ -1019,17 +1332,11 @@ def correlate_power_topomaps(
                 temp_valid = temp_series[valid_mask]
                 if temp_valid.notna().sum() >= 10:
                     try:
-                        r_temp, p_temp = stats.spearmanr(x_valid, temp_valid) if use_spearman else stats.pearsonr(x_valid, temp_valid)
+                        r_temp, p_temp = stats.spearmanr(x_valid, temp_valid)
                         
                         # Temperature CI
                         ci_lo_temp, ci_hi_temp = np.nan, np.nan
-                        if not use_spearman:
-                            n_valid_temp = temp_valid.notna().sum()
-                            if n_valid_temp > 3:
-                                z_temp = np.arctanh(r_temp)
-                                se_temp = 1 / np.sqrt(n_valid_temp - 3)
-                                z_lo_temp, z_hi_temp = z_temp - 1.96 * se_temp, z_temp + 1.96 * se_temp
-                                ci_lo_temp, ci_hi_temp = np.tanh(z_lo_temp), np.tanh(z_hi_temp)
+                        # Spearman CI via bootstrap only (if desired elsewhere)
                         
                         rec_temp = {
                             "channel": channel,
@@ -1120,38 +1427,7 @@ def plot_power_roi_scatter(
         if tcol is not None:
             temp_col = tcol
             temp_series = pd.to_numeric(aligned_events[tcol], errors="coerce")
-
-    # Helper to build covariate design matrix Z
-    def _build_Z(df_events: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-        if df_events is None:
-            return None
-        covars = list(partial_covars) if partial_covars is not None else []
-        if not covars:
-            # Reasonable defaults: temperature and a trial index if present
-            tcol_loc = _pick_first_column(df_events, PSYCH_TEMP_COLUMNS)
-            if tcol_loc is not None:
-                covars.append(tcol_loc)
-            for c in ["trial", "trial_number", "trial_index", "run", "block"]:
-                if c in df_events.columns:
-                    covars.append(c)
-                    break
-        if not covars:
-            return None
-        Z = pd.DataFrame()
-        for c in covars:
-            if c in df_events.columns:
-                Z[c] = pd.to_numeric(df_events[c], errors="coerce")
-        return Z if not Z.empty else None
-
-    Z_df_full = _build_Z(aligned_events)
-    Z_df_temp = None
-    if Z_df_full is not None:
-        try:
-            Z_df_temp = Z_df_full.drop(columns=[temp_col], errors="ignore") if temp_col else Z_df_full.copy()
-            if Z_df_temp.shape[1] == 0:
-                Z_df_temp = None
-        except (KeyError, AttributeError, ValueError):
-            Z_df_temp = Z_df_full
+    Z_df_full, Z_df_temp = _build_covariate_matrices(aligned_events, partial_covars, temp_col)
 
     # Helpers: significance formatting, CIs, bootstrap CIs, and stats textbox
     def _p_to_stars(p: float) -> str:
@@ -1164,50 +1440,6 @@ def plot_power_roi_scatter(
         if p < 0.05:
             return "*"
         return "n.s."
-
-    def _sig_color(p: float) -> str:
-        return "#C42847" if (np.isfinite(p) and p < 0.05) else "#666666"
-
-    def _fisher_ci_r(r: float, n: int, alpha: float = 0.05) -> Tuple[float, float]:
-        if not np.isfinite(r) or n < 4:
-            return np.nan, np.nan
-        r = float(np.clip(r, -0.999999, 0.999999))
-        z = np.arctanh(r)
-        se = 1.0 / np.sqrt(n - 3)
-        zcrit = float(stats.norm.ppf(1 - alpha / 2.0))
-        lo = z - zcrit * se
-        hi = z + zcrit * se
-        return float(np.tanh(lo)), float(np.tanh(hi))
-
-    def _bootstrap_corr_ci(
-        x: pd.Series,
-        y: pd.Series,
-        method: str,
-        n_boot: int = 1000,
-        rng: Optional[np.random.Generator] = None,
-    ) -> Tuple[float, float]:
-        dfb = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
-        if n_boot <= 0 or len(dfb) < 5:
-            return np.nan, np.nan
-        if rng is None:
-            rng = np.random.default_rng(42)
-        Xv = dfb["x"].to_numpy()
-        Yv = dfb["y"].to_numpy()
-        N = len(dfb)
-        vals: List[float] = []
-        for _ in range(int(n_boot)):
-            idx = rng.integers(0, N, size=N)
-            xb = Xv[idx]
-            yb = Yv[idx]
-            if method == "spearman" and len(np.unique(yb)) > 5:
-                rb, _ = stats.spearmanr(xb, yb, nan_policy="omit")
-            else:
-                rb, _ = stats.pearsonr(xb, yb)
-            if np.isfinite(rb):
-                vals.append(float(rb))
-        if not vals:
-            return np.nan, np.nan
-        return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
 
     def _fmt_stats_text(
         r: float,
@@ -1319,7 +1551,7 @@ def plot_power_roi_scatter(
         fig, ax = plt.subplots(figsize=(5.2, 3.8))
         return fig, ax
 
-    def _generate_correlation_scatter(
+    def _generate_correlation_scatter_local(
         x_data: pd.Series,
         y_data: pd.Series,
         x_label: str,
@@ -1381,21 +1613,12 @@ def plot_power_roi_scatter(
         if n_eff < 5:
             return
             
-        # Calculate correlation stats
+        # Calculate correlation stats (always Spearman)
         if is_partial_residuals:
-            # For residuals, just compute correlation directly
-            if method_code == "spearman":
-                r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
-            else:
-                r, p = stats.pearsonr(x_clean, y_clean)
+            r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
             r_part, p_part, n_part = np.nan, np.nan, 0
         else:
-            # Regular correlation
-            if method_code == "spearman" and y.nunique() > 5:
-                r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
-            else:
-                r, p = stats.pearsonr(x_clean, y_clean)
-                
+            r, p = stats.spearmanr(x_clean, y_clean, nan_policy="omit")
             # Optional partial correlation
             r_part, p_part, n_part = np.nan, np.nan, 0
             if Z_covars is not None and len(Z_covars) > 0:
@@ -1404,10 +1627,8 @@ def plot_power_roi_scatter(
                     x.iloc[:n_len_pt], y.iloc[:n_len_pt], Z_covars.iloc[:n_len_pt], method_code
                 )
 
-        # Calculate confidence intervals
-        if method_code == "pearson" and n_eff >= 4:
-            ci = _fisher_ci_r(r, n_eff)
-        elif method_code == "spearman" and bootstrap_ci > 0:
+        # Calculate confidence intervals (bootstrap for Spearman if requested)
+        if bootstrap_ci > 0:
             ci = _bootstrap_corr_ci(x_clean, y_clean, method_code, n_boot=int(bootstrap_ci), rng=rng)
         else:
             ci = (np.nan, np.nan)
@@ -1482,7 +1703,7 @@ def plot_power_roi_scatter(
         show_pct_axis = False
         if not is_partial_residuals and "log10(power" in x_label:
             show_pct_axis = True
-        elif is_partial_residuals and method_code == "pearson" and "residuals of log10(power" in x_label:
+        elif is_partial_residuals and "residuals of log10(power" in x_label:
             show_pct_axis = True
             
         if show_pct_axis:
@@ -1490,12 +1711,15 @@ def plot_power_roi_scatter(
                 # Add percentage axis on top histogram
                 ax_pct = ax_histx.secondary_xaxis('top', functions=(_logratio_to_pct, _pct_to_logratio))
                 ax_pct.set_xlabel("Power Change (%)", fontsize=9)
-                ax_pct.xaxis.set_major_locator(MaxNLocator(nbins=5))
+                # Increase tick density and format as integers; add minor ticks
+                ax_pct.xaxis.set_major_locator(MaxNLocator(nbins=7))
+                ax_pct.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+                ax_pct.xaxis.set_minor_locator(AutoMinorLocator(2))
             except (AttributeError, TypeError, ValueError):
                 pass
         
         # Format title and stats annotation
-        label = "Spearman ρ" if method_code == "spearman" else "Pearson r"
+        label = "Spearman ρ"
         title_parts = [title_prefix]
         
         # Add stats text box to main plot
@@ -1516,6 +1740,16 @@ def plot_power_roi_scatter(
         else:
             full_title = base_title
         fig.suptitle(full_title, fontsize=11.5, fontweight='bold', y=0.975)
+        # Optional figure note about FDR
+        if ANNOTATE_FDR:
+            try:
+                fig.text(
+                    0.02, 0.02,
+                    f"Note: correlation p shown here is uncorrected; see stats TSVs for FDR (alpha={BEHAV_FDR_ALPHA}).",
+                    fontsize=8, ha="left", va="bottom", alpha=0.75,
+                )
+            except Exception:
+                pass
         
         # Apply styling to main plot
         if "Rating" in y_label and not is_partial_residuals:
@@ -1574,9 +1808,9 @@ def plot_power_roi_scatter(
         except (KeyError, ValueError, TypeError):
             overall_vals = pd.Series(np.nan, index=pow_df.index)
 
-        # Determine correlation method
-        do_spear = bool(use_spearman and y.nunique() > 5)
-        method_code = "spearman" if do_spear else "pearson"
+        # Determine correlation method (always Spearman)
+        do_spear = True
+        method_code = "spearman"
         covar_names = list(Z_df_full.columns) if Z_df_full is not None else None
 
         # Create overall subfolder for overall (non-ROI) plots
@@ -1584,7 +1818,7 @@ def plot_power_roi_scatter(
         _ensure_dir(overall_plots_dir)
         
         # Rating target scatter (overall)
-        _generate_correlation_scatter(
+        _generate_correlation_scatter_local(
             x_data=overall_vals,
             y_data=y,
             x_label="log10(power/baseline [-5–0 s])",
@@ -1628,7 +1862,7 @@ def plot_power_roi_scatter(
                 )
                 residual_ylabel = "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
                 
-                _generate_correlation_scatter(
+                _generate_correlation_scatter_local(
                     x_data=x_res_sr,
                     y_data=y_res_sr,
                     x_label=residual_xlabel,
@@ -1645,11 +1879,11 @@ def plot_power_roi_scatter(
         # Temperature target scatter (overall)
         if do_temp and temp_series is not None and len(temp_series) > 0:
             # Determine method for temperature (may be different if discrete)
-            do_spear_t = bool(use_spearman and temp_series.nunique() > 5)
-            method2_code = "spearman" if do_spear_t else "pearson"
+            do_spear_t = True
+            method2_code = "spearman"
             covar_names_temp = list(Z_df_temp.columns) if Z_df_temp is not None else None
             
-            _generate_correlation_scatter(
+            _generate_correlation_scatter_local(
                 x_data=overall_vals,
                 y_data=temp_series,
                 x_label="log10(power/baseline [-5–0 s])",
@@ -1687,12 +1921,10 @@ def plot_power_roi_scatter(
                 if n2_res >= 5:
                     residual_xlabel = (
                         "Partial residuals (ranked) of log10(power/baseline)"
-                        if method2_code == "spearman"
-                        else "Partial residuals of log10(power/baseline)"
                     )
-                    residual_ylabel = "Partial residuals (ranked) of temperature (°C)" if method2_code == "spearman" else "Partial residuals of temperature (°C)"
+                    residual_ylabel = "Partial residuals (ranked) of temperature (°C)"
                     
-                    _generate_correlation_scatter(
+                    _generate_correlation_scatter_local(
                         x_data=x2_res_sr,
                         y_data=y2_res_sr,
                         x_label=residual_xlabel,
@@ -1717,7 +1949,7 @@ def plot_power_roi_scatter(
             _ensure_dir(roi_plots_dir)
 
             # ROI-specific rating scatter
-            _generate_correlation_scatter(
+            _generate_correlation_scatter_local(
                 x_data=roi_vals,
                 y_data=y,
                 x_label="log10(power/baseline [-5–0 s])",
@@ -1762,7 +1994,7 @@ def plot_power_roi_scatter(
                     )
                     residual_ylabel = "Partial residuals (ranked) of rating" if method_code == "spearman" else "Partial residuals of rating"
                     
-                    _generate_correlation_scatter(
+                    _generate_correlation_scatter_local(
                     x_data=x_res_sr,
                     y_data=y_res_sr,
                     x_label=residual_xlabel,
@@ -1779,12 +2011,12 @@ def plot_power_roi_scatter(
 
             # ROI-specific temperature scatter (optional)
             if do_temp and temp_series is not None and len(temp_series) > 0:
-                # Determine method for temperature (may be different if discrete)
-                do_spear_t = bool(use_spearman and temp_series.nunique() > 5)
-                method2_code = "spearman" if do_spear_t else "pearson"
+                # Always use Spearman for temperature correlations
+                do_spear_t = True
+                method2_code = "spearman"
                 covar_names_temp = list(Z_df_temp.columns) if Z_df_temp is not None else None
                 
-                _generate_correlation_scatter(
+                _generate_correlation_scatter_local(
                     x_data=roi_vals,
                     y_data=temp_series,
                     x_label="log10(power/baseline [-5–0 s])",
@@ -1821,14 +2053,9 @@ def plot_power_roi_scatter(
                     Z_part2 = Z_df_temp.iloc[:n_len_pt2]
                     x2_res_sr, y2_res_sr, n2_res = _partial_residuals_xy_given_Z(x_part2, y_part2, Z_part2, method2_code)
                     if n2_res >= 5:
-                        residual_xlabel = (
-                            "Partial residuals (ranked) of log10(power/baseline)"
-                            if method2_code == "spearman"
-                            else "Partial residuals of log10(power/baseline)"
-                        )
-                        residual_ylabel = "Partial residuals (ranked) of temperature (°C)" if method2_code == "spearman" else "Partial residuals of temperature (°C)"
-                        
-                        _generate_correlation_scatter(
+                        residual_xlabel = "Partial residuals (ranked) of log10(power/baseline)"
+                        residual_ylabel = "Partial residuals (ranked) of temperature (°C)"
+                        _generate_correlation_scatter_local(
                             x_data=x2_res_sr,
                             y_data=y2_res_sr,
                             x_label=residual_xlabel,
@@ -1842,6 +2069,725 @@ def plot_power_roi_scatter(
                             is_partial_residuals=True,
                             roi_channels=chs,
                         )
+
+# -----------------------------------------------------------------------------
+# Group-level visualization: pooled ROI power scatter plots
+# -----------------------------------------------------------------------------
+
+def plot_group_power_roi_scatter(
+    subjects: List[str],
+    task: str = TASK,
+    use_spearman: bool = True,
+    partial_covars: Optional[List[str]] = None,
+    do_temp: bool = True,
+    bootstrap_ci: int = 0,
+    rng: Optional[np.random.Generator] = None,
+    pooling_strategy: str = "within_subject_centered",
+    cluster_bootstrap: int = 0,
+    subject_fixed_effects: bool = True,
+) -> None:
+    """Create pooled ROI power scatter plots across subjects.
+
+    Logs concise progress messages and writes pooled correlation stats.
+
+    pooling_strategy:
+        - 'pooled_trials': concatenate trials across subjects.
+        - 'within_subject_centered': mean-center x and y within each subject, then pool.
+        - 'fisher_by_subject': compute per-subject r and aggregate via Fisher z.
+    """
+    logger = _setup_group_logging()
+    plots_dir = _group_plots_dir()
+    stats_dir = _group_stats_dir()
+    _ensure_dir(plots_dir)
+    _ensure_dir(stats_dir)
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    try:
+        logger.info(
+            f"Starting group pooled ROI scatters for {len(subjects)} subjects (task={task}, strategy={pooling_strategy}, FE={'on' if subject_fixed_effects else 'off'})"
+        )
+    except Exception:
+        pass
+
+    allowed_pool = {"pooled_trials", "within_subject_centered", "fisher_by_subject"}
+    if pooling_strategy not in allowed_pool:
+        logger.warning(f"Unknown pooling_strategy '{pooling_strategy}', falling back to 'pooled_trials'")
+        pooling_strategy = "pooled_trials"
+
+    tag_map = {
+        "pooled_trials": "[Pooled]",
+        "within_subject_centered": "[Centered]",
+        "within_subject_zscored": "[Z-scored]",
+        "fisher_by_subject": "[Fisher]",
+    }
+
+    def _compute_group_stats(
+        x_lists: List[np.ndarray],
+        y_lists: List[np.ndarray],
+        method_code: str,
+        *,
+        strategy: str,
+        cb_n: int,
+        rng_local: np.random.Generator,
+    ) -> Tuple[float, float, int, int, Tuple[float, float]]:
+        """Return (r, p, n_trials, n_subjects, ci_95) under the chosen strategy.
+
+        - For pooled strategies, p is the trial-level correlation p.
+        - For fisher_by_subject, p is from a one-sample t-test on Fisher z.
+        - CI is a subject-level (cluster) bootstrap CI if cb_n > 0 and >=2 subjects; else NaNs.
+        """
+        # Pre-filter subjects for valid data (>=5 non-NaN pairs)
+        pairs = []
+        for xi, yi in zip(x_lists, y_lists):
+            xi = np.asarray(xi)
+            yi = np.asarray(yi)
+            n = min(len(xi), len(yi))
+            xi = xi[:n]
+            yi = yi[:n]
+            m = np.isfinite(xi) & np.isfinite(yi)
+            if m.sum() >= 5:
+                pairs.append((xi[m], yi[m]))
+        S = len(pairs)
+        if S == 0:
+            return np.nan, np.nan, 0, 0, (np.nan, np.nan)
+
+        def _r_xy(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+            # Always Spearman for consistency
+            r, p = stats.spearmanr(x, y, nan_policy="omit")
+            return float(r), float(p)
+
+        if strategy in {"pooled_trials", "within_subject_centered", "within_subject_zscored"}:
+            xs = []
+            ys = []
+            for (xi, yi) in pairs:
+                if strategy == "within_subject_centered":
+                    xi = xi - np.nanmean(xi)
+                    yi = yi - np.nanmean(yi)
+                elif strategy == "within_subject_zscored":
+                    sx = np.nanstd(xi, ddof=1)
+                    sy = np.nanstd(yi, ddof=1)
+                    if sx <= 0 or sy <= 0:
+                        # Skip subjects with no variance
+                        continue
+                    xi = (xi - np.nanmean(xi)) / sx
+                    yi = (yi - np.nanmean(yi)) / sy
+                xs.append(xi)
+                ys.append(yi)
+            X = np.concatenate(xs)
+            Y = np.concatenate(ys)
+            r_obs, p_obs = _r_xy(X, Y)
+            n_trials = int(len(X))
+
+            # Cluster bootstrap over subjects
+            ci = (np.nan, np.nan)
+            if cb_n and S >= 2:
+                boots = []
+                idxs = np.arange(S)
+                for _ in range(int(cb_n)):
+                    pick = rng_local.choice(idxs, size=S, replace=True)
+                    bx = []
+                    by = []
+                    for j in pick:
+                        xi, yi = pairs[j]
+                        if strategy == "within_subject_centered":
+                            xi = xi - np.nanmean(xi)
+                            yi = yi - np.nanmean(yi)
+                        elif strategy == "within_subject_zscored":
+                            sx = np.nanstd(xi, ddof=1)
+                            sy = np.nanstd(yi, ddof=1)
+                            if sx <= 0 or sy <= 0:
+                                continue
+                            xi = (xi - np.nanmean(xi)) / sx
+                            yi = (yi - np.nanmean(yi)) / sy
+                        bx.append(xi)
+                        by.append(yi)
+                    Xb = np.concatenate(bx)
+                    Yb = np.concatenate(by)
+                    rb, _ = _r_xy(Xb, Yb)
+                    if np.isfinite(rb):
+                        boots.append(rb)
+                if boots:
+                    ci = (float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5)))
+            return float(r_obs), float(p_obs), n_trials, S, ci
+
+        # fisher_by_subject
+        r_subj = []
+        for (xi, yi) in pairs:
+            r_i, _ = _r_xy(xi, yi)
+            if np.isfinite(r_i):
+                r_subj.append(float(np.clip(r_i, -0.999999, 0.999999)))
+        if not r_subj:
+            return np.nan, np.nan, 0, S, (np.nan, np.nan)
+        z = np.arctanh(np.array(r_subj))
+        r_grp = float(np.tanh(np.mean(z)))
+        # p via t-test of Fisher z against 0
+        if len(z) >= 2:
+            tstat, p_grp = stats.ttest_1samp(z, popmean=0.0)
+            p_grp = float(p_grp)
+        else:
+            p_grp = np.nan
+        n_trials = int(sum(len(x) for (x, _y) in pairs))
+        ci = (np.nan, np.nan)
+        if cb_n and S >= 2:
+            boots = []
+            idxs = np.arange(S)
+            for _ in range(int(cb_n)):
+                pick = rng_local.choice(idxs, size=S, replace=True)
+                zb = np.mean(z[pick])
+                boots.append(float(np.tanh(zb)))
+            if boots:
+                ci = (float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5)))
+        return r_grp, p_grp, n_trials, S, ci
+
+    rating_x_by_key: Dict[Tuple[str, str], List[np.ndarray]] = {}
+    rating_y_by_key: Dict[Tuple[str, str], List[np.ndarray]] = {}
+    rating_Z_by_key: Dict[Tuple[str, str], List[pd.DataFrame]] = {}
+    rating_hasZ_by_key: Dict[Tuple[str, str], List[bool]] = {}
+    rating_subj_by_key: Dict[Tuple[str, str], List[str]] = {}
+    temp_x_by_key: Dict[Tuple[str, str], List[np.ndarray]] = {}
+    temp_y_by_key: Dict[Tuple[str, str], List[np.ndarray]] = {}
+    temp_Z_by_key: Dict[Tuple[str, str], List[pd.DataFrame]] = {}
+    temp_hasZ_by_key: Dict[Tuple[str, str], List[bool]] = {}
+    temp_subj_by_key: Dict[Tuple[str, str], List[str]] = {}
+    have_temp = False
+
+    for sub in subjects:
+        try:
+            pow_df, _conn_df, y, info = _load_features_and_targets(sub, task)
+        except Exception as e:
+            logger.warning(f"Skipping sub-{sub} for group scatter: {e}")
+            continue
+        y = pd.to_numeric(y, errors="coerce")
+
+        # Load events for covariates and temperature
+        try:
+            epo_path = _find_clean_epochs_path(sub, task)
+            if epo_path is None:
+                raise FileNotFoundError("epochs not found")
+            epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+            events = _load_events_df(sub, task)
+            aligned_events = _align_events_to_epochs(events, epochs) if events is not None else None
+        except Exception as e:
+            logger.warning(f"Skipping sub-{sub} due to events/epochs issue: {e}")
+            continue
+
+        temp_series: Optional[pd.Series] = None
+        temp_col: Optional[str] = None
+        if aligned_events is not None:
+            tcol = _pick_first_column(aligned_events, PSYCH_TEMP_COLUMNS)
+            if tcol is not None:
+                temp_col = tcol
+                temp_series = pd.to_numeric(aligned_events[tcol], errors="coerce")
+                have_temp = True
+
+        Z_df_full, Z_df_temp = _build_covariate_matrices(aligned_events, partial_covars, temp_col)
+
+        roi_map = _build_rois(info)
+        for band in POWER_BANDS_TO_USE:
+            band_cols = [c for c in pow_df.columns if c.startswith(f"pow_{band}_")]
+            if not band_cols:
+                continue
+            band_vals = pow_df[band_cols].apply(pd.to_numeric, errors="coerce")
+            overall_vals = band_vals.mean(axis=1).to_numpy()
+            key_overall = (band, "All")
+            rating_x_by_key.setdefault(key_overall, []).append(overall_vals)
+            rating_y_by_key.setdefault(key_overall, []).append(y.to_numpy())
+            rating_subj_by_key.setdefault(key_overall, []).append(sub)
+            if Z_df_full is not None:
+                rating_Z_by_key.setdefault(key_overall, []).append(Z_df_full)
+                rating_hasZ_by_key.setdefault(key_overall, []).append(True)
+            else:
+                rating_hasZ_by_key.setdefault(key_overall, []).append(False)
+            if do_temp and temp_series is not None:
+                temp_x_by_key.setdefault(key_overall, []).append(overall_vals)
+                temp_y_by_key.setdefault(key_overall, []).append(temp_series.to_numpy())
+                temp_subj_by_key.setdefault(key_overall, []).append(sub)
+                if Z_df_temp is not None:
+                    temp_Z_by_key.setdefault(key_overall, []).append(Z_df_temp)
+                    temp_hasZ_by_key.setdefault(key_overall, []).append(True)
+                else:
+                    temp_hasZ_by_key.setdefault(key_overall, []).append(False)
+            for roi, chs in roi_map.items():
+                cols = [f"pow_{band}_{ch}" for ch in chs if f"pow_{band}_{ch}" in pow_df.columns]
+                if not cols:
+                    continue
+                roi_vals = pow_df[cols].apply(pd.to_numeric, errors="coerce").mean(axis=1).to_numpy()
+                key = (band, roi)
+                rating_x_by_key.setdefault(key, []).append(roi_vals)
+                rating_y_by_key.setdefault(key, []).append(y.to_numpy())
+                rating_subj_by_key.setdefault(key, []).append(sub)
+                if Z_df_full is not None:
+                    rating_Z_by_key.setdefault(key, []).append(Z_df_full)
+                    rating_hasZ_by_key.setdefault(key, []).append(True)
+                else:
+                    rating_hasZ_by_key.setdefault(key, []).append(False)
+                if do_temp and temp_series is not None:
+                    temp_x_by_key.setdefault(key, []).append(roi_vals)
+                    temp_y_by_key.setdefault(key, []).append(temp_series.to_numpy())
+                    temp_subj_by_key.setdefault(key, []).append(sub)
+                    if Z_df_temp is not None:
+                        temp_Z_by_key.setdefault(key, []).append(Z_df_temp)
+                        temp_hasZ_by_key.setdefault(key, []).append(True)
+                    else:
+                        temp_hasZ_by_key.setdefault(key, []).append(False)
+
+    rating_records: List[Dict[str, object]] = []
+    method_code = "spearman"
+    for (band, roi), x_lists in rating_x_by_key.items():
+        y_lists = rating_y_by_key.get((band, roi))
+        if not y_lists:
+            continue
+        # Keep Z handling for passing to the plotting helper, but group r/p are computed above
+        Z_lists = rating_Z_by_key.get((band, roi))
+        if Z_lists:
+            common_cols = set(Z_lists[0].columns)
+            for df in Z_lists[1:]:
+                common_cols &= set(df.columns)
+            if common_cols:
+                Z_all = pd.concat([df[sorted(common_cols)] for df in Z_lists], ignore_index=True)
+            else:
+                Z_all = None
+        else:
+            Z_all = None
+
+        band_rng = FEATURES_FREQ_BANDS.get(band)
+        band_title = f"{band.capitalize()} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band.capitalize()
+        title_roi = "Overall" if roi == "All" else roi
+        title_prefix = f"{band_title} power vs rating — {title_roi}"
+
+        out_dir = plots_dir / (
+            "overall" if roi == "All" else Path("roi_scatters") / _sanitize(roi)
+        )
+
+        _ensure_dir(out_dir)
+        base_name = (
+            f"scatter_pow_overall_{_sanitize(band)}_vs_rating" if roi == "All" else f"scatter_pow_{_sanitize(band)}_vs_rating"
+        )
+        out_path = out_dir / base_name
+        # Build visualization data and aligned design matrix for partials
+        vis_x = []
+        vis_y = []
+        vis_subj_ids = []
+        subj_order = rating_subj_by_key.get((band, roi), [])
+        for i, (xi_arr, yi_arr) in enumerate(zip(x_lists, y_lists)):
+            xi = pd.Series(xi_arr)
+            yi = pd.Series(yi_arr)
+            n = min(len(xi), len(yi))
+            xi = xi.iloc[:n]
+            yi = yi.iloc[:n]
+            m = xi.notna() & yi.notna()
+            xi = xi[m]
+            yi = yi[m]
+            if pooling_strategy == "within_subject_centered":
+                xi = xi - xi.mean()
+                yi = yi - yi.mean()
+            elif pooling_strategy == "within_subject_zscored":
+                sx = xi.std(ddof=1)
+                sy = yi.std(ddof=1)
+                if sx <= 0 or sy <= 0:
+                    continue
+                xi = (xi - xi.mean()) / sx
+                yi = (yi - yi.mean()) / sy
+            elif pooling_strategy == "fisher_by_subject":
+                # Center for visualization under Fisher strategy
+                xi = xi - xi.mean()
+                yi = yi - yi.mean()
+            vis_x.append(xi)
+            vis_y.append(yi)
+            sid = subj_order[i] if i < len(subj_order) else str(i)
+            vis_subj_ids.extend([sid] * len(xi))
+        x_all = pd.concat(vis_x, ignore_index=True) if vis_x else pd.Series(dtype=float)
+        y_all = pd.concat(vis_y, ignore_index=True) if vis_y else pd.Series(dtype=float)
+
+        # Build aligned Z for partials + optional subject fixed-effects
+        Z_all_vis = None
+        x_all_partial = None
+        y_all_partial = None
+        hasZ_list = rating_hasZ_by_key.get((band, roi))
+        if hasZ_list is not None and (subject_fixed_effects or rating_Z_by_key.get((band, roi))):
+            vis_Z = []
+            partial_x = []
+            partial_y = []
+            j = 0
+            common_cols = []
+            Z_lists = rating_Z_by_key.get((band, roi))
+            if Z_lists:
+                common_cols = sorted(set(Z_lists[0].columns))
+                for df in Z_lists[1:]:
+                    common_cols = sorted(set(common_cols) & set(df.columns))
+            # Build Z rows aligned to vis_x/vis_y entries
+            for i, (xi_arr, yi_arr) in enumerate(zip(x_lists, y_lists)):
+                if not hasZ_list[i]:
+                    continue
+                Zi = Z_lists[j]
+                j += 1
+                # Align Zi to xi/yi filtering
+                xi = pd.Series(xi_arr)
+                yi = pd.Series(yi_arr)
+                n = min(len(xi), len(yi), len(Zi))
+                xi = xi.iloc[:n]
+                yi = yi.iloc[:n]
+                Zi = Zi.iloc[:n]
+                m = xi.notna() & yi.notna()
+                xi = xi[m]
+                yi = yi[m]
+                Zi = Zi.loc[m]
+                # Apply same transformation as main visualization for consistency
+                if pooling_strategy == "within_subject_centered":
+                    xi = xi - xi.mean()
+                    yi = yi - yi.mean()
+                elif pooling_strategy == "within_subject_zscored":
+                    sx = xi.std(ddof=1)
+                    sy = yi.std(ddof=1)
+                    if sx <= 0 or sy <= 0:
+                        continue
+                    xi = (xi - xi.mean()) / sx
+                    yi = (yi - yi.mean()) / sy
+                # Keep only common covariates
+                Zi = Zi[common_cols] if common_cols else Zi
+                # Optionally add subject id for FE dummies
+                if subject_fixed_effects:
+                    sid = subj_order[i] if i < len(subj_order) else str(i)
+                    Zi = Zi.copy()
+                    Zi["__subject_id__"] = sid
+                vis_Z.append(Zi)
+                partial_x.append(xi)
+                partial_y.append(yi)
+            if vis_Z:
+                Z_all_vis = pd.concat(vis_Z, ignore_index=True)
+                x_all_partial = pd.concat(partial_x, ignore_index=True)
+                y_all_partial = pd.concat(partial_y, ignore_index=True)
+                if subject_fixed_effects and "__subject_id__" in Z_all_vis.columns:
+                    dummies = pd.get_dummies(Z_all_vis["__subject_id__"].astype(str), prefix="sub", drop_first=True)
+                    Z_all_vis = pd.concat([Z_all_vis.drop(columns=["__subject_id__"]), dummies], axis=1)
+
+        r_g, p_g, n_trials, n_subj, ci95 = _compute_group_stats(
+            [np.asarray(v) for v in x_lists],
+            [np.asarray(v) for v in y_lists],
+            method_code,
+            strategy=pooling_strategy,
+            cb_n=int(cluster_bootstrap),
+            rng_local=rng,
+        )
+
+        tag = tag_map.get(pooling_strategy)
+
+        r, p, n_eff = _generate_correlation_scatter(
+            x_data=x_all,
+            y_data=y_all,
+            x_label="log10(power/baseline [-5–0 s])",
+            # Use pooling-aware y-axis label for rating
+            y_label=(
+                "Rating (centered)" if pooling_strategy == "within_subject_centered"
+                else ("Rating (z-scored)" if pooling_strategy == "within_subject_zscored" else "Rating")
+            ),
+            title_prefix=title_prefix,
+            band_color=_get_band_color(band),
+            output_path=out_path,
+            method_code=method_code,
+            Z_covars=None,
+            covar_names=None,
+            bootstrap_ci=bootstrap_ci,
+            rng=rng,
+            logger=logger,
+            annotated_stats=(r_g, p_g, n_trials),
+            annot_ci=ci95,
+            stats_tag=tag,
+        )
+        rating_records.append({
+            "roi": roi,
+            "band": band,
+            "r_pooled": r_g,
+            "p_pooled": p_g,
+            "n_total": n_trials,
+            "n_subjects": n_subj,
+            "pooling_strategy": pooling_strategy,
+            "ci_low": ci95[0],
+            "ci_high": ci95[1],
+        })
+
+        try:
+            logger.info(
+                f"Pooled rating scatter saved: {out_path} "
+                f"(band={band}, roi={title_roi}, r={r_g:.3f}, p={p_g:.3g}, n_trials={n_trials}, n_subj={n_subj}, strategy={pooling_strategy})"
+            )
+        except Exception:
+            pass
+
+        if Z_all_vis is None and subject_fixed_effects and len(vis_subj_ids) == len(x_all):
+            # Build FE-only design matrix aligned to all pooled rows
+            Z_all_vis = pd.get_dummies(pd.Series(vis_subj_ids, name="__subject_id__").astype(str), prefix="sub", drop_first=True)
+            x_all_partial = x_all
+            y_all_partial = y_all
+
+        if Z_all_vis is not None and len(Z_all_vis) > 0 and x_all_partial is not None and y_all_partial is not None:
+            # Use aligned subset for partial residuals
+            x_res, y_res, n_res = _partial_residuals_xy_given_Z(x_all_partial, y_all_partial, Z_all_vis, method_code)
+            if n_res >= 5:
+                residual_xlabel = (
+                    "Partial residuals (ranked) of log10(power/baseline)"
+                )
+                residual_ylabel = (
+                    "Partial residuals (ranked) of rating"
+                )
+                _generate_correlation_scatter(
+                    x_data=x_res,
+                    y_data=y_res,
+                    x_label=residual_xlabel,
+                    y_label=residual_ylabel,
+                    title_prefix=f"Partial residuals — {band_title} power vs rating — {title_roi}",
+                    band_color=_get_band_color(band),
+                    output_path=out_dir / f"{base_name}_partial",
+                    method_code=method_code,
+                    is_partial_residuals=True,
+                    rng=rng,
+                    logger=logger,
+                )
+
+    if rating_records:
+        df = pd.DataFrame(rating_records)
+        rej, crit = _fdr_bh(df["p_pooled"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
+        df["fdr_reject"] = rej
+        df["fdr_crit_p"] = crit
+        out_stats = stats_dir / "group_pooled_corr_pow_roi_vs_rating.tsv"
+        df.to_csv(out_stats, sep="\t", index=False)
+        try:
+            logger.info(f"Wrote pooled ROI vs rating stats: {out_stats}")
+        except Exception:
+            pass
+
+    if do_temp and have_temp:
+        temp_records: List[Dict[str, object]] = []
+        for (band, roi), x_lists in temp_x_by_key.items():
+            y_lists = temp_y_by_key.get((band, roi))
+            if not y_lists:
+                continue
+            # Keep Z for plotting; stats computed separately
+            Z_lists = temp_Z_by_key.get((band, roi))
+            if Z_lists:
+                common_cols = set(Z_lists[0].columns)
+                for df in Z_lists[1:]:
+                    common_cols &= set(df.columns)
+                if common_cols:
+                    Z_all = pd.concat([df[sorted(common_cols)] for df in Z_lists], ignore_index=True)
+                else:
+                    Z_all = None
+            else:
+                Z_all = None
+
+            band_rng = FEATURES_FREQ_BANDS.get(band)
+            band_title = f"{band.capitalize()} ({band_rng[0]:g}\u2013{band_rng[1]:g} Hz)" if band_rng else band.capitalize()
+            title_roi = "Overall" if roi == "All" else roi
+            title_prefix = f"{band_title} power vs temperature — {title_roi}"
+
+            out_dir = plots_dir / (
+                "overall" if roi == "All" else Path("roi_scatters") / _sanitize(roi)
+            )
+
+            _ensure_dir(out_dir)
+            base_name = (
+                f"scatter_pow_overall_{_sanitize(band)}_vs_temp" if roi == "All" else f"scatter_pow_{_sanitize(band)}_vs_temp"
+            )
+            out_path = out_dir / base_name
+            try:
+                _y_all_concat = np.concatenate([np.asarray(v) for v in y_lists])
+                _y_all_concat = _y_all_concat[np.isfinite(_y_all_concat)]
+                _ny = len(np.unique(_y_all_concat))
+            except Exception:
+                _ny = 0
+            method2_code = "spearman"
+            # Visualization data according to strategy
+            vis_x = []
+            vis_y = []
+            vis_subj_ids = []
+            subj_order = temp_subj_by_key.get((band, roi), [])
+            for i, (xi_arr, yi_arr) in enumerate(zip(x_lists, y_lists)):
+                xi = pd.Series(xi_arr)
+                yi = pd.Series(yi_arr)
+                n = min(len(xi), len(yi))
+                xi = xi.iloc[:n]
+                yi = yi.iloc[:n]
+                m = xi.notna() & yi.notna()
+                xi = xi[m]
+                yi = yi[m]
+                if pooling_strategy == "within_subject_centered":
+                    xi = xi - xi.mean()
+                    yi = yi - yi.mean()
+                elif pooling_strategy == "within_subject_zscored":
+                    sx = xi.std(ddof=1)
+                    sy = yi.std(ddof=1)
+                    if sx <= 0 or sy <= 0:
+                        continue
+                    xi = (xi - xi.mean()) / sx
+                    yi = (yi - yi.mean()) / sy
+                elif pooling_strategy == "fisher_by_subject":
+                    xi = xi - xi.mean()
+                    yi = yi - yi.mean()
+                vis_x.append(xi)
+                vis_y.append(yi)
+                sid = subj_order[i] if i < len(subj_order) else str(i)
+                vis_subj_ids.extend([sid] * len(xi))
+            x_all = pd.concat(vis_x, ignore_index=True) if vis_x else pd.Series(dtype=float)
+            y_all = pd.concat(vis_y, ignore_index=True) if vis_y else pd.Series(dtype=float)
+
+            # Build aligned Z for partials + optional subject fixed-effects
+            Z_all_vis = None
+            x_all_partial = None
+            y_all_partial = None
+            hasZ_list = temp_hasZ_by_key.get((band, roi))
+            if hasZ_list is not None and (subject_fixed_effects or temp_Z_by_key.get((band, roi))):
+                vis_Z = []
+                partial_x = []
+                partial_y = []
+                j = 0
+                common_cols = []
+                Z_lists2 = temp_Z_by_key.get((band, roi))
+                if Z_lists2:
+                    common_cols = sorted(set(Z_lists2[0].columns))
+                    for df in Z_lists2[1:]:
+                        common_cols = sorted(set(common_cols) & set(df.columns))
+                for i, (xi_arr, yi_arr) in enumerate(zip(x_lists, y_lists)):
+                    if not hasZ_list[i]:
+                        continue
+                    Zi = Z_lists2[j]
+                    j += 1
+                    xi = pd.Series(xi_arr)
+                    yi = pd.Series(yi_arr)
+                    n = min(len(xi), len(yi), len(Zi))
+                    xi = xi.iloc[:n]
+                    yi = yi.iloc[:n]
+                    Zi = Zi.iloc[:n]
+                    m = xi.notna() & yi.notna()
+                    xi = xi[m]
+                    yi = yi[m]
+                    Zi = Zi.loc[m]
+                    if pooling_strategy == "within_subject_centered":
+                        xi = xi - xi.mean()
+                        yi = yi - yi.mean()
+                    elif pooling_strategy == "within_subject_zscored":
+                        sx = xi.std(ddof=1)
+                        sy = yi.std(ddof=1)
+                        if sx <= 0 or sy <= 0:
+                            continue
+                        xi = (xi - xi.mean()) / sx
+                        yi = (yi - yi.mean()) / sy
+                    Zi = Zi[common_cols] if common_cols else Zi
+                    if subject_fixed_effects:
+                        sid = subj_order[i] if i < len(subj_order) else str(i)
+                        Zi = Zi.copy()
+                        Zi["__subject_id__"] = sid
+                    vis_Z.append(Zi)
+                    partial_x.append(xi)
+                    partial_y.append(yi)
+                if vis_Z:
+                    Z_all_vis = pd.concat(vis_Z, ignore_index=True)
+                    x_all_partial = pd.concat(partial_x, ignore_index=True)
+                    y_all_partial = pd.concat(partial_y, ignore_index=True)
+                    if subject_fixed_effects and "__subject_id__" in Z_all_vis.columns:
+                        dummies = pd.get_dummies(Z_all_vis["__subject_id__"].astype(str), prefix="sub", drop_first=True)
+                        Z_all_vis = pd.concat([Z_all_vis.drop(columns=["__subject_id__"]), dummies], axis=1)
+
+            r_g, p_g, n_trials, n_subj, ci95 = _compute_group_stats(
+                [np.asarray(v) for v in x_lists],
+                [np.asarray(v) for v in y_lists],
+                method2_code,
+                strategy=pooling_strategy,
+                cb_n=int(cluster_bootstrap),
+                rng_local=rng,
+            )
+
+            tag = tag_map.get(pooling_strategy)
+
+            # Use pooling-aware y-axis label for temperature
+            if pooling_strategy == "within_subject_centered":
+                _y_label_temp = "Temperature (°C, centered)"
+            elif pooling_strategy == "within_subject_zscored":
+                _y_label_temp = "Temperature (z-scored)"
+            else:
+                _y_label_temp = "Temperature (°C)"
+
+            r, p, n_eff = _generate_correlation_scatter(
+                x_data=x_all,
+                y_data=y_all,
+                x_label="log10(power/baseline [-5–0 s])",
+                y_label=_y_label_temp,
+                title_prefix=title_prefix,
+                band_color=_get_band_color(band),
+                output_path=out_path,
+                method_code=method2_code,
+                Z_covars=None,
+                covar_names=None,
+                bootstrap_ci=bootstrap_ci,
+                rng=rng,
+                logger=logger,
+                annotated_stats=(r_g, p_g, n_trials),
+                annot_ci=ci95,
+                stats_tag=tag,
+            )
+            temp_records.append({
+                "roi": roi,
+                "band": band,
+                "r_pooled": r_g,
+                "p_pooled": p_g,
+                "n_total": n_trials,
+                "n_subjects": n_subj,
+                "pooling_strategy": pooling_strategy,
+                "ci_low": ci95[0],
+                "ci_high": ci95[1],
+            })
+
+            try:
+                logger.info(
+                    f"Pooled temperature scatter saved: {out_path} "
+                    f"(band={band}, roi={title_roi}, r={r_g:.3f}, p={p_g:.3g}, n_trials={n_trials}, n_subj={n_subj}, strategy={pooling_strategy})"
+                )
+            except Exception:
+                pass
+
+            if Z_all_vis is None and subject_fixed_effects and len(vis_subj_ids) == len(x_all):
+                Z_all_vis = pd.get_dummies(pd.Series(vis_subj_ids, name="__subject_id__").astype(str), prefix="sub", drop_first=True)
+                x_all_partial = x_all
+                y_all_partial = y_all
+            if Z_all_vis is not None and len(Z_all_vis) > 0 and x_all_partial is not None and y_all_partial is not None:
+                x_res2, y_res2, n_res2 = _partial_residuals_xy_given_Z(x_all_partial, y_all_partial, Z_all_vis, method2_code)
+                if n_res2 >= 5:
+                    residual_xlabel = (
+                        "Partial residuals (ranked) of log10(power/baseline)"
+                        if method2_code == "spearman"
+                        else "Partial residuals of log10(power/baseline)"
+                    )
+                    residual_ylabel = (
+                        "Partial residuals (ranked) of temperature (°C)"
+                        if method2_code == "spearman"
+                        else "Partial residuals of temperature (°C)"
+                    )
+                    _generate_correlation_scatter(
+                        x_data=x_res2,
+                        y_data=y_res2,
+                        x_label=residual_xlabel,
+                        y_label=residual_ylabel,
+                        title_prefix=f"Partial residuals — {band_title} power vs temperature — {title_roi}",
+                        band_color=_get_band_color(band),
+                        output_path=out_dir / f"{base_name}_partial",
+                        method_code=method2_code,
+                        is_partial_residuals=True,
+                        rng=rng,
+                        logger=logger,
+                    )
+
+        if temp_records:
+            df_t = pd.DataFrame(temp_records)
+            rej_t, crit_t = _fdr_bh(df_t["p_pooled"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
+            df_t["fdr_reject"] = rej_t
+            df_t["fdr_crit_p"] = crit_t
+            out_stats_t = stats_dir / "group_pooled_corr_pow_roi_vs_temp.tsv"
+            df_t.to_csv(out_stats_t, sep="\t", index=False)
+            try:
+                logger.info(f"Wrote pooled ROI vs temperature stats: {out_stats_t}")
+            except Exception:
+                pass
 
 # Residual Diagnostic Visualization for Regression Analysis
 # -----------------------------------------------------------------------------
@@ -2122,10 +3068,9 @@ def plot_power_behavior_correlation(pow_df: pd.DataFrame, y: pd.Series, bands: L
             axes[i].grid(True, alpha=0.3)
             
             # Add correlation statistics
-            r, p_val = stats.pearsonr(x_valid, y_valid)
             rho, p_spear = stats.spearmanr(x_valid, y_valid)
             
-            stats_text = f'Pearson r={r:.3f} (p={p_val:.3f})\nSpearman ρ={rho:.3f} (p={p_spear:.3f})\nn={len(x_valid)}'
+            stats_text = f'Spearman ρ={rho:.3f} (p={p_spear:.3f})\nn={len(x_valid)}'
             axes[i].text(0.05, 0.95, stats_text, transform=axes[i].transAxes, 
                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
@@ -2994,14 +3939,22 @@ def correlate_connectivity_roi_summaries(
             logger.warning(f"Partial correlation dropped {len(df_full) - len(df)} rows due to missing data (kept {len(df)}/{len(df_full)})")
         if len(df) < 5 or df["y"].nunique() <= 1:
             return np.nan, np.nan, 0
-        Xd = np.column_stack([np.ones(len(df)), df[Z.columns].to_numpy()])
-        bx = np.linalg.lstsq(Xd, df["x"].to_numpy(), rcond=None)[0]
-        by = np.linalg.lstsq(Xd, df["y"].to_numpy(), rcond=None)[0]
-        x_res = df["x"].to_numpy() - Xd.dot(bx)
-        y_res = df["y"].to_numpy() - Xd.dot(by)
-        if method == "spearman" and df["y"].nunique() > 5:
-            r_p, p_p = stats.spearmanr(x_res, y_res, nan_policy="omit")
+        if method == "spearman":
+            xr = stats.rankdata(df["x"].to_numpy())
+            yr = stats.rankdata(df["y"].to_numpy())
+            Zr = np.column_stack([stats.rankdata(df[c].to_numpy()) for c in Z.columns]) if len(Z.columns) else np.empty((len(df), 0))
+            Xd = np.column_stack([np.ones(len(df)), Zr])
+            bx = np.linalg.lstsq(Xd, xr, rcond=None)[0]
+            by = np.linalg.lstsq(Xd, yr, rcond=None)[0]
+            x_res = xr - Xd.dot(bx)
+            y_res = yr - Xd.dot(by)
+            r_p, p_p = stats.pearsonr(x_res, y_res)
         else:
+            Xd = np.column_stack([np.ones(len(df)), df[Z.columns].to_numpy()])
+            bx = np.linalg.lstsq(Xd, df["x"].to_numpy(), rcond=None)[0]
+            by = np.linalg.lstsq(Xd, df["y"].to_numpy(), rcond=None)[0]
+            x_res = df["x"].to_numpy() - Xd.dot(bx)
+            y_res = df["y"].to_numpy() - Xd.dot(by)
             r_p, p_p = stats.pearsonr(x_res, y_res)
         return float(r_p), float(p_p), int(len(df))
     # Note: Do not require sensor ROI map here; atlas-based grouping may still proceed.
@@ -3020,18 +3973,12 @@ def correlate_connectivity_roi_summaries(
         df = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
         if len(df) < 5:
             return np.nan
-        if method == "spearman" and df["y"].nunique() > 5:
-            obs, _ = stats.spearmanr(df["x"], df["y"], nan_policy="omit")
-        else:
-            obs, _ = stats.pearsonr(df["x"], df["y"])
+        obs, _ = stats.spearmanr(df["x"], df["y"], nan_policy="omit")
         ge = 1
         y_vals = df["y"].to_numpy()
         for _ in range(int(n_perm)):
             y_pi = y_vals[rng.permutation(len(y_vals))]
-            if method == "spearman" and df["y"].nunique() > 5:
-                rp, _ = stats.spearmanr(df["x"], y_pi, nan_policy="omit")
-            else:
-                rp, _ = stats.pearsonr(df["x"], y_pi)
+            rp, _ = stats.spearmanr(df["x"], y_pi, nan_policy="omit")
             if np.abs(rp) >= np.abs(obs) - 1e-12:
                 ge += 1
         return ge / (int(n_perm) + 1)
@@ -3040,25 +3987,37 @@ def correlate_connectivity_roi_summaries(
         df = pd.concat([x.rename("x"), y.rename("y"), Z], axis=1).dropna()
         if len(df) < 5:
             return np.nan
-        Xd = np.column_stack([np.ones(len(df)), df[Z.columns].to_numpy()])
-        bx = np.linalg.lstsq(Xd, df["x"].to_numpy(), rcond=None)[0]
-        by = np.linalg.lstsq(Xd, df["y"].to_numpy(), rcond=None)[0]
-        rx = df["x"].to_numpy() - Xd.dot(bx)
-        ry = df["y"].to_numpy() - Xd.dot(by)
-        if method == "spearman" and df["y"].nunique() > 5:
-            obs, _ = stats.spearmanr(rx, ry, nan_policy="omit")
-        else:
+        if method == "spearman":
+            xr = stats.rankdata(df["x"].to_numpy())
+            yr = stats.rankdata(df["y"].to_numpy())
+            Zr = np.column_stack([stats.rankdata(df[c].to_numpy()) for c in Z.columns]) if len(Z.columns) else np.empty((len(df), 0))
+            Xd = np.column_stack([np.ones(len(df)), Zr])
+            bx = np.linalg.lstsq(Xd, xr, rcond=None)[0]
+            by = np.linalg.lstsq(Xd, yr, rcond=None)[0]
+            rx = xr - Xd.dot(bx)
+            ry = yr - Xd.dot(by)
             obs, _ = stats.pearsonr(rx, ry)
-        ge = 1
-        for _ in range(int(n_perm)):
-            ry_pi = ry[rng.permutation(len(ry))]
-            if method == "spearman" and df["y"].nunique() > 5:
-                rp, _ = stats.spearmanr(rx, ry_pi, nan_policy="omit")
-            else:
+            ge = 1
+            for _ in range(int(n_perm)):
+                ry_pi = ry[rng.permutation(len(ry))]
                 rp, _ = stats.pearsonr(rx, ry_pi)
-            if np.abs(rp) >= np.abs(obs) - 1e-12:
-                ge += 1
-        return ge / (int(n_perm) + 1)
+                if np.abs(rp) >= np.abs(obs) - 1e-12:
+                    ge += 1
+            return ge / (int(n_perm) + 1)
+        else:
+            Xd = np.column_stack([np.ones(len(df)), df[Z.columns].to_numpy()])
+            bx = np.linalg.lstsq(Xd, df["x"].to_numpy(), rcond=None)[0]
+            by = np.linalg.lstsq(Xd, df["y"].to_numpy(), rcond=None)[0]
+            rx = df["x"].to_numpy() - Xd.dot(bx)
+            ry = df["y"].to_numpy() - Xd.dot(by)
+            obs, _ = stats.pearsonr(rx, ry)
+            ge = 1
+            for _ in range(int(n_perm)):
+                ry_pi = ry[rng.permutation(len(ry))]
+                rp, _ = stats.pearsonr(rx, ry_pi)
+                if np.abs(rp) >= np.abs(obs) - 1e-12:
+                    ge += 1
+            return ge / (int(n_perm) + 1)
 
     X = pd.read_csv(conn_path, sep="\t")
     y_df = pd.read_csv(y_path, sep="\t")
@@ -3177,12 +4136,9 @@ def correlate_connectivity_roi_summaries(
             n_eff = int(mask.sum())
             if n_eff < 5:
                 continue
-            if use_spearman and y.nunique() > 5:
-                r, p = stats.spearmanr(xi[mask], y[mask], nan_policy="omit")
-                method = "spearman"
-            else:
-                r, p = stats.pearsonr(xi[mask], y[mask])
-                method = "pearson"
+            # Always use Spearman
+            r, p = stats.spearmanr(xi[mask], y[mask], nan_policy="omit")
+            method = "spearman"
 
             # Partial correlations given multi-covariates (if available)
             r_part = np.nan
@@ -3197,19 +4153,14 @@ def correlate_connectivity_roi_summaries(
             # CIs for r: Fisher z for Pearson; bootstrap for Spearman
             ci_low = np.nan
             ci_high = np.nan
-            if method == "pearson" and n_eff >= 4:
-                ci_low, ci_high = _fisher_ci(r, n_eff)
-            elif bootstrap and n_eff >= 5:
+            if bootstrap and n_eff >= 5:
                 idx = np.where(mask.to_numpy())[0]
                 boots: List[float] = []
                 for _ in range(int(bootstrap)):
                     bidx = rng.choice(idx, size=len(idx), replace=True)
                     xb = xi.iloc[bidx]
                     yb = y.iloc[bidx]
-                    if method == "spearman" and yb.nunique() > 5:
-                        rb, _ = stats.spearmanr(xb, yb, nan_policy="omit")
-                    else:
-                        rb, _ = stats.pearsonr(xb, yb)
+                    rb, _ = stats.spearmanr(xb, yb, nan_policy="omit")
                     boots.append(rb)
                 if boots:
                     ci_low, ci_high = np.percentile(boots, [2.5, 97.5])
@@ -3258,12 +4209,9 @@ def correlate_connectivity_roi_summaries(
                 m2 = xt.notna() & tt.notna()
                 n_eff2 = int(m2.sum())
                 if n_eff2 >= 5:
-                    if use_spearman and tt.nunique() > 5:
-                        r2, p2 = stats.spearmanr(xt[m2], tt[m2], nan_policy="omit")
-                        method2 = "spearman"
-                    else:
-                        r2, p2 = stats.pearsonr(xt[m2], tt[m2])
-                        method2 = "pearson"
+                    # Always use Spearman
+                    r2, p2 = stats.spearmanr(xt[m2], tt[m2], nan_policy="omit")
+                    method2 = "spearman"
                     # Partial correlation controlling covariates excluding temperature itself
                     r2_part = np.nan
                     p2_part = np.nan
@@ -3276,19 +4224,14 @@ def correlate_connectivity_roi_summaries(
                     # CIs for r2: Fisher z for Pearson; bootstrap for Spearman
                     ci2_low = np.nan
                     ci2_high = np.nan
-                    if method2 == "pearson" and n_eff2 >= 4:
-                        ci2_low, ci2_high = _fisher_ci(r2, n_eff2)
-                    elif bootstrap and n_eff2 >= 5:
+                    if bootstrap and n_eff2 >= 5:
                         idx2 = np.where(m2.to_numpy())[0]
                         boots2: List[float] = []
                         for _ in range(int(bootstrap)):
                             bidx2 = rng.choice(idx2, size=len(idx2), replace=True)
                             xb = xt.iloc[bidx2]
                             tb = tt.iloc[bidx2]
-                            if method2 == "spearman" and tb.nunique() > 5:
-                                rb, _ = stats.spearmanr(xb, tb, nan_policy="omit")
-                            else:
-                                rb, _ = stats.pearsonr(xb, tb)
+                            rb, _ = stats.spearmanr(xb, tb, nan_policy="omit")
                             boots2.append(rb)
                         if boots2:
                             ci2_low, ci2_high = np.percentile(boots2, [2.5, 97.5])
@@ -3397,10 +4340,8 @@ def correlate_connectivity_heatmaps(subject: str, task: str = TASK, use_spearman
             mask = xi.notna() & y.notna()
             if mask.sum() < 5:
                 continue
-            if use_spearman and y.nunique() > 5:
-                r, p = stats.spearmanr(xi[mask], y[mask], nan_policy="omit")
-            else:
-                r, p = stats.pearsonr(xi[mask], y[mask])
+            # Always use Spearman
+            r, p = stats.spearmanr(xi[mask], y[mask], nan_policy="omit")
             rvals[i, j] = r
             rvals[j, i] = r
             pvals[i, j] = p
@@ -3475,8 +4416,13 @@ def export_all_significant_predictors(subject: str, alpha: float = 0.05, use_fdr
             continue
         try:
             roi_df = pd.read_csv(roi_file, sep="\t")
-            # Use raw p-values for filtering (include all p < 0.05)
-            significant_roi = roi_df[roi_df["p"] <= alpha].copy()
+            # Select significant using FDR when available and requested
+            if use_fdr and "fdr_reject" in roi_df.columns:
+                significant_roi = roi_df[roi_df["fdr_reject"] == True].copy()
+            elif use_fdr and "fdr_crit_p" in roi_df.columns and "p" in roi_df.columns:
+                significant_roi = roi_df[roi_df["p"] <= roi_df["fdr_crit_p"]].copy()
+            else:
+                significant_roi = roi_df[roi_df["p"] <= alpha].copy()
             if len(significant_roi) > 0:
                 # Add predictor type, target, and format predictor name
                 significant_roi["predictor_type"] = "ROI"
@@ -3510,8 +4456,13 @@ def export_all_significant_predictors(subject: str, alpha: float = 0.05, use_fdr
             continue
         try:
             chan_df = pd.read_csv(combined_file, sep="\t")
-            # Use raw p-values for filtering (include all p < 0.05)
-            significant_chan = chan_df[chan_df["p"] <= alpha].copy()
+            # Select significant using FDR when available and requested
+            if use_fdr and "fdr_reject" in chan_df.columns:
+                significant_chan = chan_df[chan_df["fdr_reject"] == True].copy()
+            elif use_fdr and "fdr_crit_p" in chan_df.columns and "p" in chan_df.columns:
+                significant_chan = chan_df[chan_df["p"] <= chan_df["fdr_crit_p"]].copy()
+            else:
+                significant_chan = chan_df[chan_df["p"] <= alpha].copy()
             if len(significant_chan) > 0:
                 # Add predictor type, target, and format predictor name
                 significant_chan["predictor_type"] = "Channel"
@@ -3743,8 +4694,20 @@ def plot_time_frequency_correlation_heatmap(
         return_itc=False,
         decim=decim,
         n_jobs=1,
+        average=False,  # IMPORTANT: keep epoch dimension for trial-wise correlations
         verbose=False
     )
+
+    # Validate epoch-resolved TFR shape
+    try:
+        ndim = getattr(getattr(tfr, 'data', None), 'ndim', None)
+        if ndim != 4:
+            logger.error(f"TFR must be epoch-resolved with shape (epochs, channels, freqs, times); got ndim={ndim}")
+            return
+        logger.info(f"TFR shape: {tfr.data.shape}; channels={len(tfr.ch_names)}; freqs={len(freqs)}; times={len(tfr.times)}")
+    except Exception as e:
+        logger.error(f"Failed to validate TFR shape: {e}")
+        return
 
     # Apply baseline correction to obtain log10(power/baseline) prior to correlations
     baseline_applied = False
@@ -3829,19 +4792,13 @@ def plot_time_frequency_correlation_heatmap(
             continue
             
         for f_idx, freq in enumerate(freqs):
-            # Get power data for this frequency 
-            # TFR data shape varies: could be (epochs, channels, freqs, times) or (epochs, freqs, times)
-            if tfr.data.ndim == 4:
-                # 4D: (epochs, channels, freqs, times)
-                power_freq = tfr.data[:, :, f_idx, :]  # (epochs, channels, times)
-            elif tfr.data.ndim == 3:
-                # 3D: (epochs, freqs, times) - channels already averaged
-                power_freq = tfr.data[:, f_idx, :]  # (epochs, times)
-                # Add channel dimension for consistency
-                power_freq = power_freq[:, np.newaxis, :]  # (epochs, 1, times)
-            else:
-                logger.error(f"Unexpected TFR data dimensionality: {tfr.data.ndim}")
+            # Get power data for this frequency
+            # Expect TFR data shape: (epochs, channels, freqs, times)
+            if tfr.data.ndim != 4:
+                logger.error(f"Unexpected TFR data dimensionality: {tfr.data.ndim}; expected 4")
                 continue
+            # 4D: (epochs, channels, freqs, times)
+            power_freq = tfr.data[:, :, f_idx, :]  # (epochs, channels, times)
             
             # Apply time mask to get data for this time bin
             power_data = power_freq[:, :, time_mask]  # (epochs, channels, time_points_in_bin)
@@ -3869,10 +4826,8 @@ def plot_time_frequency_correlation_heatmap(
             
             # Compute correlation
             try:
-                if use_spearman and len(np.unique(behavior_clean)) > 5:
-                    r, p = stats.spearmanr(power_clean, behavior_clean)
-                else:
-                    r, p = stats.pearsonr(power_clean, behavior_clean)
+                # Always use Spearman for time-frequency correlations
+                r, p = stats.spearmanr(power_clean, behavior_clean)
                     
                 correlations[f_idx, t_idx] = r
                 p_values[f_idx, t_idx] = p
@@ -3901,7 +4856,7 @@ def plot_time_frequency_correlation_heatmap(
     correlation_vmax = viz_config.get('correlation_vmax', 0.6)
     
     roi_suffix = f"_{roi_selection.lower()}" if roi_selection else ""
-    method_suffix = "_spearman" if use_spearman else "_pearson"
+    method_suffix = "_spearman"
     
     # Figure 1: Time-frequency correlation heatmap
     fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
@@ -3911,7 +4866,7 @@ def plot_time_frequency_correlation_heatmap(
     ax1.set_xlabel('Time (s)', fontweight='bold')
     ax1.set_ylabel('Frequency (Hz)', fontweight='bold')
     title_main = 'Time-Frequency Power-Behavior Correlations'
-    method_name = 'Spearman' if use_spearman else 'Pearson'
+    method_name = 'Spearman'
     roi_name = roi_selection or 'All Channels'
     metric = 'log10(power/baseline)' if baseline_applied else 'raw power'
     bl_txt = ''
@@ -3947,17 +4902,16 @@ def plot_time_frequency_correlation_heatmap(
         ax2.set_xlabel('Frequency (Hz)', fontweight='bold')
         ax2.set_ylabel('Max |Correlation|', fontweight='bold')
         ax2.set_title(f'Frequency Profile of Strongest Power-Behavior Correlations\n'
-                     f'Subject: {subject} | Method: {use_spearman and "Spearman" or "Pearson"} | '
+                     f'Subject: {subject} | Method: Spearman | '
                      f'ROI: {roi_selection or "All Channels"}', 
                      fontsize=14, fontweight='bold')
         ax2.grid(True, alpha=0.3)
         
-        # Add frequency band annotations with theta included
-        band_colors = {'theta': 'purple', 'alpha': 'green', 'beta': 'orange', 'gamma': 'red'}
+        # Add frequency band annotations using configured colors (includes delta/theta/...)
         for band, (fmin, fmax) in FEATURES_FREQ_BANDS.items():
-            if band in band_colors and fmin >= freq_range[0] and fmax <= freq_range[1]:
-                ax2.axvspan(fmin, fmax, alpha=0.2, color=band_colors[band], 
-                           label=f'{band} ({fmin:g}–{fmax:g}Hz)')
+            if fmin >= freq_range[0] and fmax <= freq_range[1]:
+                ax2.axvspan(fmin, fmax, alpha=0.2, color=_get_band_color(band),
+                            label=f'{band} ({fmin:g}–{fmax:g}Hz)')
         ax2.legend(loc='upper right', fontsize=10, framealpha=0.9)
     
     plt.tight_layout()
@@ -4370,7 +5324,6 @@ def process_subject(
     partial_covars: Optional[List[str]] = None,
     bootstrap: int = 0,
     n_perm: int = 0,
-    build_report: bool = False,
     rng_seed: int = 42,
 ) -> None:
     logger = _setup_logging(subject)
@@ -4459,13 +5412,6 @@ def process_subject(
             use_spearman=use_spearman,
         )
         
-        # 11b. Sensorimotor ROI-specific time-frequency correlation heatmap
-        # To specialize by ROI, set behavior_analysis.time_frequency_heatmap.roi_selection in the YAML
-        plot_time_frequency_correlation_heatmap(
-            subject,
-            task,
-            use_spearman=use_spearman,
-        )
         
         
     except Exception as e:
@@ -4536,11 +5482,7 @@ def process_subject(
     except Exception as e:
         logger.error(f"Global FDR application failed for sub-{subject}: {e}")
 
-    if build_report:
-        try:
-            build_subject_report(subject, task)
-        except Exception as e:
-            logger.error(f"Report build failed for sub-{subject}: {e}")
+    # Report building removed per user request
 
 
 def _fisher_aggregate(rs: List[float]) -> Tuple[float, float, float, int]:
@@ -4565,13 +5507,26 @@ def _fisher_aggregate(rs: List[float]) -> Tuple[float, float, float, int]:
     return float(np.tanh(mean_z)), float(np.tanh(ci_low_z)), float(np.tanh(ci_high_z)), n
 
 
-def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK) -> None:
+def aggregate_group_level(
+    subjects: Optional[List[str]] = None,
+    task: str = TASK,
+    *,
+    pooling_strategy: str = "within_subject_centered",
+    cluster_bootstrap: int = 0,
+    subject_fixed_effects: bool = True,
+) -> None:
     if subjects is None or subjects == ["all"]:
         subjects = SUBJECTS
     gstats = _group_stats_dir()
     gplots = _group_plots_dir()
     _ensure_dir(gstats)
     _ensure_dir(gplots)
+
+    logger = _setup_group_logging()
+    try:
+        logger.info(f"Starting group aggregation for {len(subjects)} subjects (task={task})")
+    except Exception:
+        pass
 
     # 1) ROI power vs rating
     by_key: Dict[Tuple[str, str], List[float]] = {}
@@ -4623,7 +5578,12 @@ def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK
             dfb["fdr_crit_p"] = crit
             out_rows.append(dfb)
         dfg2 = pd.concat(out_rows, ignore_index=True)
-        dfg2.to_csv(gstats / "group_corr_pow_roi_vs_rating.tsv", sep="\t", index=False)
+        out_path_rating = gstats / "group_corr_pow_roi_vs_rating.tsv"
+        dfg2.to_csv(out_path_rating, sep="\t", index=False)
+        try:
+            logger.info(f"Wrote group ROI power vs rating summary: {out_path_rating}")
+        except Exception:
+            pass
 
         # Simple plot: bar of r_group by ROI per band
         try:
@@ -4694,63 +5654,733 @@ def aggregate_group_level(subjects: Optional[List[str]] = None, task: str = TASK
         rej, crit = _fdr_bh(out_df["p_group"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
         out_df["fdr_reject"] = rej
         out_df["fdr_crit_p"] = crit
-        out_df.to_csv(gstats / f"group_corr_conn_roi_summary_{_sanitize(pref)}_vs_rating.tsv", sep="\t", index=False)
+        out_conn = gstats / f"group_corr_conn_roi_summary_{_sanitize(pref)}_vs_rating.tsv"
+        out_df.to_csv(out_conn, sep="\t", index=False)
+        try:
+            logger.info(f"Wrote group connectivity ROI summary: {out_conn}")
+        except Exception:
+            pass
 
-
-def build_subject_report(subject: str, task: str = TASK) -> None:
+    # Generate pooled scatter plots across subjects
     try:
-        Report = getattr(mne, "Report")
-    except AttributeError:
-        Report = None
-    if Report is None:
-        print("mne.Report not available; skipping report build.")
+        try:
+            logger.info("Generating pooled ROI scatters across subjects…")
+        except Exception:
+            pass
+        plot_group_power_roi_scatter(
+            subjects,
+            task=task,
+            use_spearman=True,
+            partial_covars=PARTIAL_COVARS_DEFAULT,
+            do_temp=True,
+            bootstrap_ci=0,
+            rng=None,
+            pooling_strategy=pooling_strategy,
+            cluster_bootstrap=int(cluster_bootstrap),
+            subject_fixed_effects=bool(subject_fixed_effects),
+        )
+    except Exception as e:
+        logging.getLogger("behavior_analysis_group").error(
+            f"Group scatter plotting failed: {e}"
+        )
+
+    # Group channel-level aggregation and visualizations
+    try:
+        _group_channel_level_visuals(subjects, task, logger)
+    except Exception as e:
+        logger.error(f"Group channel-level visuals failed: {e}")
+
+    # Group overall multi-band summary figures (pooled overall power vs rating/temp)
+    try:
+        _group_overall_band_summary(
+            subjects,
+            task,
+            logger=logger,
+            use_spearman=True,
+            pooling_strategy=pooling_strategy,
+            cluster_bootstrap=int(cluster_bootstrap),
+        )
+    except Exception as e:
+        logger.error(f"Group overall multi-band summary failed: {e}")
+
+def _group_channel_level_visuals(subjects: List[str], task: str, logger: logging.Logger) -> None:
+    """Aggregate channel-level correlations across subjects and create group plots.
+
+    - Aggregates per-band channel-level r via Fisher z; p via t-test on Fisher z.
+    - Saves per-band TSVs and a combined TSV in the group stats directory.
+    - Plots per-band bar charts of r_group and a top-N predictors chart.
+    - Plots group significant topomaps across bands using a representative subject's montage.
+    """
+    gstats = _group_stats_dir()
+    gplots = _group_plots_dir()
+    _ensure_dir(gstats)
+    _ensure_dir(gplots)
+
+    # Helper: load subject channel-level stats for a band
+    def _load_sub_band_df(sub: str, band: str) -> Optional[pd.DataFrame]:
+        f = _stats_dir(sub) / f"corr_stats_pow_{band}_vs_rating.tsv"
+        if not f.exists():
+            return None
+        try:
+            df = pd.read_csv(f, sep="\t")
+        except (FileNotFoundError, OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            return None
+        if df is None or df.empty or "channel" not in df.columns or "r" not in df.columns:
+            return None
+        return df
+
+    bands_to_df: Dict[str, pd.DataFrame] = {}
+    bands_to_df_temp: Dict[str, pd.DataFrame] = {}
+    for band in POWER_BANDS_TO_USE:
+        chan_to_r: Dict[str, List[float]] = {}
+        chan_to_r_temp: Dict[str, List[float]] = {}
+        # Collect r per subject for each channel
+        for sub in subjects:
+            df = _load_sub_band_df(sub, band)
+            if df is None:
+                continue
+            for _, row in df.iterrows():
+                ch = str(row.get("channel"))
+                try:
+                    r = float(row.get("r"))
+                except (TypeError, ValueError):
+                    r = np.nan
+                if np.isfinite(r):
+                    chan_to_r.setdefault(ch, []).append(float(np.clip(r, -0.999999, 0.999999)))
+        # Temperature per subject (optional)
+        for sub in subjects:
+            ftemp = _stats_dir(sub) / f"corr_stats_pow_{band}_vs_temp.tsv"
+            if not ftemp.exists():
+                continue
+            try:
+                df_t = pd.read_csv(ftemp, sep="\t")
+            except (FileNotFoundError, OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+            if df_t is None or df_t.empty or "channel" not in df_t.columns or "r" not in df_t.columns:
+                continue
+            for _, row in df_t.iterrows():
+                ch = str(row.get("channel"))
+                try:
+                    r = float(row.get("r"))
+                except (TypeError, ValueError):
+                    r = np.nan
+                if np.isfinite(r):
+                    chan_to_r_temp.setdefault(ch, []).append(float(np.clip(r, -0.999999, 0.999999)))
+
+        if not chan_to_r and not chan_to_r_temp:
+            continue
+
+        # Aggregate per channel via Fisher (rating)
+        out_rows: List[Dict[str, object]] = []
+        for ch, rs in sorted(chan_to_r.items()):
+            vals = np.array(rs, dtype=float)
+            vals = vals[np.isfinite(vals)]
+            vals = np.clip(vals, -0.999999, 0.999999)
+            if vals.size == 0:
+                continue
+            z = np.arctanh(vals)
+            r_grp = float(np.tanh(np.mean(z)))
+            # p via t-test on Fisher z against 0
+            if len(z) >= 2:
+                tstat, p = stats.ttest_1samp(z, popmean=0.0)
+                p = float(p)
+            else:
+                p = np.nan
+            # CI via t-critical on mean z
+            if len(z) >= 2:
+                sd = float(np.std(z, ddof=1))
+                se = sd / np.sqrt(len(z)) if sd > 0 else np.nan
+                if np.isfinite(se) and se > 0:
+                    tcrit = float(stats.t.ppf(0.975, df=len(z) - 1))
+                    lo = float(np.tanh(np.mean(z) - tcrit * se))
+                    hi = float(np.tanh(np.mean(z) + tcrit * se))
+                else:
+                    lo = np.nan
+                    hi = np.nan
+            else:
+                lo = np.nan
+                hi = np.nan
+            out_rows.append({
+                "channel": ch,
+                "band": band,
+                "r_group": r_grp,
+                "p_group": p,
+                "r_ci_low": lo,
+                "r_ci_high": hi,
+                "n_subjects": int(len(z)),
+            })
+
+        df_band = pd.DataFrame(out_rows)
+        if not df_band.empty:
+            rej, crit = _fdr_bh(df_band["p_group"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
+            df_band["fdr_reject"] = rej
+            df_band["fdr_crit_p"] = crit
+            df_band = df_band.sort_values("channel").reset_index(drop=True)
+            df_band.to_csv(gstats / f"group_corr_pow_{_sanitize(band)}_vs_rating.tsv", sep="\t", index=False)
+            bands_to_df[band] = df_band
+
+        # Aggregate per channel via Fisher (temperature)
+        out_rows_t: List[Dict[str, object]] = []
+        for ch, rs in sorted(chan_to_r_temp.items()):
+            vals = np.array(rs, dtype=float)
+            vals = vals[np.isfinite(vals)]
+            vals = np.clip(vals, -0.999999, 0.999999)
+            if vals.size == 0:
+                continue
+            z = np.arctanh(vals)
+            r_grp = float(np.tanh(np.mean(z)))
+            if len(z) >= 2:
+                tstat, p = stats.ttest_1samp(z, popmean=0.0)
+                p = float(p)
+            else:
+                p = np.nan
+            if len(z) >= 2:
+                sd = float(np.std(z, ddof=1))
+                se = sd / np.sqrt(len(z)) if sd > 0 else np.nan
+                if np.isfinite(se) and se > 0:
+                    tcrit = float(stats.t.ppf(0.975, df=len(z) - 1))
+                    lo = float(np.tanh(np.mean(z) - tcrit * se))
+                    hi = float(np.tanh(np.mean(z) + tcrit * se))
+                else:
+                    lo = np.nan
+                    hi = np.nan
+            else:
+                lo = np.nan
+                hi = np.nan
+            out_rows_t.append({
+                "channel": ch,
+                "band": band,
+                "r_group": r_grp,
+                "p_group": p,
+                "r_ci_low": lo,
+                "r_ci_high": hi,
+                "n_subjects": int(len(z)),
+            })
+
+        df_band_t = pd.DataFrame(out_rows_t)
+        if not df_band_t.empty:
+            rej_t, crit_t = _fdr_bh(df_band_t["p_group"].to_numpy(), alpha=BEHAV_FDR_ALPHA)
+            df_band_t["fdr_reject"] = rej_t
+            df_band_t["fdr_crit_p"] = crit_t
+            df_band_t = df_band_t.sort_values("channel").reset_index(drop=True)
+            df_band_t.to_csv(gstats / f"group_corr_pow_{_sanitize(band)}_vs_temp.tsv", sep="\t", index=False)
+            bands_to_df_temp[band] = df_band_t
+
+    if not bands_to_df and not bands_to_df_temp:
+        logger.warning("No group channel-level stats aggregated (missing subject inputs?)")
         return
-    plots_dir = _plots_dir(subject)
-    stats_dir = _stats_dir(subject)
-    report_dir = DERIV_ROOT / f"sub-{subject}" / "eeg" / "report"
-    _ensure_dir(report_dir)
-    rep = Report(title=f"Behavior & EEG features: sub-{subject}, task-{task}")
-    # Psychometric plots
-    for fn in ["psychometric_rating_vs_temp.png", "psychometric_pain_vs_temp.png"]:
-        p = plots_dir / fn
-        if p.exists():
-            rep.add_image(p, title=fn, section="Psychometrics")
-    
-    # Top behavioral predictors plot
-    _top_n = int(config.get("behavior_analysis.predictors.top_n", 20))
-    for fn in [f"sub-{subject}_top_{_top_n}_behavioral_predictors.png"]:
-        p = plots_dir / fn
-        if p.exists():
-            rep.add_image(p, title=f"Top {_top_n} Behavioral Predictors", section="Correlations")
-    # Save stats TSVs as links
-    for fn in [
-        "corr_stats_pow_roi_vs_rating.tsv",
-        "corr_stats_pow_roi_vs_temp.tsv",
-    ]:
-        p = stats_dir / fn
-        if p.exists():
-            rep.add_html(f"<p><a href='{p.as_posix()}'>Download {fn}</a></p>", title=fn, section="Stats")
-    # Add global FDR summary if present
-    p = stats_dir / "global_fdr_summary.tsv"
-    if p.exists():
-        rep.add_html(f"<p><a href='{p.as_posix()}'>Download global_fdr_summary.tsv</a></p>", title="global_fdr_summary.tsv", section="Stats")
-    # Add connectivity ROI summary TSVs (atlas-aware) if present
+
+    # Combined across bands for top predictors plot
+    if bands_to_df:
+        combined = pd.concat([bands_to_df[b] for b in bands_to_df.keys()], ignore_index=True)
+        combined.to_csv(gstats / "group_corr_pow_combined_vs_rating.tsv", sep="\t", index=False)
+    else:
+        combined = pd.DataFrame()
+
+    if bands_to_df_temp:
+        combined_t = pd.concat([bands_to_df_temp[b] for b in bands_to_df_temp.keys()], ignore_index=True)
+        combined_t.to_csv(gstats / "group_corr_pow_combined_vs_temp.tsv", sep="\t", index=False)
+    else:
+        combined_t = pd.DataFrame()
+
+    # Per-band bar plots (group_power_behavior_correlation_{band})
+    for band, dfb in bands_to_df.items():
+        try:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            xs = np.arange(len(dfb))
+            colors = ["red" if (np.isfinite(p) and p < BEHAV_FDR_ALPHA) else "lightblue" for p in dfb["p_group"]]
+            ax.bar(xs, dfb["r_group"], color=colors)
+            ax.set_xlabel("Channel", fontweight="bold")
+            ax.set_ylabel("Spearman ρ", fontweight="bold")
+            ax.set_title(f"{band.upper()} Band - Channel-wise Correlations with Behavior\nGroup", fontweight="bold", fontsize=14)
+            ax.set_xticks(xs)
+            ax.set_xticklabels(dfb["channel"].tolist(), rotation=45, ha="right")
+            ax.grid(True, alpha=0.3, axis="y")
+            ax.axhline(y=0, color="black", linestyle="-", alpha=0.5)
+            # Moderate threshold lines (visual aid)
+            ax.axhline(y=0.3, color="green", linestyle="--", alpha=0.7)
+            ax.axhline(y=-0.3, color="green", linestyle="--", alpha=0.7)
+            sig_count = int((dfb["p_group"] < BEHAV_FDR_ALPHA).sum())
+            ax.text(0.02, 0.98, f"Significant channels: {sig_count}/{len(dfb)}",
+                    transform=ax.transAxes, va="top",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+            plt.tight_layout()
+            _save_fig(fig, gplots / f"group_power_behavior_correlation_{_sanitize(band)}")
+        except Exception as e:
+            logger.warning(f"Failed group bar plot for {band}: {e}")
+
+    # Per-band bar plots for temperature (group_power_temperature_correlation_{band})
+    for band, dfb in bands_to_df_temp.items():
+        try:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            xs = np.arange(len(dfb))
+            colors = ["red" if (np.isfinite(p) and p < BEHAV_FDR_ALPHA) else "lightblue" for p in dfb["p_group"]]
+            ax.bar(xs, dfb["r_group"], color=colors)
+            ax.set_xlabel("Channel", fontweight="bold")
+            ax.set_ylabel("Spearman ρ", fontweight="bold")
+            ax.set_title(f"{band.upper()} Band - Channel-wise Correlations with Temperature\nGroup", fontweight="bold", fontsize=14)
+            ax.set_xticks(xs)
+            ax.set_xticklabels(dfb["channel"].tolist(), rotation=45, ha="right")
+            ax.grid(True, alpha=0.3, axis="y")
+            ax.axhline(y=0, color="black", linestyle="-", alpha=0.5)
+            ax.axhline(y=0.3, color="green", linestyle="--", alpha=0.7)
+            ax.axhline(y=-0.3, color="green", linestyle="--", alpha=0.7)
+            sig_count = int((dfb["p_group"] < BEHAV_FDR_ALPHA).sum())
+            ax.text(0.02, 0.98, f"Significant channels: {sig_count}/{len(dfb)}",
+                    transform=ax.transAxes, va="top",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+            plt.tight_layout()
+            _save_fig(fig, gplots / f"group_power_temperature_correlation_{_sanitize(band)}")
+        except Exception as e:
+            logger.warning(f"Failed group temperature bar plot for {band}: {e}")
+
+    # Group top-N behavioral predictors
     try:
-        for p in sorted(stats_dir.glob("corr_stats_conn_roi_summary_*_vs_rating.tsv")):
-            fn = p.name
-            rep.add_html(f"<p><a href='{p.as_posix()}'>Download {fn}</a></p>", title=fn, section="Stats")
-        # Add connectivity ROI summary temperature TSVs if present
-        for p in sorted(stats_dir.glob("corr_stats_conn_roi_summary_*_vs_temp.tsv")):
-            fn = p.name
-            rep.add_html(f"<p><a href='{p.as_posix()}'>Download {fn}</a></p>", title=fn, section="Stats")
-        # Add top-20 edge result TSVs if present
-        for p in sorted(stats_dir.glob("corr_stats_edges_*_vs_rating_top20.tsv")):
-            fn = p.name
-            rep.add_html(f"<p><a href='{p.as_posix()}'>Download {fn}</a></p>", title=fn, section="Stats")
-    except (OSError, AttributeError, ValueError):
+        top_n = int(config.get("behavior_analysis.predictors.top_n", 20))
+        df_sig = combined[(~combined.empty) & (combined["p_group"] <= BEHAV_FDR_ALPHA) & combined["r_group"].notna()].copy() if not combined.empty else pd.DataFrame()
+        if len(df_sig) > 0:
+            df_sig["abs_r"] = df_sig["r_group"].abs()
+            df_top = df_sig.nlargest(top_n, "abs_r").copy()
+            df_top = df_top.sort_values("abs_r", ascending=True)
+
+            fig, ax = plt.subplots(figsize=(10, max(8, top_n * 0.4)))
+            labels = [f"{ch} ({band})" for ch, band in zip(df_top["channel"], df_top["band"])]
+            y_pos = np.arange(len(df_top))
+            colors = [_get_band_color(b) for b in df_top["band"]]
+            ax.barh(y_pos, df_top["abs_r"], color=colors, alpha=0.85, edgecolor="black", linewidth=0.5)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(labels, fontsize=11)
+            ax.set_xlabel(f"|Spearman ρ| (p < {BEHAV_FDR_ALPHA})", fontweight='bold', fontsize=12)
+            ax.set_title(f"Top {top_n} Significant Behavioral Predictors — Group", fontweight='bold', fontsize=14, pad=20)
+            for i, (_, row) in enumerate(df_top.iterrows()):
+                ax.text(row["abs_r"] + 0.01, i, f"{row['abs_r']:.3f} (p={row['p_group']:.3f})", va='center', ha='left', fontsize=10)
+            ax.set_xlim(0, float(df_top["abs_r"].max()) * 1.25)
+            ax.grid(True, axis='x', alpha=0.3, linestyle='-', linewidth=0.5)
+            ax.set_axisbelow(True)
+            plt.tight_layout()
+            _save_fig(fig, gplots / f"group_top_{top_n}_behavioral_predictors")
+            # Export TSV
+            df_top_export = df_top[["channel", "band", "r_group", "p_group", "n_subjects", "abs_r"]].sort_values("abs_r", ascending=False)
+            df_top_export.to_csv(gstats / f"group_top_{top_n}_behavioral_predictors.tsv", sep="\t", index=False)
+        else:
+            logger.info("No significant group-level predictors to plot for top-N.")
+    except Exception as e:
+        logger.warning(f"Top-N group predictors plotting failed: {e}")
+
+    # Group top-N temperature predictors
+    try:
+        top_n = int(config.get("behavior_analysis.predictors.top_n", 20))
+        df_sig_t = combined_t[(~combined_t.empty) & (combined_t["p_group"] <= BEHAV_FDR_ALPHA) & combined_t["r_group"].notna()].copy() if not combined_t.empty else pd.DataFrame()
+        if len(df_sig_t) > 0:
+            df_sig_t["abs_r"] = df_sig_t["r_group"].abs()
+            df_top_t = df_sig_t.nlargest(top_n, "abs_r").copy()
+            df_top_t = df_top_t.sort_values("abs_r", ascending=True)
+            fig, ax = plt.subplots(figsize=(10, max(8, top_n * 0.4)))
+            labels = [f"{ch} ({band})" for ch, band in zip(df_top_t["channel"], df_top_t["band"])]
+            y_pos = np.arange(len(df_top_t))
+            colors = [_get_band_color(b) for b in df_top_t["band"]]
+            ax.barh(y_pos, df_top_t["abs_r"], color=colors, alpha=0.85, edgecolor="black", linewidth=0.5)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(labels, fontsize=11)
+            ax.set_xlabel(f"|Spearman ρ| (p < {BEHAV_FDR_ALPHA})", fontweight='bold', fontsize=12)
+            ax.set_title(f"Top {top_n} Significant Temperature Predictors — Group", fontweight='bold', fontsize=14, pad=20)
+            for i, (_, row) in enumerate(df_top_t.iterrows()):
+                ax.text(row["abs_r"] + 0.01, i, f"{row['abs_r']:.3f} (p={row['p_group']:.3f})", va='center', ha='left', fontsize=10)
+            ax.set_xlim(0, float(df_top_t["abs_r"].max()) * 1.25)
+            ax.grid(True, axis='x', alpha=0.3, linestyle='-', linewidth=0.5)
+            ax.set_axisbelow(True)
+            plt.tight_layout()
+            _save_fig(fig, gplots / f"group_top_{top_n}_temperature_predictors")
+            df_top_t[["channel", "band", "r_group", "p_group", "n_subjects", "abs_r"]].sort_values("abs_r", ascending=False).to_csv(
+                gstats / f"group_top_{top_n}_temperature_predictors.tsv", sep="\t", index=False
+            )
+        else:
+            logger.info("No significant group-level temperature predictors to plot for top-N.")
+    except Exception as e:
+        logger.warning(f"Top-N temperature predictors plotting failed: {e}")
+
+    # Group significant correlations topomap (rating)
+    try:
+        # Choose representative info from the first subject with epochs
+        info = None
+        for sub in subjects:
+            epo_path = _find_clean_epochs_path(sub, task)
+            if epo_path is not None and Path(epo_path).exists():
+                info = mne.read_epochs(epo_path, preload=False, verbose=False).info
+                break
+        if info is None:
+            logger.warning("No epochs found to build group topomap; skipping.")
+            return
+
+        # Prepare band data for topomap
+        bands_with_data = []
+        for band, dfb in bands_to_df.items():
+            chs = dfb["channel"].astype(str).tolist()
+            corrs = dfb["r_group"].to_numpy()
+            pvals = dfb["p_group"].to_numpy()
+            sig_mask = np.isfinite(pvals) & (pvals < BEHAV_FDR_ALPHA)
+            bands_with_data.append({
+                "band": band,
+                "channels": chs,
+                "correlations": corrs,
+                "p_values": pvals,
+                "significant_mask": sig_mask,
+            })
+        if not bands_with_data:
+            return
+        n_bands = len(bands_with_data)
+        fig, axes = plt.subplots(1, n_bands, figsize=(4.8 * n_bands, 4.8))
+        if n_bands == 1:
+            axes = [axes]
+        plt.subplots_adjust(left=0.06, right=0.98, top=0.92, bottom=0.16, wspace=0.08)
+
+        # Determine vlim
+        all_sig = []
+        for bd in bands_with_data:
+            all_sig.extend(bd["correlations"][bd["significant_mask"]])
+        finite_sig = np.array(all_sig, dtype=float)
+        finite_sig = finite_sig[np.isfinite(finite_sig)]
+        if finite_sig.size > 0:
+            vmax = float(np.max(np.abs(finite_sig)))
+        else:
+            all_vals = []
+            for bd in bands_with_data:
+                all_vals.extend(bd["correlations"][np.isfinite(bd["correlations"])])
+            vmax = float(np.max(np.abs(all_vals))) if all_vals else 0.5
+
+        successful = []
+        for i, bd in enumerate(bands_with_data):
+            ax = axes[i]
+            try:
+                picks = mne.pick_types(info, meg=False, eeg=True, exclude='bads')
+                if len(picks) == 0:
+                    raise ValueError("No EEG channels found in info")
+                n_info_chs = len(info['ch_names'])
+                topo_data = np.zeros(n_info_chs)
+                topo_mask = np.zeros(n_info_chs, dtype=bool)
+                for j, ch in enumerate(info['ch_names']):
+                    if ch in bd['channels']:
+                        idx = bd['channels'].index(ch)
+                        val = bd['correlations'][idx]
+                        topo_data[j] = val if np.isfinite(val) else 0.0
+                        topo_mask[j] = bool(bd['significant_mask'][idx])
+                im, _ = mne.viz.plot_topomap(
+                    topo_data[picks],
+                    mne.pick_info(info, picks),
+                    axes=ax,
+                    show=False,
+                    cmap='RdBu_r',
+                    vlim=(-vmax, vmax),
+                    contours=6,
+                    mask=topo_mask[picks],
+                    mask_params=dict(marker='o', markerfacecolor='white', markeredgecolor='black', linewidth=1, markersize=6)
+                )
+                successful.append(im)
+                n_sig = int(topo_mask[picks].sum())
+                n_total = int(np.sum([1 for ch in bd['channels'] if ch in info['ch_names']]))
+                ax.set_title(f"{bd['band'].upper()}\n{n_sig}/{n_total} significant", fontweight='bold', fontsize=12, pad=10)
+            except Exception as e:
+                logger.warning(f"Group topomap failed for band {bd['band']}: {e}")
+                ax.text(0.5, 0.5, f"{bd['band'].upper()}\nPlot failed", ha='center', va='center', transform=ax.transAxes,
+                        bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+                ax.set_title(f"{bd['band'].upper()}\n(Error)", fontweight='bold', pad=10)
+
+        plt.suptitle(f"Group Significant EEG-Pain Correlations (p < {BEHAV_FDR_ALPHA})", fontweight='bold', fontsize=14, y=0.97)
+        if successful:
+            left = min(ax.get_position().x0 for ax in axes)
+            right = max(ax.get_position().x1 for ax in axes)
+            bottom = min(ax.get_position().y0 for ax in axes)
+            span = right - left
+            cb_width = 0.55 * span
+            cb_left = left + 0.225 * span
+            cb_bottom = max(0.04, bottom - 0.06)
+            cax = fig.add_axes([cb_left, cb_bottom, cb_width, 0.028])
+            cbar = fig.colorbar(successful[-1], cax=cax, orientation='horizontal')
+            cbar.set_label('Correlation (ρ)', fontweight='bold', fontsize=11)
+            cbar.ax.tick_params(pad=2, labelsize=9)
+        _save_fig(fig, gplots / "group_significant_correlations_topomap")
+    except Exception as e:
+        logger.warning(f"Group significant topomap plotting failed: {e}")
+
+    # Group significant correlations topomap (temperature)
+    try:
+        if not bands_to_df_temp:
+            return
+        info = None
+        for sub in subjects:
+            epo_path = _find_clean_epochs_path(sub, task)
+            if epo_path is not None and Path(epo_path).exists():
+                info = mne.read_epochs(epo_path, preload=False, verbose=False).info
+                break
+        if info is None:
+            return
+        bands_with_data = []
+        for band, dfb in bands_to_df_temp.items():
+            chs = dfb["channel"].astype(str).tolist()
+            corrs = dfb["r_group"].to_numpy()
+            pvals = dfb["p_group"].to_numpy()
+            sig_mask = np.isfinite(pvals) & (pvals < BEHAV_FDR_ALPHA)
+            bands_with_data.append({
+                "band": band,
+                "channels": chs,
+                "correlations": corrs,
+                "p_values": pvals,
+                "significant_mask": sig_mask,
+            })
+        n_bands = len(bands_with_data)
+        fig, axes = plt.subplots(1, n_bands, figsize=(4.8 * n_bands, 4.8))
+        if n_bands == 1:
+            axes = [axes]
+        plt.subplots_adjust(left=0.06, right=0.98, top=0.92, bottom=0.16, wspace=0.08)
+        all_sig = []
+        for bd in bands_with_data:
+            all_sig.extend(bd["correlations"][bd["significant_mask"]])
+        finite_sig = np.array(all_sig, dtype=float)
+        finite_sig = finite_sig[np.isfinite(finite_sig)]
+        if finite_sig.size > 0:
+            vmax = float(np.max(np.abs(finite_sig)))
+        else:
+            all_vals = []
+            for bd in bands_with_data:
+                all_vals.extend(bd["correlations"][np.isfinite(bd["correlations"])])
+            vmax = float(np.max(np.abs(all_vals))) if all_vals else 0.5
+        successful = []
+        for i, bd in enumerate(bands_with_data):
+            ax = axes[i]
+            try:
+                picks = mne.pick_types(info, meg=False, eeg=True, exclude='bads')
+                if len(picks) == 0:
+                    raise ValueError("No EEG channels found in info")
+                n_info_chs = len(info['ch_names'])
+                topo_data = np.zeros(n_info_chs)
+                topo_mask = np.zeros(n_info_chs, dtype=bool)
+                for j, ch in enumerate(info['ch_names']):
+                    if ch in bd['channels']:
+                        idx = bd['channels'].index(ch)
+                        val = bd['correlations'][idx]
+                        topo_data[j] = val if np.isfinite(val) else 0.0
+                        topo_mask[j] = bool(bd['significant_mask'][idx])
+                im, _ = mne.viz.plot_topomap(
+                    topo_data[picks],
+                    mne.pick_info(info, picks),
+                    axes=ax,
+                    show=False,
+                    cmap='RdBu_r',
+                    vlim=(-vmax, vmax),
+                    contours=6,
+                    mask=topo_mask[picks],
+                    mask_params=dict(marker='o', markerfacecolor='white', markeredgecolor='black', linewidth=1, markersize=6)
+                )
+                successful.append(im)
+                n_sig = int(topo_mask[picks].sum())
+                n_total = int(np.sum([1 for ch in bd['channels'] if ch in info['ch_names']]))
+                ax.set_title(f"{bd['band'].upper()}\n{n_sig}/{n_total} significant", fontweight='bold', fontsize=12, pad=10)
+            except Exception as e:
+                ax.text(0.5, 0.5, f"{bd['band'].upper()}\nPlot failed", ha='center', va='center', transform=ax.transAxes,
+                        bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+                ax.set_title(f"{bd['band'].upper()}\n(Error)", fontweight='bold', pad=10)
+        plt.suptitle(f"Group Significant EEG-Temperature Correlations (p < {BEHAV_FDR_ALPHA})", fontweight='bold', fontsize=14, y=0.97)
+        if successful:
+            left = min(ax.get_position().x0 for ax in axes)
+            right = max(ax.get_position().x1 for ax in axes)
+            bottom = min(ax.get_position().y0 for ax in axes)
+            span = right - left
+            cb_width = 0.55 * span
+            cb_left = left + 0.225 * span
+            cb_bottom = max(0.04, bottom - 0.06)
+            cax = fig.add_axes([cb_left, cb_bottom, cb_width, 0.028])
+            cbar = fig.colorbar(successful[-1], cax=cax, orientation='horizontal')
+            cbar.set_label('Correlation (ρ)', fontweight='bold', fontsize=11)
+            cbar.ax.tick_params(pad=2, labelsize=9)
+        _save_fig(fig, gplots / "group_significant_correlations_topomap_temperature")
+    except Exception:
         pass
-    out_html = report_dir / f"report_sub-{subject}_task-{task}_behavior_features.html"
-    rep.save(out_html, overwrite=True, open_browser=False)
+
+
+def _group_overall_band_summary(
+    subjects: List[str],
+    task: str,
+    logger: logging.Logger,
+    use_spearman: bool,
+    pooling_strategy: str,
+    cluster_bootstrap: int,
+) -> None:
+    """Create group scatter summaries (overall power vs rating and temperature).
+
+    For each band, pools trials across subjects using the requested strategy and shows
+    a scatter with regression line. Saves one figure per band for each target:
+    - group_power_behavior_correlation_{band}
+    - group_power_temperature_correlation_{band} (when temperature is available)
+    """
+    # Build pooled 'overall' values (mean across channels per band) per subject
+    rating_x: Dict[str, List[np.ndarray]] = {}
+    rating_y: Dict[str, List[np.ndarray]] = {}
+    temp_x: Dict[str, List[np.ndarray]] = {}
+    temp_y: Dict[str, List[np.ndarray]] = {}
+    have_temp = False
+
+    for sub in subjects:
+        try:
+            pow_df, _conn_df, y, info = _load_features_and_targets(sub, task)
+            y = pd.to_numeric(y, errors="coerce")
+            epo_path = _find_clean_epochs_path(sub, task)
+            if epo_path is None:
+                continue
+            epochs = mne.read_epochs(epo_path, preload=False, verbose=False)
+            events = _load_events_df(sub, task)
+            aligned = _align_events_to_epochs(events, epochs) if events is not None else None
+        except Exception:
+            continue
+        ts = None
+        if aligned is not None:
+            tcol = _pick_first_column(aligned, PSYCH_TEMP_COLUMNS)
+            if tcol is not None:
+                ts = pd.to_numeric(aligned[tcol], errors="coerce")
+                have_temp = True
+        for band in POWER_BANDS_TO_USE:
+            cols = [c for c in pow_df.columns if c.startswith(f"pow_{band}_")]
+            if not cols:
+                continue
+            vals = pow_df[cols].apply(pd.to_numeric, errors="coerce").mean(axis=1).to_numpy()
+            rating_x.setdefault(band, []).append(vals)
+            rating_y.setdefault(band, []).append(y.to_numpy())
+            if ts is not None:
+                temp_x.setdefault(band, []).append(vals)
+                temp_y.setdefault(band, []).append(ts.to_numpy())
+
+    def _pool_xy(x_lists, y_lists, strategy: str):
+        vis_x = []
+        vis_y = []
+        for xi, yi in zip(x_lists, y_lists):
+            xi = pd.Series(xi)
+            yi = pd.Series(yi)
+            n = min(len(xi), len(yi))
+            xi = xi.iloc[:n]
+            yi = yi.iloc[:n]
+            m = xi.notna() & yi.notna()
+            xi = xi[m]
+            yi = yi[m]
+            if strategy == "within_subject_centered":
+                xi = xi - xi.mean()
+                yi = yi - yi.mean()
+            elif strategy == "within_subject_zscored":
+                sx = xi.std(ddof=1)
+                sy = yi.std(ddof=1)
+                if sx <= 0 or sy <= 0:
+                    continue
+                xi = (xi - xi.mean()) / sx
+                yi = (yi - yi.mean()) / sy
+            elif strategy == "fisher_by_subject":
+                xi = xi - xi.mean()
+                yi = yi - yi.mean()
+            vis_x.append(xi)
+            vis_y.append(yi)
+        X = pd.concat(vis_x, ignore_index=True) if vis_x else pd.Series(dtype=float)
+        Y = pd.concat(vis_y, ignore_index=True) if vis_y else pd.Series(dtype=float)
+        return X, Y
+
+    # Rating summary figures: one scatter per band per figure
+    n_bands = len(POWER_BANDS_TO_USE)
+    if n_bands > 0:
+        for band in POWER_BANDS_TO_USE:
+            x_lists = rating_x.get(band, [])
+            y_lists = rating_y.get(band, [])
+            if not x_lists or not y_lists:
+                continue
+            X, Y = _pool_xy(x_lists, y_lists, pooling_strategy)
+            if len(X) < 5:
+                continue
+            fig, ax = plt.subplots(figsize=(7.5, 5.5))
+            sns.regplot(
+                x=X,
+                y=Y,
+                ax=ax,
+                ci=95,
+                scatter_kws={
+                    "s": 25,
+                    "alpha": 0.7,
+                    "color": _get_band_color(band),
+                    "edgecolor": "white",
+                    "linewidths": 0.3,
+                },
+                line_kws={"color": "#666666", "lw": 1.5},
+            )
+            ax.set_xlabel(f"{band.capitalize()} Power\nlog10(power/baseline)")
+            ax.set_ylabel("Rating")
+            ax.set_title(f"{band.capitalize()} vs Rating")
+            try:
+                r, p = stats.spearmanr(X, Y, nan_policy="omit")
+                ax.text(
+                    0.02,
+                    0.98,
+                    f"Spearman ρ={r:.3f}\np={p:.3f}\nn={len(X)}",
+                    transform=ax.transAxes,
+                    va='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                )
+            except Exception:
+                pass
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            _save_fig(fig, _group_plots_dir() / f"group_power_behavior_correlation_{_sanitize(band)}")
+            plt.close(fig)
+
+    # Temperature summary figures: one scatter per band per figure
+    if have_temp and len(temp_x) > 0:
+        for band in POWER_BANDS_TO_USE:
+            x_lists = temp_x.get(band, [])
+            y_lists = temp_y.get(band, [])
+            if not x_lists or not y_lists:
+                continue
+            X, Y = _pool_xy(x_lists, y_lists, pooling_strategy)
+            if len(X) < 5:
+                continue
+            fig, ax = plt.subplots(figsize=(7.5, 5.5))
+            sns.regplot(
+                x=X,
+                y=Y,
+                ax=ax,
+                ci=95,
+                scatter_kws={
+                    "s": 25,
+                    "alpha": 0.7,
+                    "color": _get_band_color(band),
+                    "edgecolor": "white",
+                    "linewidths": 0.3,
+                },
+                line_kws={"color": "#666666", "lw": 1.5},
+            )
+            ax.set_xlabel(f"{band.capitalize()} Power\nlog10(power/baseline)")
+            # Clarify y-axis based on pooling strategy
+            if pooling_strategy == "within_subject_centered":
+                ax.set_ylabel("Temperature (°C, centered)")
+            elif pooling_strategy == "within_subject_zscored":
+                ax.set_ylabel("Temperature (z-scored)")
+            else:
+                ax.set_ylabel("Temperature (°C)")
+            ax.set_title(f"{band.capitalize()} vs Temp")
+            try:
+                r, p = stats.spearmanr(X, Y, nan_policy="omit")
+                ax.text(
+                    0.02,
+                    0.98,
+                    f"Spearman ρ={r:.3f}\np={p:.3f}\nn={len(X)}",
+                    transform=ax.transAxes,
+                    va='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                )
+            except Exception:
+                pass
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            _save_fig(fig, _group_plots_dir() / f"group_power_temperature_correlation_{_sanitize(band)}")
+            plt.close(fig)
+
+    # Group channel-level aggregation and visualizations
+    try:
+        _group_channel_level_visuals(subjects, task, logger)
+    except Exception as e:
+        logger.error(f"Group channel-level visuals failed: {e}")
 
 
 def _collect_subject_ids_with_features(root: Path) -> List[str]:
@@ -4773,9 +6403,11 @@ def main(
     n_perm: int = 0,
     do_group: bool = False,
     group_only: bool = False,
-    build_reports: bool = False,
     rng_seed: int = 42,
     all_subjects: bool = False,
+    pooling_strategy: str = "within_subject_centered",
+    cluster_bootstrap: int = 0,
+    group_subject_fixed_effects: bool = True,
 ):
     # Enforce CLI-provided subjects; allow --all-subjects to auto-detect from derivatives
     if all_subjects:
@@ -4783,7 +6415,7 @@ def main(
         if not subjects:
             raise ValueError(f"No subjects with features found in {DERIV_ROOT}")
     elif subjects is None or len(subjects) == 0:
-        raise ValueError("No subjects specified. Use --subjects or --all-subjects.")
+        raise ValueError("No subjects specified. Use --group all|A,B,C, or --subject (can repeat), or --all-subjects.")
     if not group_only:
         for sub in subjects:
             process_subject(
@@ -4793,20 +6425,50 @@ def main(
                 partial_covars=partial_covars,
                 bootstrap=bootstrap,
                 n_perm=n_perm,
-                build_report=build_reports,
                 rng_seed=rng_seed,
             )
     if do_group or group_only:
-        aggregate_group_level(subjects, task)
+        aggregate_group_level(
+            subjects,
+            task,
+            pooling_strategy=pooling_strategy,
+            cluster_bootstrap=int(cluster_bootstrap),
+            subject_fixed_effects=bool(group_subject_fixed_effects),
+        )
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG feature correlations")
-    subj_group = parser.add_mutually_exclusive_group(required=True)
-    subj_group.add_argument("--subjects", nargs="*", help="Subject IDs to process (e.g., 001 002)")
-    subj_group.add_argument("--all-subjects", action="store_true", help="Process all subjects with available features")
+    parser = argparse.ArgumentParser(description="Behavioral psychometrics and EEG feature correlations (single or multiple subjects)")
+
+    # Subject selection (mutually exclusive): --group, --subject(s), --all-subjects
+    sel = parser.add_mutually_exclusive_group(required=False)
+    sel.add_argument(
+        "--group", type=str,
+        help=(
+            "Group to process: 'all' or comma/space-separated subject labels without 'sub-' "
+            "(e.g., '0001,0002,0003')."
+        ),
+    )
+    sel.add_argument(
+        "--subject", "-s", type=str, action="append",
+        help=(
+            "BIDS subject label(s) without 'sub-' prefix (e.g., 0001). "
+            "Can be specified multiple times."
+        ),
+    )
+    sel.add_argument(
+        "--all-subjects", action="store_true",
+        help="Process all available subjects with features and targets",
+    )
+
+    # Deprecated alias (kept for backward compatibility). Used only if other selectors absent.
+    parser.add_argument(
+        "--subjects", nargs="*", default=None,
+        help="[Deprecated] Subject IDs list. Prefer --subject repeated or --group."
+    )
+
     parser.add_argument("--task", default=TASK, help="Task label (default from config)")
     parser.add_argument(
         "--bootstrap",
@@ -4820,18 +6482,108 @@ if __name__ == "__main__":
         default=42,
         help="Random seed for reproducible bootstrap and permutation tests",
     )
+    parser.add_argument(
+        "--pooling-strategy",
+        choices=["pooled", "centered", "zscored", "fisher"],
+        default="centered",
+        help=(
+            "Group pooling strategy for pooled scatters: "
+            "'pooled' (concatenate trials), 'centered' (within-subject mean-center then pool), "
+            "'zscored' (within-subject z-score then pool), or 'fisher' (aggregate subject-wise r via Fisher z)."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-bootstrap",
+        type=int,
+        default=BEHAV_BOOTSTRAP_N,
+        help=(
+            "Number of subject-level bootstrap resamples for pooled group r (0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--no-group-subject-fixed-effects",
+        action="store_false",
+        dest="group_subject_fixed_effects",
+        help="Disable subject fixed-effects (dummies) in group-level partial residuals",
+    )
+
     args = parser.parse_args()
 
-    main(
-        args.subjects,
-        task=args.task,
-        use_spearman=USE_SPEARMAN_DEFAULT,
-        partial_covars=PARTIAL_COVARS_DEFAULT,
-        bootstrap=args.bootstrap,
-        n_perm=N_PERM_DEFAULT,
-        do_group=DO_GROUP_DEFAULT,
-        group_only=GROUP_ONLY_DEFAULT,
-        build_reports=BUILD_REPORTS_DEFAULT,
-        rng_seed=args.rng_seed,
-        all_subjects=args.all_subjects,
-    )
+    # Resolve subjects according to 01/02 pattern
+    subjects: Optional[List[str]] = None
+    if args.group is not None:
+        g = args.group.strip()
+        if g.lower() in {"all", "*", "@all"}:
+            subjects = _collect_subject_ids_with_features(Path(DERIV_ROOT))
+        else:
+            cand = [s.strip() for s in g.replace(";", ",").replace(" ", ",").split(",") if s.strip()]
+            subjects = []
+            for s in cand:
+                feats = _features_dir(s)
+                if (feats / "features_eeg_direct.tsv").exists() and (feats / "target_vas_ratings.tsv").exists():
+                    subjects.append(s)
+                else:
+                    print(f"Warning: --group subject '{s}' has no features/targets; skipping")
+    elif args.all_subjects:
+        subjects = _collect_subject_ids_with_features(Path(DERIV_ROOT))
+    elif args.subject:
+        # De-duplicate while preserving order
+        _seen = set()
+        subjects = []
+        for s in args.subject:
+            if s not in _seen:
+                _seen.add(s)
+                subjects.append(s)
+    elif args.subjects:
+        # Deprecated alias fallback
+        subjects = list(dict.fromkeys(args.subjects))
+
+    if subjects is None or len(subjects) == 0:
+        print("No subjects provided. Use --group all|A,B,C, or --subject (repeatable), or --all-subjects.")
+        sys.exit(2)
+
+    # Auto-enable group aggregation when multiple subjects provided (mirrors 02)
+    if len(subjects) == 1:
+        main(
+            subjects,
+            task=args.task,
+            use_spearman=True,
+            partial_covars=PARTIAL_COVARS_DEFAULT,
+            bootstrap=args.bootstrap,
+            n_perm=N_PERM_DEFAULT,
+            do_group=False,
+            group_only=False,
+            rng_seed=args.rng_seed,
+            all_subjects=False,
+            pooling_strategy=(
+                "within_subject_centered" if args.pooling_strategy == "centered" else (
+                    "within_subject_zscored" if args.pooling_strategy == "zscored" else (
+                        "pooled_trials" if args.pooling_strategy == "pooled" else "fisher_by_subject"
+                    )
+                )
+            ),
+            cluster_bootstrap=int(args.cluster_bootstrap),
+            group_subject_fixed_effects=bool(getattr(args, "group_subject_fixed_effects", True)),
+        )
+    else:
+        main(
+            subjects,
+            task=args.task,
+            use_spearman=True,
+            partial_covars=PARTIAL_COVARS_DEFAULT,
+            bootstrap=args.bootstrap,
+            n_perm=N_PERM_DEFAULT,
+            do_group=True,
+            group_only=GROUP_ONLY_DEFAULT,
+            rng_seed=args.rng_seed,
+            all_subjects=False,
+            pooling_strategy=(
+                "within_subject_centered" if args.pooling_strategy == "centered" else (
+                    "within_subject_zscored" if args.pooling_strategy == "zscored" else (
+                        "pooled_trials" if args.pooling_strategy == "pooled" else "fisher_by_subject"
+                    )
+                )
+            ),
+            cluster_bootstrap=int(args.cluster_bootstrap),
+            group_subject_fixed_effects=bool(getattr(args, "group_subject_fixed_effects", True)),
+        )

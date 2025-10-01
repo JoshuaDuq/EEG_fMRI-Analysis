@@ -1,3 +1,9 @@
+"""
+DEPRECATED: This legacy config is kept for compatibility with coll_lab_eeg_pipeline
+and MNE-BIDS pipeline tooling. Most scripts now read configuration from
+eeg_pipeline/eeg_config.yaml via config_loader.py. Avoid adding new settings here.
+"""
+
 import os
 
 import numpy as np

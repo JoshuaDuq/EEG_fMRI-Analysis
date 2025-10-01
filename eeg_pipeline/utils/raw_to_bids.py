@@ -53,6 +53,17 @@ def parse_subject_id(path: Path) -> str:
     return m.group(1)
 
 
+def _extract_run_label(name: str) -> Optional[int]:
+    """Extract run number from a filename (e.g., '..._run-02_...')."""
+    m = re.search(r"run-?(\d+)", name, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
 def events_from_raw_annotations(raw: mne.io.BaseRaw) -> Tuple[Optional[np.ndarray], Optional[dict]]:
     """Derive events and an auto event_id from raw annotations.
 
@@ -229,6 +240,141 @@ def convert_one(
         **kwargs,
     )
 
+    # Post-process events.tsv to add a 'sample' column for robust later alignment
+    try:
+        sf = float(raw.info.get("sfreq", 0.0))
+        if sf > 0:
+            ev_bp = bids_path.copy().update(suffix="events", extension=".tsv")
+            ev_path = ev_bp.fpath
+            if ev_path is not None and ev_path.exists():
+                import pandas as _pd, numpy as _np
+                ev = _pd.read_csv(ev_path, sep="\t")
+                # Add 'sample' if missing
+                if "onset" in ev.columns and "sample" not in ev.columns:
+                    samp = _pd.to_numeric(ev["onset"], errors="coerce") * sf
+                    samp = samp.round().astype("Int64")
+                    ev["sample"] = samp
+                    ev.to_csv(ev_path, sep="\t", index=False)
+                # Write/update per-subject integrity TSV summarizing this run's events
+                try:
+                    sub = parse_subject_id(ev_path)
+                except Exception:
+                    sub = parse_subject_id(vhdr_path)
+                # Determine run label
+                run_label = run_idx if run_idx is not None else _extract_run_label(ev_path.name) if 'run' in ev.columns else None
+                # Metrics
+                n_rows = int(len(ev))
+                has_sample = int("sample" in ev.columns)
+                n_miss_onset = int(ev.get("onset").isna().sum()) if "onset" in ev.columns else n_rows
+                n_miss_duration = int(ev.get("duration").isna().sum()) if "duration" in ev.columns else n_rows
+                n_miss_tt = int(ev.get("trial_type").isna().sum()) if "trial_type" in ev.columns else n_rows
+                uniq_tt = []
+                if "trial_type" in ev.columns:
+                    try:
+                        uniq_tt = sorted({str(x) for x in ev["trial_type"].dropna().unique().tolist()})
+                    except Exception:
+                        uniq_tt = []
+                on_min = float(_pd.to_numeric(ev.get("onset"), errors="coerce").min()) if "onset" in ev.columns else _np.nan
+                on_max = float(_pd.to_numeric(ev.get("onset"), errors="coerce").max()) if "onset" in ev.columns else _np.nan
+                nonmono = False
+                if "onset" in ev.columns:
+                    try:
+                        ons = _pd.to_numeric(ev["onset"], errors="coerce").to_numpy()
+                        dif = _np.diff(ons)
+                        nonmono = bool(_np.any(dif < -1e-9))
+                    except Exception:
+                        nonmono = False
+                neg_on = int((_pd.to_numeric(ev.get("onset"), errors="coerce") < 0).sum()) if "onset" in ev.columns else 0
+                # Append row to subject integrity file in the eeg directory
+                integ_path = ev_path.parent / f"sub-{sub}_task-{task}_events_integrity.tsv"
+                row = _pd.DataFrame([
+                    {
+                        "subject": sub,
+                        "run": run_label,
+                        "n_rows": n_rows,
+                        "has_sample": has_sample,
+                        "n_missing_onset": n_miss_onset,
+                        "n_missing_duration": n_miss_duration,
+                        "n_missing_trial_type": n_miss_tt,
+                        "unique_trial_types": "|".join(uniq_tt),
+                        "onset_min": on_min,
+                        "onset_max": on_max,
+                        "onset_nonmonotonic": int(nonmono),
+                        "negative_onsets": int(neg_on),
+                    }
+                ])
+                header = not integ_path.exists()
+                row.to_csv(integ_path, sep="\t", index=False, mode=("w" if header else "a"), header=header)
+
+                # Create minimal events JSON sidecar describing columns
+                try:
+                    ev_json_bp = ev_bp.copy().update(extension=".json")
+                    ev_json_path = ev_json_bp.fpath
+                    if ev_json_path is not None:
+                        ev_desc = {
+                            "onset": {
+                                "LongName": "Event onset",
+                                "Description": "Onset of the event relative to the start of the recording",
+                                "Units": "s",
+                            },
+                            "duration": {
+                                "LongName": "Event duration",
+                                "Description": "Duration of the event",
+                                "Units": "s",
+                            },
+                            "trial_type": {
+                                "LongName": "Event label",
+                                "Description": "Categorical event label indicating experimental condition",
+                            },
+                            "sample": {
+                                "LongName": "Sample index",
+                                "Description": "Sample index corresponding to the event onset",
+                                "Units": "samples",
+                            },
+                        }
+                        import json as _json
+                        with open(ev_json_path, "w", encoding="utf-8") as f:
+                            _json.dump(ev_desc, f, indent=2)
+                except Exception:
+                    pass
+
+                # Normalize channels.tsv types and status
+                try:
+                    ch_bp = bids_path.copy().update(suffix="channels", extension=".tsv")
+                    ch_path = ch_bp.fpath
+                    if ch_path is not None and ch_path.exists():
+                        ch = _pd.read_csv(ch_path, sep="\t")
+                        # Canonicalize Type: uppercase known entries; map GSR to MISC
+                        if "type" in ch.columns:
+                            types = ch["type"].astype(str).str.upper()
+                            # If channel name equals GSR (case-insensitive), set type to MISC
+                            name_is_gsr = ch.get("name", _pd.Series([None]*len(ch))).astype(str).str.upper().eq("GSR")
+                            types = types.where(~name_is_gsr, other="MISC")
+                            # Normalize common types
+                            types = types.replace({
+                                "EEG": "EEG",
+                                "EOG": "EOG",
+                                "EMG": "EMG",
+                                "ECG": "ECG",
+                                "GSR": "MISC",
+                                "MISC": "MISC",
+                            })
+                            ch["type"] = types
+                        # Fill missing status with 'good' and normalize case
+                        if "status" in ch.columns:
+                            status = ch["status"].astype(str).str.lower()
+                            status = status.where(~status.isin(["", "nan", "none"]), other="good")
+                            status = status.replace({"ok": "good"})
+                            ch["status"] = status
+                        else:
+                            ch["status"] = "good"
+                        ch.to_csv(ch_path, sep="\t", index=False)
+                except Exception:
+                    pass
+    except Exception:
+        # Do not fail conversion if event patching fails
+        pass
+
     return bids_path
 
 
@@ -305,6 +451,24 @@ def main():
             print(f"[{i}/{len(vhdrs)}] Wrote: {rel}")
         except Exception as e:
             print(f"[{i}/{len(vhdrs)}] Failed: {vhdr} -> {e}")
+
+    # Optionally summarize per-subject integrity files per subject
+    try:
+        by_sub = {}
+        for bp in written:
+            if bp is None:
+                continue
+            s = bp.subject
+            if not s:
+                continue
+            by_sub.setdefault(s, True)
+        for s in sorted(by_sub.keys()):
+            subj_eeg = bids_root / f"sub-{s}" / "eeg"
+            integ = subj_eeg / f"sub-{s}_task-{task}_events_integrity.tsv"
+            if integ.exists():
+                print(f"Integrity summary for sub-{s}: {integ}")
+    except Exception:
+        pass
 
     print(f"Done. Converted {len(written)} file(s) to BIDS in: {bids_root}")
 

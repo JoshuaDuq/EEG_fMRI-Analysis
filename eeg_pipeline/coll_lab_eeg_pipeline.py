@@ -1,10 +1,11 @@
 import importlib
+import re
 import os
 
 import mne
 import pandas as pd
 import pyprep
-from mne_bids import BIDSPath, get_entities_from_fname
+from mne_bids import BIDSPath, get_entities_from_fname, read_raw_bids
 from mne_icalabel import label_components
 
 os.environ["PYTHONUTF8"] = "1"
@@ -97,6 +98,9 @@ def reject_bad_segs(raw, annot_to_reject="", delete_non_bads=True):
             )
         )
 
+    # If no valid segments were identified, return the original recording
+    if len(raw_segs) == 0:
+        return raw.copy(), 1
     return mne.concatenate_raws(raw_segs), len(raw_segs)
 
 
@@ -177,9 +181,9 @@ def run_bads_detection(
     )
     eeg_files.sort()
     # For some datasets, same file is in sourcedata, root or derivatives because dataset is a modified BIDS
-    # Remove sourcedata and derivatives files
+    # Remove sourcedata and derivatives files (must exclude both)
     eeg_files = [
-        f for f in eeg_files if "sourcedata" not in f or "derivatives" not in f
+        f for f in eeg_files if ("sourcedata" not in f and "derivatives" not in f)
     ]
     if subjects != "all":
         # If subjects is not 'all', filter the eeg_files list
@@ -243,9 +247,15 @@ def run_bads_detection(
                     )
                 )
                 # Load corresponding chan file
-                chan_file = pd.read_csv(
-                    file.replace("_eeg.vhdr", "_channels.tsv"), sep="\t"
-                )
+                # Robustly derive channels.tsv alongside the EEG file: replace terminal '_eeg.<ext>' with '_channels.tsv'
+                chan_path = re.sub(r"_eeg\.[^.]+$", "_channels.tsv", file)
+                if not os.path.exists(chan_path):
+                    raise FileNotFoundError(
+                        f"channels.tsv not found alongside EEG file: {chan_path}. "
+                        f"Expected for subject {get_entities_from_fname(file).get('subject')} "
+                        f"session {get_entities_from_fname(file).get('session')}."
+                    )
+                chan_file = pd.read_csv(chan_path, sep="\t")
 
                 # Add participant_id and session to bads_frame
                 bads_frame.loc[file, "participant_id"] = get_entities_from_fname(file)[
@@ -289,25 +299,52 @@ def run_bads_detection(
                     chan_file["type"].isin(["MISC", "misc"]), "name"
                 ].tolist()
 
-                # For painlaval quick fix, remove later. IF GSR in type, replace with misc
-                if "GSR" in chan_file["name"].tolist():
-                    chan_file.loc[chan_file["type"] == "GSR", "type"] = "MISC"
-                    misc_chans = misc_chans + ["GSR"]
+                # Normalize GSR channels to MISC robustly (handle either in name or type columns)
+                try:
+                    is_gsr = (chan_file["name"].astype(str).str.upper() == "GSR") | (
+                        chan_file["type"].astype(str).str.upper() == "GSR"
+                    )
+                    if is_gsr.any():
+                        chan_file.loc[is_gsr, "type"] = "MISC"
+                        gsr_names = chan_file.loc[is_gsr, "name"].astype(str).tolist()
+                        misc_chans = list(sorted(set(misc_chans + gsr_names)))
+                except Exception:
+                    pass
 
-                # read input data
-                raw = mne.io.read_raw(
-                    file,
-                    preload=True,
-                    verbose=False,
-                    eog=eog_chans,
-                    misc=misc_chans + ecg_chans + emg_chans,
-                )
+                # Read input data; prefer MNE-BIDS to load types + electrodes when available
+                try:
+                    ents = get_entities_from_fname(file)
+                    bp = BIDSPath(
+                        root=bids_path,
+                        subject=ents.get("subject"),
+                        session=ents.get("session"),
+                        task=ents.get("task"),
+                        datatype="eeg",
+                        suffix="eeg",
+                        extension=file_extension,
+                        check=False,
+                    )
+                    raw = read_raw_bids(bp, verbose=False)
+                    raw.load_data()
+                except Exception:
+                    raw = mne.io.read_raw(
+                        file,
+                        preload=True,
+                        verbose=False,
+                        eog=eog_chans,
+                        misc=misc_chans + ecg_chans + emg_chans,
+                    )
                 assert isinstance(raw, mne.io.BaseRaw)
 
-                raw.set_montage(montage)
+                # Only set a template montage if no electrode locations are present
+                try:
+                    if raw.get_montage() is None and raw.info.get("dig") is None:
+                        raw.set_montage(montage)
+                except Exception:
+                    pass
 
                 if l_pass:
-                    raw.filter(None, l_pass)
+                    raw.filter(None, l_pass, picks="eeg", verbose=False)
                 if notch:
                     raw.notch_filter(notch, picks="eeg", verbose=False)
 
@@ -315,7 +352,7 @@ def run_bads_detection(
                 if consider_previous_bads:
                     raw.info["bads"] = list(set(raw.info["bads"] + previous_bads))
 
-                # Annotate breaks
+                # Annotate breaks (do not crop to avoid introducing discontinuities for PyPREP)
                 if delete_breaks:
                     annot_breaks = mne.preprocessing.annotate_break(
                         raw=raw,
@@ -328,27 +365,12 @@ def run_bads_detection(
                             "New Segment",
                         ),
                     )
-                    raw.set_annotations(raw.annotations + annot_breaks)
-
+                    # Do not add BAD_break annotations to raw before PyPREP to avoid incompatibilities
+                    n_blocks = len(annot_breaks)
                     original_dur = raw.times[-1]
-
-                    # We remove the breaks from the data because pyprep
-                    # is not yet able to handle "BAD_break" annotations
-                    # This creates discontinuities in the data but should
-                    # not affect the bad channel detection too much
-                    raw, n_blocks = reject_bad_segs(raw, annot_to_reject="BAD_break")
-
-                    new_dur = raw.times[-1]
-                    msg = f"Found {len(annot_breaks)} breaks and in the data and {n_blocks} valid segments."
-                    logger.info(
-                        **gen_log_kwargs(
-                            message=msg,
-                            subject=get_entities_from_fname(file)["subject"],
-                            session=get_entities_from_fname(file)["session"],
-                            emoji="⚠️",
-                        )
-                    )
-                    msg = f"Removed {original_dur - new_dur} s of breaks from the data."
+                    # Approximate total removed duration as the sum of break durations
+                    removed_dur = float(np.sum(annot_breaks.duration)) if len(annot_breaks) else 0.0
+                    msg = f"Found {len(annot_breaks)} breaks in the data; not cropping prior to PyPREP."
                     logger.info(
                         **gen_log_kwargs(
                             message=msg,
@@ -358,7 +380,7 @@ def run_bads_detection(
                         )
                     )
                     bads_frame.loc[file, "n_breaks_found"] = len(annot_breaks)
-                    bads_frame.loc[file, "recording_duration"] = original_dur - new_dur
+                    bads_frame.loc[file, "removed_breaks_duration"] = removed_dur
 
                 # Rename bad boundary annotations
                 if rename_anot_dict:
@@ -443,18 +465,18 @@ def run_bads_detection(
                             "Bad channel from custom bad channel list"
                         )
 
-                # Save the file
+                # Save using robustly derived channels.tsv path
                 if overwrite_chans_tsv:
                     chan_file.to_csv(
-                        file.replace("_eeg.vhdr", "_channels.tsv"),
+                        chan_path,
                         sep="\t",
                         index=False,
                     )
                 else:
+                    import os as _os
+                    base, _ext = _os.path.splitext(chan_path)
                     chan_file.to_csv(
-                        file.replace("_eeg.vhdr", "_channels.tsv").replace(
-                            ".tsv", "_bad_channels.tsv"
-                        ),
+                        base + "_bad_channels.tsv",
                         sep="\t",
                         index=False,
                     )
@@ -731,7 +753,7 @@ def run_ica_label(
     else:
         bad_ica_frames = []
         for p in ica_files:
-            _run_ica_label(p)
+            # Execute once per file and collect the result
             bad_ica_frames.append(_run_ica_label(p))
 
     if len(bad_ica_frames) > 1:
@@ -1187,27 +1209,32 @@ def compute_features(
                 )
             )
 
-            # Zero pad the data to required duration to get the desired frequency resolution
-            pad_s = (
-                1 / freq_res
-            )  # Padding necessary to get the desired frequency resolution
+            # Optional zero-padding guard: avoid negative padding and prefer multitaper bandwidth control
+            pad_s = 1 / freq_res
             epo_dur = clean_epo.get_data().shape[2] / clean_epo.info["sfreq"]
-            n_pad = int(int((pad_s - epo_dur) * clean_epo.info["sfreq"]) / 2)
-            clean_epo_padded = mne.EpochsArray(
-                np.pad(
-                    clean_epo.get_data(),
-                    pad_width=((0, 0), (0, 0), (n_pad, n_pad)),
-                    mode="constant",
-                    constant_values=0,
-                ),
-                info=clean_epo.info,
-                tmin=-pad_s / 2,
-                verbose=False,
-            )
+            if epo_dur < pad_s:
+                n_pad = int(int((pad_s - epo_dur) * clean_epo.info["sfreq"]) / 2)
+                clean_epo_padded = mne.EpochsArray(
+                    np.pad(
+                        clean_epo.get_data(),
+                        pad_width=((0, 0), (0, 0), (n_pad, n_pad)),
+                        mode="constant",
+                        constant_values=0,
+                    ),
+                    info=clean_epo.info,
+                    tmin=-pad_s / 2,
+                    verbose=False,
+                )
+            else:
+                clean_epo_padded = clean_epo
 
             # Compute power spectral density (and average across epochs)
             psd = clean_epo_padded.compute_psd(
-                method="multitaper", n_jobs=-1, fmin=psd_freqmin, fmax=psd_freqmax
+                method="multitaper",
+                n_jobs=-1,
+                fmin=psd_freqmin,
+                fmax=psd_freqmax,
+                bandwidth=freq_res,
             ).average()
             # Save PSD
             psd.save(
@@ -1231,10 +1258,12 @@ def compute_features(
                     )
                 )
 
-                # For connectivity, use the rest epochs
-                clean_epo_connectivity = clean_epo.copy().set_eeg_reference(
-                    projection=True
-                )
+                # For connectivity, use the rest epochs and apply average reference projection
+                clean_epo_connectivity = clean_epo.copy().set_eeg_reference(projection=True)
+                try:
+                    clean_epo_connectivity.apply_proj()
+                except Exception:
+                    pass
         else:
             # Task-based behavior - process each condition separately
             # We will iterate through the original event IDs and sanitize them inside the loop.
@@ -1300,7 +1329,11 @@ def compute_features(
 
                 # Compute the PSD. It will inherit the sanitized event_id.
                 psd = clean_epo_padded.compute_psd(
-                    method="multitaper", n_jobs=-1, fmin=psd_freqmin, fmax=psd_freqmax
+                    method="multitaper",
+                    n_jobs=-1,
+                    fmin=psd_freqmin,
+                    fmax=psd_freqmax,
+                    bandwidth=freq_res,
                 )
 
                 # This save operation will now succeed.
@@ -1368,10 +1401,14 @@ def compute_features(
                     trial_row["alpha_peak_global"] = psd.freqs[freqRange][peak]
                     trial_row["alpha_peak_global_usedmax"] = used_max_global
 
-                    # Center of gravity
-                    trial_row["alpha_cog_global"] = np.sum(
-                        np.multiply(avgpow_trial[freqRange], psd.freqs[freqRange])
-                    ) / np.sum(avgpow_trial[freqRange])
+                    # Center of gravity (guard against zero/near-zero denominator)
+                    denom = np.sum(avgpow_trial[freqRange])
+                    if denom > 1e-20:
+                        trial_row["alpha_cog_global"] = (
+                            np.sum(np.multiply(avgpow_trial[freqRange], psd.freqs[freqRange])) / denom
+                        )
+                    else:
+                        trial_row["alpha_cog_global"] = np.nan
 
                     # Same for somatosensory channels
                     if somato_chans:
@@ -1392,11 +1429,18 @@ def compute_features(
 
                         trial_row["alpha_peak_somato"] = psd.freqs[freqRange][peak]
                         trial_row["alpha_peak_somato_usedmax"] = used_max_somato
-                        trial_row["alpha_cog_somato"] = np.sum(
-                            np.multiply(
-                                avgpow_somato_trial[freqRange], psd.freqs[freqRange]
+                        denom_s = np.sum(avgpow_somato_trial[freqRange])
+                        if denom_s > 1e-20:
+                            trial_row["alpha_cog_somato"] = (
+                                np.sum(
+                                    np.multiply(
+                                        avgpow_somato_trial[freqRange], psd.freqs[freqRange]
+                                    )
+                                )
+                                / denom_s
                             )
-                        ) / np.sum(avgpow_somato_trial[freqRange])
+                        else:
+                            trial_row["alpha_cog_somato"] = np.nan
 
                     # Compute ROI features for alpha band (per-trial)
                     # Use configurable ROI channels or default if not provided
@@ -1528,11 +1572,18 @@ def compute_features(
                                 peak
                             ]
                             trial_row[f"alpha_peak_{roi_name}_usedmax"] = used_max_roi
-                            trial_row[f"alpha_cog_{roi_name}"] = np.sum(
-                                np.multiply(
-                                    avgpow_roi_trial[freqRange], psd.freqs[freqRange]
+                            denom_r = np.sum(avgpow_roi_trial[freqRange])
+                            if denom_r > 1e-20:
+                                trial_row[f"alpha_cog_{roi_name}"] = (
+                                    np.sum(
+                                        np.multiply(
+                                            avgpow_roi_trial[freqRange], psd.freqs[freqRange]
+                                        )
+                                    )
+                                    / denom_r
                                 )
-                            ) / np.sum(avgpow_roi_trial[freqRange])
+                            else:
+                                trial_row[f"alpha_cog_{roi_name}"] = np.nan
 
                     # --- NEW: Compute ROI power for all frequency bands (per-trial) ---
                     for band in freq_bands:
@@ -1613,6 +1664,10 @@ def compute_features(
                     clean_epo_connectivity = (
                         epochs_for_condition.copy().set_eeg_reference(projection=True)
                     )
+                    try:
+                        clean_epo_connectivity.apply_proj()
+                    except Exception:
+                        pass
 
                     # NOTE maybe should download instead
                     pos = pd.read_csv(sourcecoords_file)
@@ -1621,7 +1676,6 @@ def compute_features(
 
                     # Divide to convert mm to m
                     pos_coord["rr"] = np.array([pos["R"], pos["A"], pos["S"]]).T / 1000
-                    pos_coord["nn"] = np.array([pos["R"], pos["A"], pos["S"]]).T / 1000
                     labels = pos["ROI Name"]
 
                     # Setup the source space
@@ -1663,151 +1717,155 @@ def compute_features(
                             cov,
                             reg=0.05,
                             pick_ori="max-power",
-                            rank=None,
+                            rank='info',
                         )
 
-                        # Apply the spatial filter
+                        # Apply the spatial filter to obtain per-epoch source estimates
                         stcs = apply_lcmv_epochs(clean_epo_band, filters)
 
-                        # Compute connectivity PER TRIAL using robust MNE methods
+                        # Compute connectivity PER TRIAL using validated MNE methods
                         # Initialize arrays to collect all trial connectivity matrices
                         all_aec_matrices = []
                         all_wpli_matrices = []
+
+                        # Try importing spectral_connectivity (array API); fallback is to skip wPLI if unavailable
+                        try:
+                            from mne_connectivity import spectral_connectivity as _spectral_connectivity
+                            _has_sc = True
+                        except Exception:
+                            _has_sc = False
 
                         for trial_idx in range(len(stcs)):
                             # Get single trial source estimate
                             stc_trial = stcs[trial_idx]
 
-                            # For AEC, apply hilbert transform to get envelope
-                            stc_hilbert = stc_trial.copy().apply_hilbert(envelope=True)
-                            vtcs_trial = stc_hilbert.data[np.newaxis, :, :]
+                            # For AEC, apply Hilbert transform to get amplitude envelopes
+                            stc_env = stc_trial.copy().apply_hilbert(envelope=True)
+                            vtcs_trial_env = stc_env.data[np.newaxis, :, :]  # (1, n_vertices, n_times)
 
-                            # Compute AEC for this single trial using proper MNE method
+                            # Compute AEC for this single trial using mne-connectivity
                             con_aec_trial = envelope_correlation(
-                                data=vtcs_trial, orthogonalize="pairwise", verbose=False
-                            )
-                            con_aec_trial = (
-                                con_aec_trial.combine()
-                            )  # Combine connectivity data over epochs
+                                data=vtcs_trial_env, orthogonalize="pairwise", verbose=False
+                            ).combine()
 
-                            # Get the AEC matrix for this trial
-                            con_aec_matrix_trial = con_aec_trial.get_data(
-                                output="dense"
-                            )[:, :, 0]
-                            con_aec_matrix_trial /= 0.577  # normalization because of under-estimation through orthogonalization
-                            con_aec_matrix_trial[np.triu_indices(len(labels), 0)] = (
-                                np.nan
-                            )
+                            aec_matrix = con_aec_trial.get_data(output="dense")[:, :, 0]
+                            # Mask diagonal/upper triangle for saving/metrics consistency
+                            aec_matrix[np.triu_indices(len(labels), 0)] = np.nan
 
-                            # Collect AEC matrix for this trial
                             if "aec" in connectivity_methods:
-                                all_aec_matrices.append(con_aec_matrix_trial)
+                                all_aec_matrices.append(aec_matrix)
 
-                            # For wPLI, we need to use proper MNE spectral_connectivity_epochs
-                            # Since we can't compute wPLI on a single trial, we'll use a sliding window approach
-                            # or compute connectivity with the single trial and a reference
-                            # For now, we'll compute a simplified connectivity measure for wPLI
-                            # We'll use the phase information from the single trial
-                            if "wpli" in connectivity_methods:
-                                stc_phase = stc_trial.copy().apply_hilbert(
-                                    envelope=False
-                                )
-                                phase_data = np.angle(stc_phase.data)
-
-                                # Compute phase difference matrix for this trial
-                                n_vertices = phase_data.shape[0]
-                                phase_diff_matrix = np.zeros((n_vertices, n_vertices))
-
-                                for i in range(n_vertices):
-                                    for j in range(i + 1, n_vertices):
-                                        phase_diff = phase_data[i, :] - phase_data[j, :]
-                                        # Compute phase locking value
-                                        plv = np.abs(np.mean(np.exp(1j * phase_diff)))
-                                        phase_diff_matrix[i, j] = plv
-                                        phase_diff_matrix[j, i] = plv
-
-                                # Mask upper triangle for consistency
-                                phase_diff_matrix[np.triu_indices(len(labels), 0)] = (
-                                    np.nan
-                                )
-
-                                # Collect wPLI matrix for this trial
-                                all_wpli_matrices.append(phase_diff_matrix)
+                            # For wPLI, use debiased wPLI from mne-connectivity on the trial time series
+                            if "wpli" in connectivity_methods and _has_sc:
+                                # Use raw (non-envelope) analytic signal per trial
+                                vtcs_trial = stc_trial.data[np.newaxis, :, :]  # (1, n_vertices, n_times)
+                                try:
+                                    con_wpli = _spectral_connectivity(
+                                        data=vtcs_trial,
+                                        method="wpli2_debiased",
+                                        sfreq=clean_epo_band.info["sfreq"],
+                                        fmin=freq_bands[band][0],
+                                        fmax=freq_bands[band][1],
+                                        faverage=True,
+                                        verbose=False,
+                                    ).combine()
+                                    wpli_matrix = con_wpli.get_data(output="dense")[:, :, 0]
+                                    wpli_matrix[np.triu_indices(len(labels), 0)] = np.nan
+                                    all_wpli_matrices.append(wpli_matrix)
+                                except Exception as _e:
+                                    logger.warning(
+                                        **gen_log_kwargs(
+                                            message=f"wPLI computation failed for trial {trial_idx}: {_e}",
+                                            subject=sub_num.replace("sub-", ""),
+                                            session=session,
+                                            emoji="⚠️",
+                                        )
+                                    )
 
                             # Compute graph metrics for each connectivity matrix (per trial) using BCT
                             for conn_measure in connectivity_methods:
                                 if conn_measure == "wpli":
-                                    conn_matrix = phase_diff_matrix.copy()
+                                    if not all_wpli_matrices:
+                                        continue
+                                    conn_matrix = all_wpli_matrices[-1].copy()
                                 else:
-                                    conn_matrix = con_aec_matrix_trial.copy()
+                                    conn_matrix = all_aec_matrices[-1].copy()
 
-                                # Threshold by the configurable percentage of the connectivity values
-                                sortedValues = np.sort(np.abs(conn_matrix.flatten()))
-                                # Remove NaNs
-                                sortedValues = sortedValues[~np.isnan(sortedValues)]
-                                # Get the threshold
-                                threshold = sortedValues[
-                                    int(connectivity_threshold * len(sortedValues))
-                                ]
-                                # Binarize the matrix
-                                adjacency_matrix = np.abs(conn_matrix) >= threshold
+                                # Prepare values for thresholding (ignore NaNs)
+                                vals = np.abs(conn_matrix).flatten()
+                                vals = vals[~np.isnan(vals)]
+                                if vals.size == 0:
+                                    continue
 
-                                # Compute graph metrics using BCT (robust, validated methods)
-                                # Degree - Number of connections of each node
-                                degree = bct.degree.degrees_und(adjacency_matrix)
-                                # Clustering coefficient - The percentage of existing triangles surrounding
-                                cc = bct.clustering.clustering_coef_bu(adjacency_matrix)
-                                # Global clustering coefficient
-                                gcc = np.mean(cc)
-                                # Characteristic path length
-                                distance = bct.distance.distance_bin(adjacency_matrix)
-                                cpl = bct.distance.charpath(distance, 0, 0)[0]
-                                # Global efficiency - The average of the inverse shortest path between two points
-                                geff = bct.efficiency.efficiency_bin(adjacency_matrix)
+                                # Allow multiple densities for sensitivity analysis
+                                if isinstance(connectivity_threshold, (list, tuple, np.ndarray)):
+                                    thresholds_list = list(connectivity_threshold)
+                                else:
+                                    thresholds_list = [connectivity_threshold]
 
-                                # Store graph metrics in features frame for this specific trial
-                                trial_row_idx = (
-                                    len(features_frame)
-                                    - len(trial_features)
-                                    + trial_idx
-                                )
-                                if "density" in graph_metrics:
-                                    features_frame.loc[
-                                        trial_row_idx, f"{band}_{conn_measure}_density"
-                                    ] = np.mean(degree)
-                                if "clustering" in graph_metrics:
-                                    features_frame.loc[
-                                        trial_row_idx,
-                                        f"{band}_{conn_measure}_clustering",
-                                    ] = gcc
-                                if "path_length" in graph_metrics:
-                                    features_frame.loc[
-                                        trial_row_idx,
-                                        f"{band}_{conn_measure}_path_length",
-                                    ] = cpl
-                                if "efficiency" in graph_metrics:
-                                    features_frame.loc[
-                                        trial_row_idx,
-                                        f"{band}_{conn_measure}_efficiency",
-                                    ] = geff
+                                for thr in thresholds_list:
+                                    thr = float(thr)
+                                    thr = min(max(thr, 0.0), 1.0)
+                                    # Determine absolute threshold at the given quantile
+                                    idx = int(thr * len(vals))
+                                    idx = min(max(idx, 0), len(vals) - 1)
+                                    cutoff = np.sort(vals)[idx]
 
-                                # Add small-worldness for per-trial (same as old pipeline)
-                                # Compute small-worldness for this trial
-                                randN = bct.makerandCIJ_und(
-                                    len(adjacency_matrix),
-                                    int(np.floor(np.sum(adjacency_matrix) / 2)),
-                                )
-                                gcc_rand = np.mean(
-                                    bct.clustering.clustering_coef_bu(randN)
-                                )
-                                cpl_rand = bct.distance.charpath(
-                                    bct.distance.distance_bin(randN), 0, 0
-                                )[0]
-                                smallworldness = (gcc / gcc_rand) / (cpl / cpl_rand)
-                                features_frame.loc[
-                                    trial_row_idx,
-                                    f"{band}_{conn_measure}_smallworldness",
-                                ] = smallworldness
+                                    # Binarize
+                                    adjacency_matrix = np.abs(conn_matrix) >= cutoff
+
+                                    # Compute graph metrics using BCT
+                                    degree = bct.degree.degrees_und(adjacency_matrix)
+                                    cc = bct.clustering.clustering_coef_bu(adjacency_matrix)
+                                    gcc = np.mean(cc)
+                                    distance = bct.distance.distance_bin(adjacency_matrix)
+                                    cpl = bct.distance.charpath(distance, 0, 0)[0]
+                                    geff = bct.efficiency.efficiency_bin(adjacency_matrix)
+
+                                    trial_row_idx = (
+                                        len(features_frame) - len(trial_features) + trial_idx
+                                    )
+                                    dens_tag = f"dens{int(round(thr*100))}"
+                                    if "density" in graph_metrics:
+                                        features_frame.loc[
+                                            trial_row_idx,
+                                            f"{band}_{conn_measure}_{dens_tag}_density",
+                                        ] = np.mean(degree)
+                                    if "clustering" in graph_metrics:
+                                        features_frame.loc[
+                                            trial_row_idx,
+                                            f"{band}_{conn_measure}_{dens_tag}_clustering",
+                                        ] = gcc
+                                    if "path_length" in graph_metrics:
+                                        features_frame.loc[
+                                            trial_row_idx,
+                                            f"{band}_{conn_measure}_{dens_tag}_path_length",
+                                        ] = cpl
+                                    if "efficiency" in graph_metrics:
+                                        features_frame.loc[
+                                            trial_row_idx,
+                                            f"{band}_{conn_measure}_{dens_tag}_efficiency",
+                                        ] = geff
+
+                                    # Small-worldness against degree-matched random graph
+                                    try:
+                                        randN = bct.makerandCIJ_und(
+                                            len(adjacency_matrix),
+                                            int(np.floor(np.sum(adjacency_matrix) / 2)),
+                                        )
+                                        gcc_rand = np.mean(
+                                            bct.clustering.clustering_coef_bu(randN)
+                                        )
+                                        cpl_rand = bct.distance.charpath(
+                                            bct.distance.distance_bin(randN), 0, 0
+                                        )[0]
+                                        smallworldness = (gcc / gcc_rand) / (cpl / cpl_rand)
+                                        features_frame.loc[
+                                            trial_row_idx,
+                                            f"{band}_{conn_measure}_{dens_tag}_smallworldness",
+                                        ] = smallworldness
+                                    except Exception:
+                                        pass
 
                         # Save ALL trial connectivity matrices as 3D arrays (trials x vertices x vertices)
                         if "aec" in connectivity_methods and all_aec_matrices:
